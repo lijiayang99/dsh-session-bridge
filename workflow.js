@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { lstatSync } from 'node:fs'
 import { join } from 'node:path'
 import { openLedger } from './workflow-ledger.js'
 
@@ -173,7 +174,10 @@ async function hostEvidence(ctx, job, kind, signal) {
 }
 
 export function applyWorkflow(ctx, config, allowed) {
-  const ledger = openLedger(join(ctx.profileContext.dir, 'session-bridge-workflow'))
+  if (lstatSync(join(ctx.profileContext.dir, 'session-bridge-workflow'), { throwIfNoEntry: false })) {
+    throw new Error('dsh-session-bridge: migrate the legacy workflow directory with DSH stopped before enabling delegation')
+  }
+  const ledger = openLedger(join(ctx.profileContext.dir, 'dsh-session-bridge-workflow'))
   const lifetime = new AbortController()
   const signal = lifetime.signal
   const turns = new Map()
@@ -952,5 +956,5 @@ export function applyWorkflow(ctx, config, allowed) {
       await driver
       ledger.close()
     }
-  }, 'session bridge workflow ledger and dispatcher')
+  }, 'dsh-session-bridge workflow ledger and dispatcher')
 }

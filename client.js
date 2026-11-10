@@ -3,13 +3,13 @@ window.__ModuleLoader__.load({
   factory(require) {
     const { createElement: h, useEffect, useState } = require('react')
     const id = '@local/dsh-session-bridge'
-    const kind = 'session-bridge-settings'
+    const kind = 'dsh-session-bridge-settings'
     const section = { display: 'grid', gap: 8 }
     const muted = { color: 'var(--dsw-alias-label-secondary)', margin: 0 }
     const dictionaries = {
       zh: {
-        title: '窗口互传', summary: '管理哪些独立会话可以互发消息。',
-        features: '功能开关', enabled: '启用窗口互传',
+        title: 'dsh-session-bridge', summary: '管理哪些独立会话可以互发消息。',
+        features: '功能开关', enabled: '启用会话消息',
         workflow: '启用跨窗口任务委托', workflowHelp: '在原主控会话发送「授权委托」和任务 JSON 开始。普通互传与任务委托可分别关闭。',
         allowlist: '会话白名单', allowed: '勾选的会话可以相互发送，至少需要两个。',
         authorization: '每条新消息由所有者在发送会话中提交授权。首行写「授权互传 目标会话ID 请求号」，下一行开始写准确正文。',
@@ -20,7 +20,7 @@ window.__ModuleLoader__.load({
         limit: '白名单最多选择 32 个会话。',
       },
       en: {
-        title: 'Session bridge', summary: 'Choose which independent sessions may exchange messages.',
+        title: 'dsh-session-bridge', summary: 'Choose which independent sessions may exchange messages.',
         features: 'Features', enabled: 'Enable session messaging',
         workflow: 'Enable cross-session delegation', workflowHelp: 'Start with 授权委托 and the task JSON in the original main session. Messaging and delegation have separate switches.',
         allowlist: 'Session allowlist', allowed: 'Selected sessions can message each other. Select at least two.',
@@ -39,7 +39,7 @@ window.__ModuleLoader__.load({
     })
 
     function apply(ctx) {
-      const t = ctx.locale.bind('sessionBridge')
+      const t = ctx.locale.bind('dsh-session-bridge')
       function BridgeIcon(props) {
         return h('svg', { ...props, viewBox: '0 0 24 24', fill: 'none', 'aria-hidden': true },
           h('path', { d: 'M3 8h17m-5-5 5 5-5 5M21 16H4m5-5-5 5 5 5', stroke: 'currentColor',
@@ -135,14 +135,14 @@ window.__ModuleLoader__.load({
             (state === 'saved' || state === 'saveError') && h('p', { role: 'status', style: muted }, t(state))),
           state === 'readError' && h('button', { type: 'button', onClick: () => reload(generation + 1) }, t('refresh')))
       }
-      ctx.effect(() => ctx.locale.register('sessionBridge', dictionaries), 'session bridge copy')
+      ctx.effect(() => ctx.locale.register('dsh-session-bridge', dictionaries), 'dsh-session-bridge copy')
       ctx.effect(() => ctx.sidebarRightTabs.register({
         id, kind, title: () => t('title'),
         guide: [{ id: 'settings', order: 45, title: () => t('title'), description: () => t('summary'), icon: BridgeIcon }],
-      }), 'session bridge tab')
+      }), 'dsh-session-bridge tab')
       ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
         name: 'sidebar.right.pane.tab', key: id,
-      }, Panel)), 'session bridge settings panel')
+      }, Panel)), 'dsh-session-bridge settings panel')
     }
     return { inject: ['slots', 'locale', 'sidebarRightTabs', 'workspaces', 'remote', 'remote.settings', 'remote.session'], apply }
   },
