@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import {
-  closeSync, constants, fsyncSync, linkSync, mkdirSync, openSync,
+  closeSync, constants, fsyncSync, linkSync, lstatSync, mkdirSync, openSync,
   readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -20,7 +20,7 @@ const supportsOwnerPrompt = (() => {
   }
 })()
 
-export const name = 'session-bridge-settings'
+export const name = 'dsh-session-bridge-settings'
 export const Config = schema.object({
   enabled: schema.boolean().default(false).volatile(),
   workflowEnabled: schema.boolean().default(false).volatile(),
@@ -108,6 +108,12 @@ const output = {
 const stringId = { type: 'string', pattern: ID.source, maxLength: 128 }
 
 export function apply(ctx, config) {
+  const home = resolve(process.env.DSH_HOME?.trim() || join(homedir(), '.dsh'))
+  const dir = join(home, 'dsh-session-bridge', 'receipts')
+  if (lstatSync(join(home, 'session-bridge', 'receipts'), { throwIfNoEntry: false })) {
+    throw new Error('dsh-session-bridge: migrate the legacy receipts directory with DSH stopped before enabling the bundle')
+  }
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
   const allowed = (id) => typeof id === 'string' && config.allowedSessions.get().includes(id)
     && !ctx.workspaceRegistry.archivedSessionIds.includes(id)
   if (supportsOwnerPrompt) {
@@ -115,8 +121,6 @@ export function apply(ctx, config) {
       if (workflowCtx.profileContext.name === 'web') applyWorkflow(workflowCtx, config, allowed)
     })
   }
-  const dir = join(resolve(process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')), 'session-bridge', 'receipts')
-  mkdirSync(dir, { recursive: true, mode: 0o700 })
   const receiptPath = (key) => join(dir, key + '.json')
   const processingPath = (key) => join(dir, key + '.turn.json')
 
@@ -170,7 +174,7 @@ export function apply(ctx, config) {
           messageId: id, processing, turn: active.turn, endReason: reason, at: now(),
         }, true)
       }
-    }).catch(() => ctx.logger.warn('session bridge could not persist turn evidence'))
+    }).catch(() => ctx.logger.warn('dsh-session-bridge could not persist turn evidence'))
   })
 
   const senderId = (exec) => {
