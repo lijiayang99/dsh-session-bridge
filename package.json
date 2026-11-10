@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-session-bridge",
-  "version": "0.4.3-rc.2",
+  "version": "0.4.3-rc.3",
   "description": "Relay messages and delegate bounded tasks between existing DSH sessions.",
   "private": true,
   "type": "module",

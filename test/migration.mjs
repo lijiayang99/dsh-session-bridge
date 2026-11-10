@@ -4,11 +4,12 @@ import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { networkInterfaces, tmpdir } from 'node:os'
+import { DatabaseSync } from 'node:sqlite'
 import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 
 const args = process.argv.slice(2)
-assert.equal(args.length, 3, 'Usage: node test/migration.mjs <dsh> <0.4.2.tgz> <0.4.3-rc.2.tgz>')
+assert.equal(args.length, 3, 'Usage: node test/migration.mjs <dsh> <0.4.2.tgz> <0.4.3-rc.3.tgz>')
 assert(Object.values(networkInterfaces()).flat().every(({ internal }) => internal), 'Use a loopback-only network namespace')
 const [dsh, stable, candidate] = args.map((path) => resolve(path))
 const cli = await realpath(dsh)
@@ -17,7 +18,7 @@ const installedHost = JSON.parse(await readFile(join(installDir, 'package.json')
 assert.equal(installedHost.name, '@deepseek-ai/dsh')
 assert.equal(installedHost.version, '0.2.2-rc.1')
 const bundle = '@local/dsh-session-bridge'
-for (const [file, version] of [[stable, '0.4.2'], [candidate, '0.4.3-rc.2']]) {
+for (const [file, version] of [[stable, '0.4.2'], [candidate, '0.4.3-rc.3']]) {
   const pkg = JSON.parse(execFileSync('tar', ['-xOf', file, 'package/package.json'], { encoding: 'utf8' }))
   assert.equal(pkg.name, bundle)
   assert.equal(pkg.version, version)
@@ -263,17 +264,20 @@ const grant = (task) => '授权委托\n' + JSON.stringify({
 const assignment = (task) => ({ task, item: 'one', attempt: 1, target: to, scope: 'review',
   instructions: 'Synthetic migration work', acceptance: 'Return a synthetic report.' })
 
-async function makeHistory(task) {
+async function makeReceipt(task) {
   const requestId = task + '-receipt'
   const text = 'Synthetic receipt for ' + task
   const sent = await call('授权互传 ' + to + ' ' + requestId + '\n' + text,
     'send_session_message', { to, request_id: requestId, text })
   assert.equal(sent.delivery, 'delivered')
-  const receipt = await until(async () => {
+  return until(async () => {
     const result = await readReceipt(requestId)
     return result?.processing === 'processed' ? result : undefined
   }, 'durable ordinary receipt')
+}
 
+async function makeHistory(task) {
+  const receipt = await makeReceipt(task)
   const job = await call(grant(task), 'workflow_dispatch', assignment(task))
   assert.equal(job.duplicate, false)
   await until(async () => (await history(from)).some(({ type, data }) => {
@@ -317,6 +321,32 @@ async function moveDir(source, dest) {
   await rename(source, dest)
 }
 
+async function replaceStopped(fromLayout, toLayout, spec, version) {
+  await moveSettings(fromLayout, toLayout)
+  await moveDir(fromLayout.receipts, toLayout.receipts)
+  await moveDir(fromLayout.ledger, toLayout.ledger)
+  await start()
+  await remove()
+  await add(spec, version)
+  await stop()
+  await start()
+  await requireOff(toLayout)
+  await assert.rejects(stat(fromLayout.ledger), { code: 'ENOENT' })
+}
+
+function requireEmptyLedger(layout) {
+  const db = new DatabaseSync(ledgerFile(layout), { readOnly: true, timeout: 1000 })
+  try {
+    const active = db.prepare('SELECT body FROM ledger WHERE id = 1').get()
+    assert.deepEqual(JSON.parse(active.body), { grants: {}, jobs: {} })
+    for (const table of ['grant_history', 'job_history', 'job_quarantine']) {
+      assert.equal(db.prepare('SELECT count(*) AS count FROM ' + table).get().count, 0)
+    }
+  } finally {
+    db.close()
+  }
+}
+
 async function absentTool(name, text) {
   let observed = false
   await prompt(from, text, (_results, tools) => {
@@ -334,7 +364,36 @@ try {
   await start()
   await add(stable, '0.4.2')
   await sessions()
-  await save(old.ns, { ...enabled, allowedSessions: allowlist })
+  await save(old.ns, { ...disabled, enabled: true, allowedSessions: allowlist })
+  const ordinary = await makeReceipt('ordinary-only')
+  await save(old.ns, disabled)
+  requireEmptyLedger(old)
+  const emptyFile = await stat(ledgerFile(old))
+  await setBundle(false)
+  await stop()
+  await replaceStopped(old, renamed, candidate, '0.4.3-rc.3')
+  assert.deepEqual(await readReceipt(ordinary.requestId), ordinary)
+  requireEmptyLedger(renamed)
+
+  // Candidate activation fails before its settings and tools are available.
+  // Retain the confirmed off settings and restore the old package anyway.
+  await stop()
+  await mkdir(old.receipts, { recursive: true })
+  await writeFile(join(old.receipts, 'synthetic-marker'), 'Conflicting directory during candidate startup\n')
+  await start()
+  await absentTool('session_message_status', 'Candidate startup is blocked by the conflicting path')
+  assert.equal(await settings(renamed.ns), undefined)
+  await setBundle(false)
+  await stop()
+  await moveDir(old.receipts, join(lab, 'held-startup-conflict'))
+  await replaceStopped(renamed, old, stable, '0.4.2')
+  requireEmptyLedger(old)
+  const restoredEmptyFile = await stat(ledgerFile(old))
+  assert.deepEqual([restoredEmptyFile.dev, restoredEmptyFile.ino], [emptyFile.dev, emptyFile.ino])
+  assert.deepEqual(await readReceipt(ordinary.requestId), ordinary)
+  console.log('PASS ordinary-only empty ledger returns intact after candidate activation fails, with both switches off and no new delegation')
+
+  await save(old.ns, enabled)
   const original = await makeHistory('original-task')
   await save(old.ns, disabled)
   await requireOff(old)
@@ -347,7 +406,7 @@ try {
   await moveDir(old.receipts, renamed.receipts)
   await start()
   await remove()
-  await add(candidate, '0.4.3-rc.2')
+  await add(candidate, '0.4.3-rc.3')
   await requireOff(renamed)
   await absentTool('workflow_status', 'Half-upgrade must refuse an unmoved ledger')
   await assert.rejects(stat(renamed.ledger), { code: 'ENOENT' })
@@ -378,6 +437,20 @@ try {
   await requireOff(renamed)
   await checkHistory(original)
   console.log('PASS conflicting workflow and receipt paths preserve both sides and recover after stopped-host reconciliation')
+
+  // This rollback has one original delegation and no candidate delegation.
+  // Reuse the current ledger and verify original evidence while still off.
+  await setBundle(false)
+  await stop()
+  await replaceStopped(renamed, old, stable, '0.4.2')
+  await checkHistory(original)
+  assert.deepEqual(await status('candidate-task'), { error: 'grant_not_found' })
+  await setBundle(false)
+  await stop()
+  await replaceStopped(old, renamed, candidate, '0.4.3-rc.3')
+  await checkHistory(original)
+  assert.deepEqual(await status('candidate-task'), { error: 'grant_not_found' })
+  console.log('PASS rollback preserves the original attempt without manufacturing a candidate attempt')
 
   await save(renamed.ns, enabled)
   const added = await makeHistory('candidate-task')
