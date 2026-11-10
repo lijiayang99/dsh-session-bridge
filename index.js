@@ -22,7 +22,9 @@ const supportsOwnerPrompt = (() => {
 
 export const name = 'dsh-session-bridge-settings'
 export const Config = schema.object({
-  enabled: schema.boolean().default(false).volatile(),
+  // Host-authored form metadata, outside the writable settings values.
+  enabled: schema.boolean().default(false).volatile()
+    .extra('dshSessionBridgeHost', supportsOwnerPrompt ? 'supported' : 'unsupported'),
   workflowEnabled: schema.boolean().default(false).volatile(),
   allowedSessions: schema.array(schema.string().pattern(/^[a-zA-Z0-9_-]{1,128}$/))
     .max(32).default([]).volatile(),

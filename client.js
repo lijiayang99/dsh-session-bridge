@@ -15,7 +15,11 @@ window.__ModuleLoader__.load({
         authorization: '每条新消息由所有者在发送会话中提交授权。首行写「授权互传 目标会话ID 请求号」，下一行开始写准确正文。',
         empty: '没有可选会话。', unnamed: '未命名会话', unavailable: '会话当前不可用，可从白名单移除。',
         save: '保存设置', saving: '正在保存…', saved: '设置已保存并生效。',
-        refresh: '重新读取', loading: '正在读取设置…', readError: '读取设置失败，请重试。',
+        refresh: '重新读取', loading: '正在读取设置…', readError: '无法读取插件配置或宿主兼容状态，请重试。',
+        hostSupported: '宿主版本受支持（DSH 0.2.2-rc.1）。',
+        hostUnsupported: '当前宿主不受支持。新消息和任务委托需要 DSH 0.2.2-rc.1。',
+        messagingOn: '会话消息已开启。', messagingOff: '会话消息已关闭。',
+        workflowOn: '任务委托已开启。', workflowOff: '任务委托已关闭。',
         saveError: '保存失败，请重新读取后再试。', readOnly: '当前配置为只读。',
         limit: '白名单最多选择 32 个会话。',
       },
@@ -27,7 +31,11 @@ window.__ModuleLoader__.load({
         authorization: 'For each new message, the owner enters “授权互传 <destination ID> <request ID>” in the sending session, then the exact text on the next line.',
         empty: 'No eligible sessions.', unnamed: 'Untitled session', unavailable: 'Unavailable session. You can remove it from the allowlist.',
         save: 'Save settings', saving: 'Saving…', saved: 'Settings saved and applied.',
-        refresh: 'Reload', loading: 'Loading settings…', readError: 'Unable to load settings. Try again.',
+        refresh: 'Reload', loading: 'Loading settings…', readError: 'Unable to read plugin settings or host compatibility. Try again.',
+        hostSupported: 'Host version supported (DSH 0.2.2-rc.1).',
+        hostUnsupported: 'This host is unsupported. New messages and delegation require DSH 0.2.2-rc.1.',
+        messagingOn: 'Session messaging is on.', messagingOff: 'Session messaging is off.',
+        workflowOn: 'Task delegation is on.', workflowOff: 'Task delegation is off.',
         saveError: 'Unable to save. Reload before trying again.', readOnly: 'This configuration is read-only.',
         limit: 'Select at most 32 sessions.',
       },
@@ -37,6 +45,21 @@ window.__ModuleLoader__.load({
       workflowEnabled: entry.value.workflowEnabled === true,
       allowedSessions: entry.value.allowedSessions ?? [],
     })
+
+    function hostCompatibility(entry) {
+      // Schemastery sends a reference graph. Read the server schema, not editable values.
+      const schema = entry?.schema
+      const enabled = schema?.refs?.[schema.uid]?.dict?.enabled
+      return schema?.refs?.[enabled]?.meta?.dshSessionBridgeHost
+    }
+
+    function readable(entry) {
+      return hostCompatibility(entry) === 'supported' &&
+        typeof entry.value?.enabled === 'boolean' &&
+        typeof entry.value.workflowEnabled === 'boolean' &&
+        Array.isArray(entry.value.allowedSessions) &&
+        entry.value.allowedSessions.every((id) => typeof id === 'string')
+    }
 
     function apply(ctx) {
       const t = ctx.locale.bind('dsh-session-bridge')
@@ -55,20 +78,28 @@ window.__ModuleLoader__.load({
           let active = true
           setState('loading')
           setView(null)
-          Promise.all([ctx.remote.settings.describe(), ctx.remote.session.list({})])
-            .then(([settings, sessions]) => {
-              if (!active) return
-              if (!settings.ok || !sessions.ok) throw new Error('Settings or sessions unavailable')
-              const entry = settings.value.namespaces.find((item) => item.ns === kind)
-              if (!entry) throw new Error('Settings namespace unavailable')
-              const archived = new Set(ctx.workspaces.list.getSnapshot().archivedSessionIds)
-              const rows = sessions.value.items
-                .filter((row) => !row.blank && !row.parentSessionId && row.origin !== 'subagent' && !archived.has(row.sessionId))
-                .map((row) => ({ id: row.sessionId, title: row.projections?.values?.title }))
-              setView({ entry, rows, writable: settings.value.writable })
-              setDraft(values(entry))
-              setState('ready')
-            }).catch(() => { if (active) setState('readError') })
+          async function load() {
+            const settings = await ctx.remote.settings.describe()
+            if (!active) return
+            if (!settings.ok) throw new Error('Settings unavailable')
+            const entry = settings.value.namespaces.find((item) => item.ns === kind)
+            if (hostCompatibility(entry) === 'unsupported') {
+              setState('hostUnsupported')
+              return
+            }
+            if (!readable(entry)) throw new Error('Bridge settings unavailable')
+            const sessions = await ctx.remote.session.list({})
+            if (!active) return
+            if (!sessions.ok) throw new Error('Sessions unavailable')
+            const archived = new Set(ctx.workspaces.list.getSnapshot().archivedSessionIds)
+            const rows = sessions.value.items
+              .filter((row) => !row.blank && !row.parentSessionId && row.origin !== 'subagent' && !archived.has(row.sessionId))
+              .map((row) => ({ id: row.sessionId, title: row.projections?.values?.title }))
+            setView({ entry, rows, writable: settings.value.writable })
+            setDraft(values(entry))
+            setState('ready')
+          }
+          load().catch(() => { if (active) setState('readError') })
           return () => { active = false }
         }, [generation])
 
@@ -78,6 +109,11 @@ window.__ModuleLoader__.load({
           try {
             const result = await ctx.remote.settings.update(kind, draft, view.entry.revision)
             if (!result.ok) throw new Error('Settings write rejected')
+            if (!readable(result.value)) {
+              setView(null)
+              setState(hostCompatibility(result.value) === 'unsupported' ? 'hostUnsupported' : 'readError')
+              return
+            }
             setView({ ...view, entry: result.value })
             setDraft(values(result.value))
             setState('saved')
@@ -101,6 +137,10 @@ window.__ModuleLoader__.load({
           h('h2', { style: { margin: '0 0 6px', fontSize: 18 } }, t('title')),
           h('p', { style: muted }, t('summary')),
           !view ? h('p', { role: 'status' }, t(state)) : h('form', { onSubmit: save, style: { ...section, gap: 18, marginTop: 18 } },
+            h('div', { role: 'status', style: section },
+              h('p', { style: muted }, t('hostSupported')),
+              h('p', { style: muted }, t(view.entry.value.enabled ? 'messagingOn' : 'messagingOff')),
+              h('p', { style: muted }, t(view.entry.value.workflowEnabled ? 'workflowOn' : 'workflowOff'))),
             h('fieldset', { disabled, style: section },
               h('legend', null, t('features')),
               h('label', null, h('input', { type: 'checkbox', checked: draft.enabled, onChange: (event) => {
@@ -133,7 +173,7 @@ window.__ModuleLoader__.load({
               h('button', { type: 'button', disabled: state === 'saving', onClick: () => reload(generation + 1) }, t('refresh'))),
             !view.writable && h('p', { role: 'status' }, t('readOnly')),
             (state === 'saved' || state === 'saveError') && h('p', { role: 'status', style: muted }, t(state))),
-          state === 'readError' && h('button', { type: 'button', onClick: () => reload(generation + 1) }, t('refresh')))
+          (state === 'readError' || state === 'hostUnsupported') && h('button', { type: 'button', onClick: () => reload(generation + 1) }, t('refresh')))
       }
       ctx.effect(() => ctx.locale.register('dsh-session-bridge', dictionaries), 'dsh-session-bridge copy')
       ctx.effect(() => ctx.sidebarRightTabs.register({

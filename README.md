@@ -1,8 +1,21 @@
-# dsh-session-bridge 0.4.3-rc.3
+# dsh-session-bridge 0.4.4-rc.3
 
 适用于 DeepSeek Harness Web 0.2.2-rc.1。全新安装可通过「插件 → 添加插件」输入宿主机可读的包绝对路径并启用。已有版本请先按下文迁移。
 
 右栏「开始 → dsh-session-bridge」有「启用会话消息」和「启用跨窗口任务委托」两个独立开关，共用会话白名单。先创建并使用主控、开发和审核会话，将它们加到白名单。
+
+## 宿主兼容诊断
+
+右栏诊断使用服务端授权门禁生成的状态。该状态随配置结构返回，配置值无法改写它。侧栏仅显示固定状态和支持版本。
+
+| 侧栏或安装状态 | 含义 |
+| --- | --- |
+| 宿主版本受支持 | 宿主通过固定的 DSH `0.2.2-rc.1` 版本检查。会话消息和任务委托分别显示保存后的开关状态。 |
+| 当前宿主不受支持 | 插件已加载，但宿主身份或版本未通过授权门禁。侧栏不提供编辑，新会话消息和任务委托不开放。已有会话消息的回执查询和符合原条件的精确重复查询仍可用。 |
+| 无法读取插件配置或宿主兼容状态 | 配置请求失败、配置条目或兼容标记缺失、设置数据无法读取，或读取所需的会话列表失败。可在右栏重新读取。 |
+| 添加插件提示版本不兼容 | 插件管理器可能先按 `engines.dsh` 拒绝，侧栏此时尚未加载。在支持结构化错误的管理器里，`incompatible-version` 会显示运行的 DSH 版本与包的宿主要求。以添加对话框为准。 |
+
+包的宿主要求仍为 DSH `0.2.2-rc.1`，Node 要求仍为 `24.9+`。从已完成命名迁移的版本换入时，设置 ID、回执和账本路径沿用。
 
 ## 迁移与回退
 
@@ -52,7 +65,7 @@
 
 在发送会话由 DSH 所有者输入 `授权互传 目标会话ID 请求号`，下一行开始写准确正文。助手用 `send_session_message` 按原样发送，从原发送会话用 `session_message_status` 查投递和处理。精确重试只返回已有回执。迁移保留回执内容和去重键。目标轮次正常回复并落盘仅证明处理，项目验收仍要看结构化结果和产物。
 
-## 隔离复验
+## 迁移与回退隔离复验
 
 用固定 DSH Web `0.2.2-rc.1`、Node `24.22.2` 和 pnpm `12.18.0`，在源码目录执行。基线从固定 `0.4.2` 源码提交打包。测试在临时 HOME、XDG、DSH_HOME 和仅有 loopback 的网络命名空间内，使用合成会话及模型。
 
@@ -65,7 +78,23 @@ npm pack --offline --pack-destination "$lab"
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/migration.mjs "$(command -v dsh)" \
   "$lab/local-dsh-session-bridge-0.4.2.tgz" \
-  "$lab/local-dsh-session-bridge-0.4.3-rc.3.tgz"
+  "$lab/local-dsh-session-bridge-0.4.4-rc.3.tgz"
 ```
 
 原生复验覆盖升级、半迁移、新旧路径并存和完整回退，也覆盖仅有普通互传且候选无法启动、以及候选未新增委托的回退。测试另在一次性环境故意绕过失败门槛，证实只搬回设置和回执时，0.4.2 仍会创建空账本并接受原任务键。随后隔离该错误账本，从候选当前账本恢复两代历史并核对防重。
+
+## 宿主兼容诊断复验
+
+下列 smoke 在 Linux 的 loopback 网络命名空间启动临时 DSH Web 和本地合成模型。用 Node `24.22.2`、pnpm `12.18.0`、DSH Web `0.2.2-rc.1`、Chrome 与 Playwright Core `1.65.0` 可复跑。
+
+```sh
+lab="$(mktemp -d)"
+npm pack --offline --pack-destination "$lab"
+npm install --prefix "$lab/tools" playwright-core@1.65.0
+unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+  "$(command -v node)" ./test/diagnostics.mjs "$(command -v dsh)" \
+  "$lab/local-dsh-session-bridge-0.4.4-rc.3.tgz" \
+  "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
+```
+
+脚本用原生安装 RPC 验证不兼容探针包被拒、侧栏尚未注册，也用宿主的兼容判定函数检查原包面对模拟的未知版本。另在固定 Web 实现上替换合成启动器的版本身份，用原样归档检验运行时拒绝及侧栏诊断。此探针验证未知身份的拒绝边界，实际其他 DSH 版本的加载行为未纳入 smoke。
