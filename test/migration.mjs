@@ -9,7 +9,7 @@ import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 
 const args = process.argv.slice(2)
-assert.equal(args.length, 3, 'Usage: node test/migration.mjs <dsh> <0.4.2.tgz> <0.4.3-rc.3.tgz>')
+assert.equal(args.length, 3, 'Usage: node test/migration.mjs <dsh> <0.4.2.tgz> <0.4.4-rc.3.tgz>')
 assert(Object.values(networkInterfaces()).flat().every(({ internal }) => internal), 'Use a loopback-only network namespace')
 const [dsh, stable, candidate] = args.map((path) => resolve(path))
 const cli = await realpath(dsh)
@@ -18,7 +18,7 @@ const installedHost = JSON.parse(await readFile(join(installDir, 'package.json')
 assert.equal(installedHost.name, '@deepseek-ai/dsh')
 assert.equal(installedHost.version, '0.2.2-rc.1')
 const bundle = '@local/dsh-session-bridge'
-for (const [file, version] of [[stable, '0.4.2'], [candidate, '0.4.3-rc.3']]) {
+for (const [file, version] of [[stable, '0.4.2'], [candidate, '0.4.4-rc.3']]) {
   const pkg = JSON.parse(execFileSync('tar', ['-xOf', file, 'package/package.json'], { encoding: 'utf8' }))
   assert.equal(pkg.name, bundle)
   assert.equal(pkg.version, version)
@@ -371,7 +371,7 @@ try {
   const emptyFile = await stat(ledgerFile(old))
   await setBundle(false)
   await stop()
-  await replaceStopped(old, renamed, candidate, '0.4.3-rc.3')
+  await replaceStopped(old, renamed, candidate, '0.4.4-rc.3')
   assert.deepEqual(await readReceipt(ordinary.requestId), ordinary)
   requireEmptyLedger(renamed)
 
@@ -406,7 +406,7 @@ try {
   await moveDir(old.receipts, renamed.receipts)
   await start()
   await remove()
-  await add(candidate, '0.4.3-rc.3')
+  await add(candidate, '0.4.4-rc.3')
   await requireOff(renamed)
   await absentTool('workflow_status', 'Half-upgrade must refuse an unmoved ledger')
   await assert.rejects(stat(renamed.ledger), { code: 'ENOENT' })
@@ -447,7 +447,7 @@ try {
   assert.deepEqual(await status('candidate-task'), { error: 'grant_not_found' })
   await setBundle(false)
   await stop()
-  await replaceStopped(old, renamed, candidate, '0.4.3-rc.3')
+  await replaceStopped(old, renamed, candidate, '0.4.4-rc.3')
   await checkHistory(original)
   assert.deepEqual(await status('candidate-task'), { error: 'grant_not_found' })
   console.log('PASS rollback preserves the original attempt without manufacturing a candidate attempt')
