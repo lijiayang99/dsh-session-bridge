@@ -10,6 +10,7 @@ window.__ModuleLoader__.load({
       zh: {
         title: '窗口互传', summary: '管理哪些独立会话可以互发消息。',
         features: '功能开关', enabled: '启用窗口互传',
+        workflow: '启用跨窗口任务委托', workflowHelp: '在原主控会话发送「授权委托」和任务 JSON 开始。普通互传与任务委托可分别关闭。',
         allowlist: '会话白名单', allowed: '勾选的会话可以相互发送，至少需要两个。',
         authorization: '每条新消息由所有者在发送会话中提交授权。首行写「授权互传 目标会话ID 请求号」，下一行开始写准确正文。',
         empty: '没有可选会话。', unnamed: '未命名会话', unavailable: '会话当前不可用，可从白名单移除。',
@@ -21,6 +22,7 @@ window.__ModuleLoader__.load({
       en: {
         title: 'Session bridge', summary: 'Choose which independent sessions may exchange messages.',
         features: 'Features', enabled: 'Enable session messaging',
+        workflow: 'Enable cross-session delegation', workflowHelp: 'Start with 授权委托 and the task JSON in the original main session. Messaging and delegation have separate switches.',
         allowlist: 'Session allowlist', allowed: 'Selected sessions can message each other. Select at least two.',
         authorization: 'For each new message, the owner enters “授权互传 <destination ID> <request ID>” in the sending session, then the exact text on the next line.',
         empty: 'No eligible sessions.', unnamed: 'Untitled session', unavailable: 'Unavailable session. You can remove it from the allowlist.',
@@ -32,6 +34,7 @@ window.__ModuleLoader__.load({
     }
     const values = (entry) => ({
       enabled: entry.value.enabled === true,
+      workflowEnabled: entry.value.workflowEnabled === true,
       allowedSessions: entry.value.allowedSessions ?? [],
     })
 
@@ -87,8 +90,7 @@ window.__ModuleLoader__.load({
           .filter((key) => !view.rows.some((row) => row.id === key))
           .map((key) => ({ id: key, unavailable: true }))] : []
         const disabled = !view?.writable || state === 'saving' || state === 'saveError'
-        const changed = view && (draft.enabled !== values(view.entry).enabled ||
-          JSON.stringify(draft.allowedSessions) !== JSON.stringify(values(view.entry).allowedSessions))
+        const changed = view && JSON.stringify(draft) !== JSON.stringify(values(view.entry))
         function select(key, checked) {
           setDraft((old) => ({ ...old, allowedSessions: checked
             ? [...old.allowedSessions, key] : old.allowedSessions.filter((value) => value !== key) }))
@@ -104,7 +106,12 @@ window.__ModuleLoader__.load({
               h('label', null, h('input', { type: 'checkbox', checked: draft.enabled, onChange: (event) => {
                 setDraft({ ...draft, enabled: event.target.checked })
                 setState('ready')
-              } }), ' ', t('enabled'))),
+              } }), ' ', t('enabled')),
+              h('label', null, h('input', { type: 'checkbox', checked: draft.workflowEnabled, onChange: (event) => {
+                setDraft({ ...draft, workflowEnabled: event.target.checked })
+                setState('ready')
+              } }), ' ', t('workflow')),
+              h('p', { style: muted }, t('workflowHelp'))),
             h('fieldset', { disabled, style: section },
               h('legend', null, t('allowlist')),
               h('p', { style: muted }, t('allowed')),

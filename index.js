@@ -6,6 +6,7 @@ import {
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { applyWorkflow } from './workflow.js'
 
 // Local DSH bundles are linked, so resolve the schema from the running DSH CLI.
 const cli = realpathSync(process.argv[1])
@@ -22,6 +23,7 @@ const supportsOwnerPrompt = (() => {
 export const name = 'session-bridge-settings'
 export const Config = schema.object({
   enabled: schema.boolean().default(false).volatile(),
+  workflowEnabled: schema.boolean().default(false).volatile(),
   allowedSessions: schema.array(schema.string().pattern(/^[a-zA-Z0-9_-]{1,128}$/))
     .max(32).default([]).volatile(),
 })
@@ -108,6 +110,11 @@ const stringId = { type: 'string', pattern: ID.source, maxLength: 128 }
 export function apply(ctx, config) {
   const allowed = (id) => typeof id === 'string' && config.allowedSessions.get().includes(id)
     && !ctx.workspaceRegistry.archivedSessionIds.includes(id)
+  if (supportsOwnerPrompt) {
+    ctx.inject(['profileContext', 'sessionPersistence'], (workflowCtx) => {
+      if (workflowCtx.profileContext.name === 'web') applyWorkflow(workflowCtx, config, allowed)
+    })
+  }
   const dir = join(resolve(process.env.DSH_HOME?.trim() || join(homedir(), '.dsh')), 'session-bridge', 'receipts')
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   const receiptPath = (key) => join(dir, key + '.json')

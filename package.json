@@ -1,7 +1,7 @@
 {
   "name": "@local/dsh-session-bridge",
-  "version": "0.3.0",
-  "description": "Manage the DSH session bridge from the right sidebar.",
+  "version": "0.4.2",
+  "description": "Relay messages and delegate bounded tasks between existing DSH sessions.",
   "private": true,
   "type": "module",
   "exports": {
@@ -10,13 +10,29 @@
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
-  "files": ["index.js", "client.js", "cordis.patch.yml", "locale/*.json", "icon.svg"],
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "workflow.js",
+    "workflow-ledger.js"
+  ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true,
-      "inject": ["@deepseek-ai/dsh-client-ui-sidebar-right"]
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
     }
+  },
+  "engines": {
+    "dsh": "0.2.2-rc.1",
+    "node": ">=24.9.0"
   }
 }
