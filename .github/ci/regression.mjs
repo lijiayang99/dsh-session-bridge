@@ -35,7 +35,7 @@ async function fixture(t, hostVersion) {
   // The product uses the host schema only for configuration declaration.
   await writeFile(join(schemaDir, 'package.json'), '{"main":"index.cjs"}')
   await writeFile(join(schemaDir, 'index.cjs'), `
-    const chain = { default: () => chain, volatile: () => chain, pattern: () => chain, max: () => chain }
+    const chain = { default: () => chain, volatile: () => chain, pattern: () => chain, max: () => chain, extra: () => chain }
     module.exports = { object: () => chain, boolean: () => chain, string: () => chain, array: () => chain }
   `)
 
