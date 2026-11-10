@@ -1,0 +1,3 @@
+- insert:
+    - id: session-bridge-settings
+      name: '@local/dsh-session-bridge'
