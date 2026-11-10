@@ -4,6 +4,14 @@ DeepSeek Harness Web 的右栏插件，用于在白名单会话之间发送消�
 
 ## 取得安装包
 
+首次安装也可以在「插件 → 添加插件」直接输入固定的 GitHub 提交地址。此入口已在隔离的 DSH Web 0.2.2-rc.1 中验证安装及启用，宿主须能访问 GitHub。
+
+```text
+https://github.com/lijiayang99/dsh-session-bridge.git#d4594f010f07aad2d6b1b34bce08b0b984d4ae6b
+```
+
+从 0.2.0 升级与回退使用下文已完整验证的归档换包规程。
+
 将本仓库克隆到本地，检出要安装的固定提交。在仓库根目录用 npm 11.19.1 生成归档。
 
 ```sh
