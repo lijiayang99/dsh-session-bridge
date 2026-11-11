@@ -10,7 +10,9 @@
 
 ## 从 GitHub 换包
 
-DSH Web `0.2.2-rc.1` 的「更新」只处理 npm registry 来源。从 GitHub 换入当前主线时，在「插件 → 添加插件」填入 `github:lijiayang99/dsh-session-bridge#main`。复现固定候选时，使用 `github:lijiayang99/dsh-session-bridge#e6ab3f77684fa578e75188848e2627bad3d3bfd7`。本候选已完成本地归档的原生复验，GitHub 换包仍待实测。
+DSH Web `0.2.2-rc.1` 的「更新」只处理 npm registry 来源。隔离实测从固定 GitHub 提交 `b6b5af3` 安装 0.4.4-rc.3 后，原生 `listVersions` 和 `updateBundle` 均拒绝该 GitHub 来源。
+
+已验证的手动换包流程是关闭两个功能开关、移除旧包，再通过「插件 → 添加插件」手动添加一次 `github:lijiayang99/dsh-session-bridge#main`。隔离环境换入了 0.4.5-rc.2，完整重启后读回两个开关均关闭，合成白名单保留。复现固定候选时，使用 `github:lijiayang99/dsh-session-bridge#e6ab3f77684fa578e75188848e2627bad3d3bfd7`。
 
 从 0.4.4-rc.3 换入时，沿用原设置 ID、回执和委托账本路径。按包 README 停发、排空、关闭两个开关并备份数据，换包后完整重启，核对版本、设置及历史后再恢复开关。回退到 0.4.4-rc.3 时使用 `github:lijiayang99/dsh-session-bridge#b6b5af3d2f95c00b8b9f50e9a1c6af280d16c1a4`。从旧命名版本换包还须停机迁移。[包 README 的换包与回退规程](../README.md#从-044-rc3-换入或回退) · [旧命名迁移规程](../README.md#迁移与回退)
 
