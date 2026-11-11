@@ -233,27 +233,41 @@ test('batch waits once, preserves membership and budget, and closes only with it
   host.end(main)
 })
 
-test('interrupted result turn cannot leave collaboration successfully closed without reconciliation', async t => {
-  const host = await collaborationHost(t)
-  host.begin(main, direct)
-  const opened = await host.call(main, 'workflow_delegate_direct', {})
-  assert.equal(opened.duplicate, false)
-  host.end(main)
-  const lease = await claim(host, worker, opened.id)
-  assert.equal((await report(host, worker, lease)).recorded, true)
-  host.end(worker)
-  assert.equal((await host.receive(main)).source.bridgeWorkflowId, opened.id)
-  assert.equal((await consume(host, opened.id)).duplicate, false)
+for (const interrupted of [false, true]) {
+  const testName = interrupted
+    ? 'interrupted result turn cannot leave collaboration successfully closed without reconciliation'
+    : 'completed result turn settles one requested close after restart without another owner confirmation'
+  test(testName, async t => {
+    const host = await collaborationHost(t)
+    host.begin(main, direct)
+    const opened = await host.call(main, 'workflow_delegate_direct', {})
+    assert.equal(opened.duplicate, false)
+    host.end(main)
+    const lease = await claim(host, worker, opened.id)
+    assert.equal((await report(host, worker, lease)).recorded, true)
+    host.end(worker)
+    assert.equal((await host.receive(main)).source.bridgeWorkflowId, opened.id)
+    assert.equal((await consume(host, opened.id)).duplicate, false)
 
-  await completed(host, opened.task)
-  // The controller's next model step is interrupted before it completes.
-  host.end(main, 'aborted')
-  await host.restart()
-  host.begin(main, 'Read the interrupted synthetic result.')
-  const { snapshot, continuation } = await waitForContinuation(host, opened.task, opened.id, 'interrupted')
-  assert.equal(continuation.reconciliation, undefined)
-  assert.equal(host.deliveries.filter(({ target }) => target === main).length, 1)
-  assert.notEqual(snapshot.state, 'closed', 'An interrupted and unreconciled result was marked closed')
-  assert.notEqual(snapshot.outcome?.status, 'completed')
-  host.end(main)
-})
+    await completed(host, opened.task)
+    // Interrupt before the controller can finish its result turn.
+    host.end(main, interrupted ? 'aborted' : 'completed')
+    await host.restart()
+    host.begin(main, 'Read the synthetic result.')
+    const { snapshot, continuation } = await waitForContinuation(host, opened.task, opened.id,
+      interrupted ? 'interrupted' : 'verified')
+    assert.equal(continuation.reconciliation, undefined)
+    assert.equal(host.deliveries.filter(({ target }) => target === main).length, 1)
+    if (interrupted) {
+      assert.notEqual(snapshot.state, 'closed', 'An interrupted and unreconciled result was marked closed')
+      assert.notEqual(snapshot.outcome?.status, 'completed')
+    } else {
+      const closed = await until(async () => {
+        const current = await status(host, opened.task)
+        return current.state === 'closed' && current
+      }, 'Expected closeout after the original result turn completed')
+      assert.equal(closed.outcome?.status, 'completed')
+    }
+    host.end(main)
+  })
+}
