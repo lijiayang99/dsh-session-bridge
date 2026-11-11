@@ -472,7 +472,7 @@ export function applyWorkflow(ctx, config, allowed) {
   }
 
   register('delegate_direct',
-    'For the owner’s exact one-window request 把『目标原文』委托给『窗口标题』 or 你给合成查询这个窗口问他今天气温怎么样, call with no arguments. Queue one assignment with the exact goal or question and a 30-minute deadline. The result returns to this controller through workflow_consume. Ask for clarification if the title is ambiguous. Use workflow_propose for broader requests.',
+    'For the owner’s exact one-window request 把『目标原文』委托给『窗口标题』 or 你给合成查询这个窗口问他今天气温怎么样, call once with no arguments. Queue one assignment with the exact goal or question and a 30-minute deadline. When the receipt state is queued, acknowledge the dispatch using its exact targetTitle and end the turn. The result returns to this controller through workflow_consume. Ask for clarification if the title is ambiguous. Use workflow_propose for broader requests.',
     {}, (args, exec, caller) => {
       if (!args || Object.keys(args).length !== 0) return denied('workflow_direct_arguments_not_allowed')
       return authorization.delegateDirect(exec, caller, current, (input, evidence) => {
@@ -491,7 +491,10 @@ export function applyWorkflow(ctx, config, allowed) {
         if (!grant) return denied('grant_not_opened')
         schedule()
         const { task, goal, scopes, budget, expiresAt } = grant
-        return { task, goal, scopes, budget, expiresAt, id: job.id, duplicate: false }
+        return {
+          task, goal, scopes, budget, expiresAt, id: job.id,
+          targetTitle: evidence.targets[0].title, state: 'queued', duplicate: false,
+        }
       })
     })
 
