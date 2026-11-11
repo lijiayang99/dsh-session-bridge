@@ -56,18 +56,22 @@ async function consume(host, opened) {
   assert.equal(reply.report.summary, answer)
 }
 
-test('a verified one-shot reply releases a slot and retains its history at the 128-grant limit', async t => {
-  const { host, active, change, grant, history, key } = await lab(t)
+function fillGrantSlots(change) {
   change(({ grants }) => {
     for (let i = 0; i < 127; i++) {
       const task = 'synthetic-capacity-slot-' + i
       grants[main + ':' + task] = {
         task, owner: main, goal: 'Synthetic live grant', scopes: [{ name: 'execute', targets: [worker] }],
-        expiresAt: Date.now() + 30 * 60_000, state: 'active', openedAt: Date.now(),
+        expiresAt: Date.now() + 60 * 60_000, state: 'active', openedAt: Date.now(),
         ownerMessageId: 'synthetic-message-' + i, ownerTurn: i,
       }
     }
   })
+}
+
+test('a verified one-shot reply releases a slot and retains its history at the 128-grant limit', async t => {
+  const { host, active, change, grant, history, key } = await lab(t)
+  fillGrantSlots(change)
   const opened = await open(host)
   assert.equal(Object.keys(active().grants).length, 128)
   assert.deepEqual(await open(host), { error: 'grant_not_opened' })
@@ -222,3 +226,76 @@ test('a direct result whose reply ends after the deadline remains expired after 
   assert.equal(grant(opened).outcome, undefined)
   assert.deepEqual(host.deliveries.map(({ target }) => target), route)
 })
+
+test('an expired grant awaiting proof cannot resume work and releases its slot after recovery', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
+  const { host, active, change, grant, history, key } = await lab(t)
+  fillGrantSlots(change)
+  const opened = await open(host)
+  assert.equal(Object.keys(active().grants).length, 128)
+  await result(host, opened)
+  await consume(host, opened)
+  let inspecting = false
+  const releaseRead = Promise.withResolvers()
+  try {
+    await host.restart(() => {
+      host.reply(main, answer)
+      host.end(main)
+      t.mock.timers.tick(opened.expiresAt - Date.now() + 1)
+      host.faults.read = id => {
+        if (id !== main) return
+        inspecting = true
+        return releaseRead.promise
+      }
+    })
+    await until(() => inspecting || !active().grants[key(opened)], 'Expected pending evidence inspection')
+    assert(active().grants[key(opened)], 'Expected the expired grant to remain available to recovery')
+    host.begin(main, '继续委托 ' + opened.task)
+    assert.equal((await host.call(main, 'workflow_status', { task: opened.task })).state, 'expired')
+    assert.deepEqual(await host.call(main, 'workflow_dispatch', {
+      task: opened.task, item: 'execute', attempt: 2, scope: 'execute', target: worker,
+      instructions: answer, acceptance: answer,
+    }), { error: 'main_task_context_required' })
+    assert.deepEqual(await host.call(main, 'workflow_consume', { id: opened.id }), { error: 'result_wake_required' })
+    host.end(main)
+    assert.deepEqual(host.deliveries.map(({ target }) => target), route)
+  } finally {
+    releaseRead.resolve()
+    delete host.faults.read
+  }
+
+  const archived = await until(() => history(opened), 'Expected the checked attempt to reach history')
+  assert.equal(archived.resume.continuation.state, 'verified')
+  assert.equal(grant(opened).state, 'closed')
+  assert.equal(Object.keys(active().grants).length, 127)
+  assert.deepEqual(host.deliveries.map(({ target }) => target), route)
+  assert.equal((await open(host)).state, 'queued')
+})
+
+for (const [name, complete, reason] of [
+  ['the result turn has no normal end', false, 'turn_end_not_proven'],
+  ['the durable event history cannot be read', true, 'turn_evidence_unavailable'],
+]) {
+  test('restart archives an expired direct grant when ' + name, async t => {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
+    const { host, active, grant, history, key } = await lab(t)
+    const opened = await open(host)
+    await result(host, opened)
+    await consume(host, opened)
+    await host.restart(() => {
+      host.reply(main, answer)
+      if (complete) {
+        host.end(main)
+        host.faults.read = () => { throw new Error('Synthetic unavailable result history') }
+      }
+      t.mock.timers.tick(opened.expiresAt - Date.now() + 1)
+    })
+    const archived = await until(() => history(opened), 'Expected the expired attempt in history')
+    assert.equal(archived.resume.continuation.state, 'interrupted')
+    assert.equal(archived.resume.continuation.reason, reason)
+    assert.equal(active().grants[key(opened)], undefined)
+    assert.equal(grant(opened).state, 'expired')
+    assert.equal(grant(opened).outcome, undefined)
+    assert.deepEqual(host.deliveries.map(({ target }) => target), route)
+  })
+}
