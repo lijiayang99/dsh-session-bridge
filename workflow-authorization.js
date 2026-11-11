@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto'
-import { matchingTitles } from './natural-message.js'
+import { matchingTitles, naturalIntent, plainText } from './natural-message.js'
+import { contextualRequest, withdrawsQuestion } from './workflow-context.js'
 
 const ID = /^[a-zA-Z0-9_-]{1,128}$/
 const confirmationText = '确认委托'
 const draftLifetime = 120_000
+const contextTurnLimit = 5
 const directLifetimeMinutes = 30
 const directRequest = /^(?:请[ \t]*)?把(?:『([^』]*)』|「([^」]*)」|“([^”]*)”)[ \t]*委托给[ \t]*(?:『([^』\r\n]*)』|「([^」\r\n]*)」|“([^”\r\n]*)”)[。]?$/u
 const digest = (text) => createHash('sha256').update(text).digest('hex')
@@ -65,7 +67,8 @@ export function directIntent(text) {
   const title = match ? match[4] ?? match[5] ?? match[6] : question[1] ?? question[2] ?? question[3] ?? question[4]
   if (boundedText(goal, 2000) && !placeholder.test(goal.trim()) && boundedText(title, 160) && title === title.trim()) {
     return { goal, title, ...(unquotedTitle && ambiguousQuestionTitle.test(unquotedTitle)
-      ? { error: 'workflow_target_clarification_required' } : {}) }
+      ? { error: 'workflow_target_clarification_required' } : {}),
+      ...(/^[0-9]{1,3}$/u.test(unquotedTitle ?? '') ? { alias: unquotedTitle } : {}) }
   }
 }
 
@@ -113,6 +116,34 @@ function validateProposal(value) {
 function uniqueTitle(items, title) {
   const matches = matchingTitles(items, title, () => true)
   if (matches.length === 1 && isId(matches[0].to)) return matches[0]
+}
+
+function contextTarget(items, registry, owner, selector) {
+  if (selector.kind === 'title') {
+    const found = uniqueTitle(items, selector.value)
+    return found?.title === selector.value ? found : denied('workflow_context_target_ambiguous')
+  }
+  const groups = registry.list()
+  const owningGroups = groups.filter(({ sessionIds }) => sessionIds.includes(owner))
+  if (owningGroups.length > 1) return denied('workflow_context_target_ambiguous')
+  const [workspace] = owningGroups
+  const members = new Set(workspace?.sessionIds ?? groups.flatMap(({ sessionIds }) => sessionIds))
+  const inScope = workspace ? (id) => members.has(id) : (id) => !members.has(id)
+  const matches = items.flatMap(({ sessionId, blank, parentSessionId, origin, projections }) => {
+    const title = projections?.values?.title
+    const alias = typeof title === 'string' && /^([0-9]{1,3})(?=$|[ \t｜|·—–-])/u.exec(title)
+    return !blank && !parentSessionId && origin !== 'subagent' && isId(sessionId) &&
+      inScope(sessionId) && alias?.[1] === selector.value ? [{ to: sessionId, title, workspace: workspace?.id ?? null }] : []
+  })
+  if (matches.length > 1) return denied('workflow_context_alias_conflict')
+  return matches[0] ?? denied('workflow_context_alias_unknown')
+}
+
+export function matchesContextNotice(message, notice) {
+  const { source } = message
+  return message.id === notice.id && message.role === 'user' && source?.kind === 'agent-message' &&
+    source.form === 'relay' && source.senderSessionId === notice.owner && source.bridgeWorkflowOwner === notice.owner &&
+    source.bridgeWorkflowKind === 'direct-notice' && plainText(message) === notice.text
 }
 
 function resolvePlan(items, proposal, source, owner, available) {
@@ -185,6 +216,7 @@ function emptyNativeInbox(ctx, session) {
 
 export function createWorkflowAuthorization(ctx, { enabled, available, existing, signal }) {
   const pending = new Map()
+  const contextual = new Map()
   const inTurn = (exec, caller, current) => {
     const live = current(exec)
     return enabled() && live?.id === caller.id && live.turn === caller.turn && live.context === caller.context
@@ -194,16 +226,34 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
 
   function input(session, turn, message) {
     const draft = pending.get(session.id)
+    const saved = contextual.get(session.id)
     pending.delete(session.id)
+    contextual.delete(session.id)
     if (turn.mixed || !enabled() || !available(session.id)) return
+    const adjacent = saved && saved.afterTurn + 1 === turn.number && saved.expires > performance.now() ? saved : undefined
     const text = proposalSource(message)
-    if (text === undefined) return
+    if (text === undefined) {
+      if (adjacent?.notice && matchesContextNotice(message, adjacent.notice)) {
+        return { mode: 'direct-context-notice', saved: adjacent }
+      }
+      return
+    }
     const identity = { messageId: message.id, rpcId: message.source.rpcId, turn: turn.number }
     if (text.trim() === confirmationText) {
       return { mode: 'confirm-workflow', identity, draft }
     }
     const direct = directIntent(text)
-    if (direct) return { mode: 'direct-workflow', identity, text, direct }
+    if (direct && !direct.alias) return { mode: 'direct-workflow', identity, text, direct }
+    if (direct?.alias && withdrawsQuestion(direct.goal)) return
+    const request = direct?.alias ? {
+      action: 'ask', selector: { kind: 'alias', value: direct.alias }, goal: direct.goal,
+    } : !naturalIntent(text) && contextualRequest(text, adjacent?.notice ? undefined : adjacent)
+    if (request) {
+      if (request.action === 'topic' && request.selector) {
+        request.binding = selectTarget(session.id, request.selector, AbortSignal.any([signal, AbortSignal.timeout(5000)]))
+      }
+      return { mode: 'direct-workflow', identity, text, direct: request, contextual: true }
+    }
     if (delegationIntent(text)) {
       return { mode: 'propose-workflow', identity, text }
     }
@@ -317,27 +367,94 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
     return open(draft.grant, evidence)
   }
 
+  async function selectTarget(owner, selector, requestSignal) {
+    try {
+      const { items } = await readWindows(requestSignal)
+      return contextTarget(items, ctx.workspaceRegistry, owner, selector)
+    } catch {
+      return denied('workflow_targets_unavailable')
+    }
+  }
+
+  function keepContext(owner, saved) {
+    if (saved.proofs.length >= contextTurnLimit || saved.expires <= performance.now()) return
+    contextual.set(owner, saved)
+    const expiry = setTimeout(() => {
+      if (contextual.get(owner) === saved) contextual.delete(owner)
+    }, Math.max(0, saved.expires - performance.now()))
+    expiry.unref()
+  }
+
+  function rememberTopic(owner, direct, proof) {
+    const { selector, goal } = direct
+    keepContext(owner, {
+      selector, goal, afterTurn: proof.turn, proofs: [proof], expires: performance.now() + draftLifetime,
+      binding: direct.binding,
+    })
+  }
+
+  function rememberClarification(owner, direct, proof, clarification, notice) {
+    keepContext(owner, {
+      ...clarification, notice, afterTurn: proof.turn,
+      proofs: [...(direct.prior?.proofs ?? []), proof], expires: direct.prior?.expires ?? performance.now() + draftLifetime,
+    })
+  }
+
+  function rememberAfterNotice(owner, saved, proof) {
+    keepContext(owner, { ...saved, notice: undefined, afterTurn: proof.turn, proofs: [...saved.proofs, proof] })
+  }
+
+  async function contextualTarget(caller, requestSignal) {
+    const { id, context: { direct } } = caller
+    const { selector, goal, prior, inheritedTarget } = direct
+    const need = (error, clarification) => ({ error, clarification })
+    if (!selector) return goal ? need('workflow_context_target_required', { missing: 'target', goal })
+      : need('workflow_context_both_required', { missing: 'both' })
+    const clarifyTarget = (error) => need(error, { missing: goal ? 'target' : 'both', goal })
+    const first = inheritedTarget ? await prior.binding : await selectTarget(id, selector, requestSignal)
+    if (!first) return clarifyTarget('workflow_context_target_required')
+    if (first.error) return clarifyTarget(first.error)
+    if (first.to === id || !available(first.to) || !await existing(first.to, requestSignal)) {
+      return clarifyTarget('workflow_target_not_available')
+    }
+    const target = await selectTarget(id, selector, requestSignal)
+    if (target.error) return clarifyTarget(target.error)
+    if (target.to !== first.to || target.title !== first.title || target.workspace !== first.workspace || !available(target.to)) {
+      return clarifyTarget('workflow_target_changed')
+    }
+    if (!goal) return need('workflow_context_goal_required', { missing: 'goal', selector, binding: target })
+    return { target }
+  }
+
   async function delegateDirect(exec, caller, current, open) {
     const { context, id } = caller
-    if (context.mode !== 'direct-workflow' || !inTurn(exec, caller, current)) {
+    if (context.mode !== 'direct-workflow' || !inTurn(exec, caller, current) ||
+        (context.contextual && context.direct.action !== 'ask')) {
       return denied('workflow_direct_owner_request_required')
     }
     if (context.directResult) return { ...context.directResult, duplicate: true }
     if (context.delegating) return denied('workflow_direct_in_progress')
-    const { goal, title, error } = context.direct
+    const { goal, title, error, prior } = context.direct
     if (error) return denied(error)
     const requestSignal = scopedSignal(exec)
     context.delegating = true
     let target
     try {
-      const first = uniqueTitle((await readWindows(requestSignal)).items, title)
-      if (first?.title !== title) return denied('workflow_target_clarification_required')
-      if (first.to === id || !available(first.to) || !await existing(first.to, requestSignal)) {
-        return denied('workflow_target_not_available')
-      }
-      target = uniqueTitle((await readWindows(requestSignal)).items, title)
-      if (target?.to !== first.to || target.title !== title || !available(first.to)) {
-        return denied('workflow_target_changed')
+      if (context.contextual) {
+        if (prior && prior.expires <= performance.now()) return denied('workflow_context_expired')
+        const resolved = await contextualTarget(caller, requestSignal)
+        if (resolved.error) return resolved
+        target = resolved.target
+      } else {
+        const first = uniqueTitle((await readWindows(requestSignal)).items, title)
+        if (first?.title !== title) return denied('workflow_target_clarification_required')
+        if (first.to === id || !available(first.to) || !await existing(first.to, requestSignal)) {
+          return denied('workflow_target_not_available')
+        }
+        target = uniqueTitle((await readWindows(requestSignal)).items, title)
+        if (target?.to !== first.to || target.title !== title || !available(first.to)) {
+          return denied('workflow_target_changed')
+        }
       }
     } catch {
       return denied('workflow_targets_unavailable')
@@ -347,20 +464,33 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
     if (!inTurn(exec, caller, current) || !emptyNativeInbox(ctx, exec.agent.session)) {
       return denied('workflow_direct_owner_request_required')
     }
+    if (prior && prior.expires <= performance.now()) return denied('workflow_context_expired')
     const task = 'direct-' + digest(JSON.stringify([id, context.identity.messageId]))
     const grant = {
       task, goal, ttlMinutes: directLifetimeMinutes, budget: 1,
       scopes: [{ name: 'execute', purpose: '执行所有者明确给出的原文目标', targets: [target.to] }],
     }
-    const targets = [{ id: target.to, title }]
+    const targets = [{ id: target.to, title: target.title }]
     const result = open(grant, {
       kind: 'native-owner-workflow-direct',
       request: { ...context.identity, sourceDigest: digest(context.text) },
       targets, planDigest: digest(JSON.stringify([grant, targets])),
+      ...(context.contextual ? { context: {
+        selector: context.direct.selector,
+        ...(target.workspace !== undefined ? { workspace: target.workspace } : {}),
+        earlierInputs: (prior?.proofs ?? []).filter((proof) => !proof.notice).map((proof) => ({
+          ...proof.input, turn: proof.turn, endSequence: proof.endSeq, sourceDigest: proof.sourceDigest,
+        })),
+      } } : {}),
     })
     if (result?.duplicate === false) context.directResult = result
     return result
   }
 
-  return { input, reply, end, clear: (id) => pending.delete(id), propose, confirm, delegateDirect }
+  function clear(id) {
+    pending.delete(id)
+    contextual.delete(id)
+  }
+  return { input, reply, end, clear, propose, confirm, delegateDirect,
+    rememberTopic, rememberClarification, rememberAfterNotice }
 }

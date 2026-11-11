@@ -1,8 +1,8 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync } from 'node:fs'
 import { join } from 'node:path'
 import { hostContext, matchingTitles, plainText } from './natural-message.js'
-import { createWorkflowAuthorization, workflowProposalProperties } from './workflow-authorization.js'
+import { createWorkflowAuthorization, matchesContextNotice, workflowProposalProperties } from './workflow-authorization.js'
 import { openLedger } from './workflow-ledger.js'
 import { registerWorkflowView } from './workflow-view.js'
 
@@ -31,6 +31,18 @@ const directNotices = {
   workflow_targets_unavailable: '委托未发送。暂时无法核对目标窗口，请稍后重试。',
   grant_not_opened: '无法建立新的委托任务。请检查右栏的原主控任务后重试。',
 }
+const contextualNotices = {
+  workflow_context_target_required: '这句话还没指明窗口。你想问哪个窗口？请回窗口名。',
+  workflow_context_goal_required: '窗口已找到。你想问什么？',
+  workflow_context_both_required: '你想问哪个窗口、问什么？',
+  workflow_context_alias_conflict: '当前会话组里有多个窗口使用这个短号。你指哪个？请回完整标题。',
+  workflow_context_alias_unknown: '当前会话组里没找到这个短号。你指哪个窗口？请回完整标题。',
+  workflow_context_target_ambiguous: '还不能唯一确定窗口。请回一个完整且唯一的窗口名。',
+  workflow_context_expired: '刚才的上下文已过期。请再说一次窗口和要问的问题。',
+  workflow_target_changed: '窗口或工作区发生了变化。现在想问哪个窗口？请回完整标题。',
+  workflow_target_not_available: '这个窗口当前不可用。请核对白名单，或告诉我另一个窗口的完整标题。',
+}
+const digest = (text) => createHash('sha256').update(text).digest('hex')
 const idSchema = { type: 'string', pattern: ID.source, maxLength: 128 }
 const uuidSchema = { type: 'string', pattern: UUID.source }
 const textSchema = (maxLength) => ({ type: 'string', minLength: 1, maxLength })
@@ -286,8 +298,10 @@ function closeTurnEvidence(events, closure, anchor) {
     if (event.type === 'user/message' && !hostContext(event.data)) {
       const { data, seq } = event
       const matchesSource = anchor ? isWake(anchor, 'result', data)
-        : nativeOwner(data) && data.source.rpcId === closure.input.rpcId
-      if (inputSeen || seq !== closure.input.sequence || data.id !== closure.input.messageId || !matchesSource) return
+        : closure.notice ? matchesContextNotice(data, closure.notice)
+          : nativeOwner(data) && data.source.rpcId === closure.input.rpcId
+      if (inputSeen || seq !== closure.input.sequence || data.id !== closure.input.messageId || !matchesSource ||
+          (closure.sourceDigest && digest(plainText(data) ?? '') !== closure.sourceDigest)) return
       inputSeen = true
     }
     if (event.type === 'turn/end') {
@@ -500,9 +514,9 @@ export function applyWorkflow(ctx, config, allowed, activity) {
         const natural = authorization.input(session, turn, event.data)
         if (!turn.mixed) {
           turn.context = wake ?? natural ?? controlInput(session, turn, event.data)
-          if (wake || nativeOwner(event.data)) turn.input = {
+          if (wake || natural?.mode === 'direct-context-notice' || nativeOwner(event.data)) turn.input = {
             sequence: event.seq, messageId: event.data.id,
-            ...(wake ? {} : { rpcId: source.rpcId }),
+            ...(source?.kind === 'user' ? { rpcId: source.rpcId } : {}),
           }
         }
         // A native owner cancellation still applies even in a mixed turn.
@@ -587,13 +601,27 @@ export function applyWorkflow(ctx, config, allowed, activity) {
     !agent.inbox.nextTurn.length && !agent.inbox.nextStep.length
 
   function finishOwnerInput(session, turn, event) {
-    if (turn.context?.mode !== 'direct-workflow') return
+    const context = turn.context
+    const isNotice = context?.mode === 'direct-context-notice'
+    if (context?.mode !== 'direct-workflow' && !isNotice) return
     const agent = ctx.agents.get(session.id)
     const clean = enabled() && !turn.mixed && event.data.reason.kind === 'completed' &&
       agent?.session === session && cleanInbox(agent) && turn.input &&
       Number.isSafeInteger(event.seq) && Number.isFinite(event.time)
-    const proof = { startSeq: turn.startSeq, turn: turn.number, input: turn.input, requestedAt: 0 }
-    const previous = turn.context.directResult
+    const proof = {
+      startSeq: turn.startSeq, turn: turn.number, input: turn.input, requestedAt: 0, endSeq: event.seq,
+      ...(context.contextual || isNotice ? { sourceDigest: digest(isNotice ? context.saved.notice.text : context.text) } : {}),
+      ...(isNotice ? { notice: context.saved.notice } : {}),
+    }
+    if (isNotice) {
+      if (clean) authorization.rememberAfterNotice(session.id, context.saved, proof)
+      return
+    }
+    if (context.contextual && context.direct.action === 'topic') {
+      if (clean) authorization.rememberTopic(session.id, context.direct, proof)
+      return
+    }
+    const previous = context.directResult
     if (previous) {
       if (clean) ledger.change(({ jobs }) => {
         const admission = jobs[previous.id]?.ownerAdmission
@@ -610,15 +638,30 @@ export function applyWorkflow(ctx, config, allowed, activity) {
       ctx.agents.get(session.id) === agent && cleanInbox(agent) ? caller : undefined
     void Promise.resolve().then(async () => {
       await bounded(() => ctx.sessions.flush(session))
-      const events = await bounded((deadline) => hostEvents(ctx, session.id, proof.startSeq, deadline))
-      const end = closeTurnEvidence(events, proof)
-      if (end?.reason !== 'completed' || end.sequence !== event.seq || !stillCurrent()) return
-      const result = await authorization.delegateDirect({ agent, signal }, caller, stillCurrent,
-        (input, evidence) => openDirect(caller, input, { ...evidence, ownerTurnEnd: end }))
-      const notice = directNotices[result?.error]
+      const proofs = [...(context.direct.prior?.proofs ?? []), proof]
+      const events = await bounded((deadline) => hostEvents(ctx, session.id, proofs[0].startSeq, deadline))
+      let end
+      let offset = 0
+      for (const [index, step] of proofs.entries()) {
+        if (index && step.turn !== proofs[index - 1].turn + 1) return
+        while (events[offset]?.seq < step.startSeq) {
+          if (index && events[offset].type === 'turn/start') return
+          offset++
+        }
+        end = closeTurnEvidence(events.slice(offset), step)
+        if (end?.reason !== 'completed' || end.sequence !== step.endSeq) return
+        offset = events.findIndex(({ seq }) => seq === end.sequence) + 1
+      }
+      if (!stillCurrent()) return
+      const result = await bounded((deadline) => authorization.delegateDirect({ agent, signal: deadline }, caller, stillCurrent,
+        (input, evidence) => openDirect(caller, input, { ...evidence, ownerTurnEnd: end })))
+      const notice = (context.contextual ? contextualNotices[result?.error] : undefined) ?? directNotices[result?.error]
       if (notice && stillCurrent()) {
+        const id = randomUUID()
+        if (result.clarification) authorization.rememberClarification(session.id, context.direct, proof,
+          result.clarification, { id, owner: session.id, text: notice })
         agent.followup({
-          id: randomUUID(), role: 'user', content: [{ type: 'text', text: notice }],
+          id, role: 'user', content: [{ type: 'text', text: notice }],
           source: {
             kind: 'agent-message', form: 'relay', senderSessionId: session.id,
             bridgeWorkflowKind: 'direct-notice', bridgeWorkflowOwner: session.id,
@@ -633,9 +676,12 @@ export function applyWorkflow(ctx, config, allowed, activity) {
   }
 
   register('delegate_direct',
-    'A precise one-window owner request is handled by the host at the end of its native turn. If you call this tool, call once without arguments. A queued receipt names the matched targetTitle. The host releases the assignment after verifying the owner turn. Use workflow_propose for broader requests.',
+    'A precise one-window owner request is handled by the host at the end of its native turn. If you call this tool, call once without arguments. A queued receipt names the matched targetTitle. A contextual request may return waiting_for_owner_turn_end or waiting_for_owner_request without opening an assignment. The host releases work only after verifying the owner turn. Use workflow_propose for broader requests.',
     {}, (args, exec, caller) => {
       if (!args || Object.keys(args).length !== 0) return denied('workflow_direct_arguments_not_allowed')
+      if (caller.context.mode === 'direct-workflow' && caller.context.contextual) {
+        return { state: caller.context.direct.action === 'topic' ? 'waiting_for_owner_request' : 'waiting_for_owner_turn_end' }
+      }
       return authorization.delegateDirect(exec, caller, current, (input, evidence) =>
         openDirect(caller, input, evidence, {
           startSeq: caller.turn.startSeq, turn: caller.turn.number, input: caller.turn.input, requestedAt: Date.now(),

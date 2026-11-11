@@ -1,4 +1,4 @@
-# dsh-session-bridge 0.5.0-rc.12
+# dsh-session-bridge 0.5.0-rc.13
 
 适用于 DeepSeek Harness Web 0.2.2-rc.1。全新安装可通过「插件 → 添加插件」输入宿主机可读的包绝对路径并启用。已有版本请先按下文迁移。
 
@@ -59,6 +59,12 @@
 在原主控窗口输入「请把合成候选的实现交给开发窗口，把独立核查交给核查窗口，等两项都返回后交给审核窗口。审核退回就安排返修并复审」。主控生成方案，列出任务、目标、窗口标题、用途、有效期和总派工预算。看到完整预览且该轮结束后，在原主控回复「确认委托」。原主控 DSH 所有者的这条原生输入开立方案。窗口同名、目标或范围含糊时先澄清。回复「取消委托」可作废待确认方案。
 
 主控在批准范围内并行派工、等齐汇总、按原任务返修和收口。共用执行窗口逐项领取。批次等待每项回报、失败或进入待核对，只返回一次结果通知。主控可查看部分失败并按剩余预算返修。遇到待核对或明确要求所有者决定的回报，主控从原窗口继续处理，确认后可输入 `继续委托 <任务>`。右栏「开始 → dsh-session-bridge → 原主控任务」可查看批次、尝试、执行窗口、回报、失败和接续状态。
+
+### 用相邻对话问一个窗口
+
+在原主控输入「你看一下02窗口今天干了啥，你问一下他」，或者先说「你看一下02窗口今天干了啥」，等该轮结束后再说「你问一下他」。前一句建立本轮话题，实际查问由带「问」的原生所有者输入触发。也可以直接说「帮我问问02窗口，插件还有哪些坑？」。派工按原话里的问题发送。
+
+数字短号按标题开头的独立数字匹配，例如 `02-合成查询`。短号只在原主控所属工作区内匹配，未分组时只查未分组会话。集合内多个候选时，请回一个完整且唯一的标题，例如「是『02-合成查询』」。如果系统问要问什么，直接回复完整问题即可。相邻话题绑定前轮已解析的窗口和原文，目标变化时重新询问。上下文最长保留两分钟，取消、无关输入、中继、提前排队或宿主重启后请重新给出窗口和问题。
 
 ### 工具与验收接口
 
@@ -129,23 +135,27 @@ npm pack --offline --pack-destination "$lab"
 npm install --prefix "$lab/tools" playwright-core@1.65.0
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.12.tgz" full \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.13.tgz" full \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.12.tgz" stress
+  "$lab/local-dsh-session-bridge-0.5.0-rc.13.tgz" stress
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration-auto.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.12.tgz" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.13.tgz" \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/sidebar-transfers.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.12.tgz" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.13.tgz" \
+  "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
+unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+  "$(command -v node)" ./test/collaboration-contextual.mjs "$(command -v dsh)" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.13.tgz" \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 for test in collaboration-auto collaboration-direct collaboration-recovery collaboration-expiry; do
   unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
     "$(command -v node)" "./test/$test.mjs" "$(command -v dsh)" \
-    "$lab/local-dsh-session-bridge-0.5.0-rc.12.tgz"
+    "$lab/local-dsh-session-bridge-0.5.0-rc.13.tgz"
 done
 bash .github/ci/run.sh
 ```
@@ -154,7 +164,7 @@ bash .github/ci/run.sh
 
 0.4.5-rc.2 同布局换包用 `test/collaboration-rollback.mjs <dsh> <固定 0.4.5-rc.2 tgz> <候选 tgz>`，同样在 loopback 命名空间运行。基线包从 `87b06bf9fc8f9b3fc523d0ab227edd9d284c8609` 打包，SHA-256 为 `fb5de752634093c23be783fdf507b86e23ca362250ea787756de09f1e6ff6a91`。
 
-恢复和真实模型闭环测试在一次性宿主启用逐步时间快照，复验派工、接续重启和收口。真实模型闭环用 `node ./test/collaboration-pilot.mjs "$(command -v dsh)" "$lab/local-dsh-session-bridge-0.5.0-rc.12.tgz" gpt-6.1-sol`。该脚本使用合成窗口和文件、loopback 模型适配器，以及已授权的 Codex 模型访问。适配器只传合成任务，并把模型选择交给宿主真实执行的委托工具。
+恢复和真实模型闭环测试在一次性宿主启用逐步时间快照，复验派工、接续重启和收口。真实模型闭环用 `node ./test/collaboration-pilot.mjs "$(command -v dsh)" "$lab/local-dsh-session-bridge-0.5.0-rc.13.tgz" gpt-6.1-sol`。该脚本使用合成窗口和文件、loopback 模型适配器，以及已授权的 Codex 模型访问。适配器只传合成任务，并把模型选择交给宿主真实执行的委托工具。
 
 ### 自然语句隔离复验
 
@@ -166,11 +176,11 @@ npm pack --offline --pack-destination "$lab"
 npm install --prefix "$lab/tools" playwright-core@1.65.0
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/natural-send.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.12.tgz" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.13.tgz" \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/natural-send-time-context.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.12.tgz"
+  "$lab/local-dsh-session-bridge-0.5.0-rc.13.tgz"
 bash .github/ci/run.sh
 ```
 

@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-session-bridge",
-  "version": "0.5.0-rc.12",
+  "version": "0.5.0-rc.13",
   "description": "Relay messages and delegate bounded tasks between existing DSH sessions.",
   "private": true,
   "type": "module",
@@ -20,6 +20,7 @@
     "icon.svg",
     "workflow.js",
     "workflow-authorization.js",
+    "workflow-context.js",
     "workflow-view.js",
     "workflow-ledger.js"
   ],
