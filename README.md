@@ -95,6 +95,8 @@
 
 输入 `请拟一条消息发给审核窗口` 或 `把刚才的摘要发给审核窗口` 时，助手在原窗口展示完整草稿。预览包含收件标题和正文，换行与控制字符以可见转义表示。预览轮结束且宿主确认没有待处理输入后，草稿才接受确认。所有者等这一轮结束，在同一窗口回复 `确认发送` 即可投递冻结的标题和正文。若预览轮结束时仍有排队输入，需重新提出发送请求。回复 `取消发送`、转入其他话题或超过两分钟未确认都会结束草稿。发送前再次核对窗口标题、白名单和当前轮次。
 
+宿主自动追加的原生时间快照会保留同轮草稿和确认。所有者或中继发送的额外输入仍会使原草稿失效。
+
 在发送会话由 DSH 所有者输入 `授权互传 目标会话ID 请求号`，下一行开始写准确正文。助手用 `send_session_message` 按原样发送，从原发送会话用 `session_message_status` 查投递和处理。精确重试只返回已有回执。迁移保留回执内容和去重键。目标轮次正常回复并落盘仅证明处理，项目验收仍要看结构化结果和产物。
 
 ### 从 0.4.4-rc.3 或 0.4.5-rc.2 换入或回退
@@ -113,26 +115,26 @@ npm pack --offline --pack-destination "$lab"
 npm install --prefix "$lab/tools" playwright-core@1.65.0
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.3.tgz" full \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.4.tgz" full \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.3.tgz" stress
+  "$lab/local-dsh-session-bridge-0.5.0-rc.4.tgz" stress
 for test in collaboration-direct collaboration-recovery collaboration-expiry; do
   unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
     "$(command -v node)" "./test/$test.mjs" "$(command -v dsh)" \
-    "$lab/local-dsh-session-bridge-0.5.0-rc.3.tgz"
+    "$lab/local-dsh-session-bridge-0.5.0-rc.4.tgz"
 done
 bash .github/ci/run.sh
 ```
 
 同布局换包用 `test/collaboration-rollback.mjs <dsh> <固定 0.4.5-rc.2 tgz> <候选 tgz>`，同样在 loopback 命名空间运行。基线包从 `87b06bf9fc8f9b3fc523d0ab227edd9d284c8609` 打包，SHA-256 为 `fb5de752634093c23be783fdf507b86e23ca362250ea787756de09f1e6ff6a91`。
 
-恢复和真实模型闭环测试在一次性宿主启用逐步时间快照，复验派工、接续重启和收口。真实模型闭环用 `node ./test/collaboration-pilot.mjs "$(command -v dsh)" "$lab/local-dsh-session-bridge-0.5.0-rc.3.tgz" gpt-6.1-sol`。该脚本使用合成窗口和文件、loopback 模型适配器，以及已授权的 Codex 模型访问。适配器只传合成任务，并把模型选择交给宿主真实执行的委托工具。
+恢复和真实模型闭环测试在一次性宿主启用逐步时间快照，复验派工、接续重启和收口。真实模型闭环用 `node ./test/collaboration-pilot.mjs "$(command -v dsh)" "$lab/local-dsh-session-bridge-0.5.0-rc.4.tgz" gpt-6.1-sol`。该脚本使用合成窗口和文件、loopback 模型适配器，以及已授权的 Codex 模型访问。适配器只传合成任务，并把模型选择交给宿主真实执行的委托工具。
 
 ### 自然语句隔离复验
 
-使用固定 DSH Web 0.2.2-rc.1、Node 24.22.2、Chrome 和 Playwright Core 1.65.0。在 0.4.5-rc.2 源码目录（`87b06bf`）运行下列命令。测试在仅有 loopback 的网络命名空间内启动 Web、浏览器和合成模型，并使用一次性配置与会话。
+使用固定 DSH Web 0.2.2-rc.1、Node 24.22.2、Chrome 和 Playwright Core 1.65.0。在候选源码目录运行下列命令。测试在仅有 loopback 的网络命名空间内启动 Web、浏览器和合成模型，并使用一次性配置与会话。
 
 ```sh
 lab="$(mktemp -d)"
@@ -140,12 +142,17 @@ npm pack --offline --pack-destination "$lab"
 npm install --prefix "$lab/tools" playwright-core@1.65.0
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/natural-send.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.4.5-rc.2.tgz" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.4.tgz" \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
+unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+  "$(command -v node)" ./test/natural-send-time-context.mjs "$(command -v dsh)" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.4.tgz"
 bash .github/ci/run.sh
 ```
 
 测试会在模型输出预览前通过原生 `session/prompt` 提交 `queue` 与 `steer` 两种确认，核对入队、预览、确认处理和轮结束的顺序，并验证零投递。正常路径在浏览器显示完整预览且该轮结束后提交确认。
+
+时间快照用例在固定宿主分别触发草稿工具回报后和确认工具前的时间刷新，核对原生事件顺序、投递和去重。同轮出现拥有相同文字的所有者或中继输入时，验证草稿失效和零投递。
 
 ## 迁移与回退隔离复验
 

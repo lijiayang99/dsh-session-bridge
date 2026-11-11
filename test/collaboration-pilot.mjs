@@ -38,7 +38,12 @@ async function decide(body, { lab, signal }) {
     return { reply: '合成窗口就绪。' }
   }
   assert(timings.length + requestIds.size < 65, 'Pilot exceeded its inference request limit')
-  const allowed = body.tools.filter(({ name }) => name.startsWith('workflow_'))
+  const proposed = latestPrompt(body.messages, (text) => text.startsWith('请分派这项任务：让试验开发窗口'))
+  const preview = proposed?.results.findLast((result) => result?.confirmation === 'owner_reply_required')?.preview
+  const confirm = latestPrompt(body.messages, (text) => text === '确认委托')
+  const opening = confirm && confirm.results.length === 0
+  const allowed = body.tools.filter(({ name }) => name.startsWith('workflow_') && !preview &&
+    (!opening || name === 'workflow_confirm'))
   const modelWork = join(lab, 'empty-model-workspace')
   await mkdir(modelWork, { recursive: true, mode: 0o700 })
   const sequence = requestIds.size + timings.length + 1
@@ -56,7 +61,7 @@ async function decide(body, { lab, signal }) {
     },
   }))
 
-  const prompt = [
+  const generalPrompt = [
     'You are choosing exactly one next step for an isolated DSH synthetic test conversation.',
     'Use only a DSH tool shown below. Do not invoke Codex tools. Do not invent tool responses.',
     'For a tool, choose its exact name, put a JSON argument object encoded as a string in inputJson, and leave text empty.',
@@ -69,6 +74,11 @@ async function decide(body, { lab, signal }) {
     'Use the supplied conversation, actual tool results, and definitions.',
     JSON.stringify({ system: body.system, messages: body.messages, tools: allowed }),
   ].join('\n')
+  // These two steps carry the exact native preview or confirmation, so a
+  // short model request can complete within the product's draft deadline.
+  const prompt = preview ? 'Choose answer with inputJson "{}". Copy this decoded JSON string exactly into text: ' + JSON.stringify(preview)
+    : opening ? 'The original DSH owner just sent 确认委托 for the displayed plan. Choose workflow_confirm with inputJson "{}" and empty text.'
+      : generalPrompt
   const environmentKeys = [
     'PATH', 'HOME', 'USER', 'LOGNAME', 'CODEX_HOME', 'LANG', 'LC_ALL', 'TERM',
     'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR',
@@ -99,11 +109,17 @@ async function decide(body, { lab, signal }) {
     child.stdin.end(prompt)
     await completed
     const decision = JSON.parse(await readFile(output, 'utf8'))
-    if (decision.name === 'answer') return { reply: decision.text }
+    if (decision.name === 'answer') {
+      console.log('MODEL step', JSON.stringify({ sequence, action: 'answer', durationMs: Math.round(performance.now() - started) }))
+      return { reply: decision.text }
+    }
     assert(allowed.some(({ name }) => name === decision.name))
     const input = JSON.parse(decision.inputJson)
     assert(input && typeof input === 'object' && !Array.isArray(input))
     toolCounts[decision.name] = (toolCounts[decision.name] ?? 0) + 1
+    console.log('MODEL step', JSON.stringify({ sequence, action: decision.name,
+      item: input.item, attempt: input.attempt, status: input.status, outcome: input.outcome,
+      durationMs: Math.round(performance.now() - started) }))
     return tool(decision.name, input)
   } finally {
     requestIds.delete(sequence)
@@ -143,7 +159,9 @@ await withCollaborationHost({
   assert(!host.snapshot(main, task).grant)
   console.log('PASS real model prepared and rendered the exact owner preview')
   const confirmed = await host.turn(main, await host.submit(main, '确认委托'), 480_000)
-  assert(confirmed.results.some(({ task: named, duplicate }) => named === task && duplicate === false))
+  assert(confirmed.results.some(({ task: named, duplicate }) => named === task && duplicate === false),
+    'Model did not confirm the native owner plan: ' + JSON.stringify(confirmed.results.map(({ error, task, duplicate }) =>
+      ({ error, task, duplicate }))))
   console.log('PASS native owner confirmation enabled the real-model controller')
   const final = await host.until(() => {
     const state = host.snapshot(main, task)

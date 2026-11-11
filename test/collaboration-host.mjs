@@ -36,6 +36,41 @@ export function latestPrompt(messages, matches) {
   }
 }
 
+export async function installSteerRelayFixture(host) {
+  const folder = join(host.lab, 'synthetic-closeout-relay')
+  const name = '@local/dsh-bridge-closeout-relay-fixture'
+  await mkdir(folder)
+  await writeFile(join(folder, 'package.json'), JSON.stringify({
+    name, version: '0.0.0', private: true, type: 'module', exports: { '.': './index.js' },
+    dsh: { bundle: { patch: './cordis.patch.yml' } }, engines: { dsh: '0.2.2-rc.1' },
+  }))
+  await writeFile(join(folder, 'cordis.patch.yml'),
+    '- insert:\n    - id: bridge-closeout-relay-fixture\n      name: ' + JSON.stringify(name) + '\n')
+  await writeFile(join(folder, 'index.js'), `
+    import { randomUUID } from 'node:crypto'
+    export const inject = ['agents', 'tools']
+    export function apply(ctx) {
+      ctx.tools.register({
+        name: 'collaboration_fixture_steer_relay',
+        description: 'Place synthetic relay text into the next step of an active native turn.',
+        parameters: { type: 'object', required: ['target', 'text'],
+          properties: { target: { type: 'string' }, text: { type: 'string' } } },
+        output: { schema: { type: 'object', additionalProperties: true },
+          render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+        execute({ target, text }, exec) {
+          const id = randomUUID()
+          ctx.agents.get(target).steer({
+            id, role: 'user', content: [{ type: 'text', text }],
+            source: { kind: 'agent-message', form: 'relay', senderSessionId: exec.agent.session.id },
+          })
+          return { id }
+        },
+      })
+    }
+  `)
+  await host.install(folder, name)
+}
+
 export async function withCollaborationHost({
   dsh, archive, bootstrap = archive, decide, modelDeadlineMs = 15_000, allowNetwork = false, timeRefreshIntervalMs,
 }, run) {

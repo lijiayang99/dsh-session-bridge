@@ -1,8 +1,6 @@
 import assert from 'node:assert/strict'
-import { mkdir, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
-import { latestPrompt, tool, withCollaborationHost } from './collaboration-host.mjs'
+import { installSteerRelayFixture, latestPrompt, tool, withCollaborationHost } from './collaboration-host.mjs'
 
 const [dsh, archive] = process.argv.slice(2)
 assert(dsh && archive, 'Usage: node test/collaboration-recovery.mjs <dsh> <candidate.tgz>')
@@ -278,41 +276,6 @@ async function stopPendingClose(host, expire) {
   console.log('PASS ' + state + ' grant cannot commit a pending close after normal native turn end and restart')
 }
 
-async function installRelayFixture(host) {
-  const folder = join(host.lab, 'synthetic-closeout-relay')
-  const name = '@local/dsh-bridge-closeout-relay-fixture'
-  await mkdir(folder)
-  await writeFile(join(folder, 'package.json'), JSON.stringify({
-    name, version: '0.0.0', private: true, type: 'module', exports: { '.': './index.js' },
-    dsh: { bundle: { patch: './cordis.patch.yml' } }, engines: { dsh: '0.2.2-rc.1' },
-  }))
-  await writeFile(join(folder, 'cordis.patch.yml'),
-    '- insert:\n    - id: bridge-closeout-relay-fixture\n      name: ' + JSON.stringify(name) + '\n')
-  await writeFile(join(folder, 'index.js'), `
-    import { randomUUID } from 'node:crypto'
-    export const inject = ['agents', 'tools']
-    export function apply(ctx) {
-      ctx.tools.register({
-        name: 'collaboration_fixture_steer_relay',
-        description: 'Place synthetic relay text into the next step of an active native turn.',
-        parameters: { type: 'object', required: ['target', 'text'],
-          properties: { target: { type: 'string' }, text: { type: 'string' } } },
-        output: { schema: { type: 'object', additionalProperties: true },
-          render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
-        execute({ target, text }, exec) {
-          const id = randomUUID()
-          ctx.agents.get(target).steer({
-            id, role: 'user', content: [{ type: 'text', text }],
-            source: { kind: 'agent-message', form: 'relay', senderSessionId: exec.agent.session.id },
-          })
-          return { id }
-        },
-      })
-    }
-  `)
-  await host.install(folder, name)
-}
-
 async function rejectLookalikeTimeInput(host, relay) {
   const task = 'synthetic-close-counterfeit-time-' + (relay ? 'relay' : 'owner')
   const { test, anchor, pending } = await holdClose(host, task)
@@ -509,7 +472,7 @@ async function cancelWithLateReport(host) {
 await withCollaborationHost({ dsh, archive, decide, modelDeadlineMs: 80_000, timeRefreshIntervalMs: 0 }, async (host) => {
   await host.createSessions(Object.entries(titles))
   await host.save({ enabled: false, workflowEnabled: true, allowedSessions: [owner, worker, child] })
-  await installRelayFixture(host)
+  await installSteerRelayFixture(host)
   await normalClose(host, false)
   await normalClose(host, true)
   await interruptClose(host, false)

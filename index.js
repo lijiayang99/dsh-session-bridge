@@ -6,7 +6,7 @@ import {
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { draftPreview, matchingTitles, naturalIntent } from './natural-message.js'
+import { draftPreview, hostContext, matchingTitles, naturalIntent } from './natural-message.js'
 import { applyWorkflow } from './workflow.js'
 
 // Local DSH bundles are linked, so resolve the schema from the running DSH CLI.
@@ -170,6 +170,7 @@ export function apply(ctx, config) {
     }
     if (!active) return
     if (event.type === 'user/message') {
+      if (web && hostContext(event.data)) return
       clearNatural(active)
       const draft = drafts.get(session.id)
       drafts.delete(session.id)

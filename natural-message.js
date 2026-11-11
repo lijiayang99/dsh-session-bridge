@@ -1,3 +1,19 @@
+export function plainText(message) {
+  return message.content?.length === 1 && message.content[0]?.type === 'text'
+    ? message.content[0].text : undefined
+}
+
+export function hostContext(message) {
+  const { source } = message
+  if (source?.kind === 'runtime-context') return true
+  // The fixed Web host's time-context plugin appends a source-attributed
+  // snapshot between steps. Prompt and relay APIs cannot set this source.
+  const section = source?.sections?.[0]
+  return message.role === 'user' && source?.kind === 'time-context' && source.form === 'snapshot' &&
+    Array.isArray(source.sections) && source.sections.length === 1 && section?.name === 'time-context' &&
+    typeof section.text === 'string' && section.text === plainText(message)
+}
+
 const lead = '(?:(?:请帮我|帮我|请|麻烦你)[ \\t]*)?'
 const target = '([^：:\\r\\n]{1,160}?)'
 const toTarget = `(?:给${target}(?:发(?:送)?(?:一条)?消息|说)|发(?:送)?(?:一条)?消息给${target}|告诉${target})`

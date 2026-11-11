@@ -12,7 +12,7 @@ assert.equal(process.argv.length, 6, 'Usage: node test/natural-send.mjs <dsh> <t
 assert(Object.values(networkInterfaces()).flat().every(({ internal }) => internal), 'Use a loopback-only network namespace')
 const [dsh, archive, playwright, chrome] = process.argv.slice(2).map((path) => resolve(path))
 const pkg = JSON.parse(execFileSync('tar', ['-xOf', archive, 'package/package.json'], { encoding: 'utf8' }))
-assert.equal(pkg.version, '0.4.5-rc.2')
+assert.match(pkg.version, /^(?:0\.4\.5-rc\.2|0\.5\.0-rc\.[1-9]\d*)$/)
 assert.equal(pkg.engines.dsh, '0.2.2-rc.1')
 
 const lab = await mkdtemp(join(tmpdir(), 'bridge-natural-send-'))
