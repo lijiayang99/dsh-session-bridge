@@ -23,3 +23,5 @@ The closeout cases cover dispatch and duplicate requests while closeout is pendi
 Time-context cases use the fixed host's source-attributed clock snapshot. They cover owner confirmation, result dispatch and closeout replay. An owner or relay message carrying the same visible text remains a separate input and must preserve the mixed-turn fence.
 
 The ordinary send cases check the same native time snapshot around the complete preview and the subsequent owner confirmation. They also verify that an additional owner or relay input containing the same text clears the frozen send authorization.
+
+Colloquial routing cases exercise a bounded owner question to one named window and the original controller's result. They also verify that ambiguous or untrusted inputs do not dispatch, and that a quoted literal with a window suffix outside the title is delivered as ordinary text.
