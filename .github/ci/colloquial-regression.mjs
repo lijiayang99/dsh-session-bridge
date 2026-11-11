@@ -32,6 +32,7 @@ test('an exact colloquial owner question delegates once and returns the answer t
   assert.equal(opened.budget, 1)
   host.rename(worker, '合成派工后改名')
   assert.deepEqual(await ownerDispatch(host), { ...opened, duplicate: true })
+  host.rename(worker, receiptTitle)
   host.end(main)
 
   const job = await host.receive(worker)

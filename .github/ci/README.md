@@ -31,3 +31,5 @@ Direct-delegation receipt cases bind the queued status and exact title to the ac
 One-shot closeout cases exercise the 128-grant boundary, archived grant and attempt evidence, and a durable reply recovered after restart. The deadline cases distinguish when the native result turn completed from when the plugin restarted. Negative cases cover earlier, blank and interrupted replies, mixed turns, failure, owner action, cancellation, late reports and records created without the reply sequence.
 
 Expiry recovery cases hold the durable history scan to check that an expired grant cannot resume work while awaiting evidence. They verify capacity is reusable once recovery settles, and that a missing turn end or unreadable history results in expiration and no replay.
+
+Native direct-result cases verify owner-turn admission, no-tool dispatch, original-controller report text and no replay after restart. A provisional tool receipt remains idempotent if the title changes, while admission rejects the changed binding. Older jobs without the native-result marker retain the model-visible reply fence.
