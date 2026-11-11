@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { test } from 'node:test'
 import { createWorkflowAuthorization } from '../../workflow-authorization.js'
+import { contextualRequest } from '../../workflow-context.js'
 import { fixture, main, ownerSource, secondMain, until, worker } from './host-fixture.mjs'
 import '../../test/contextual-authorization.mjs'
 
@@ -61,6 +62,8 @@ test('adjacent owner turns bind exact input, workspace, and one native return wi
 for (const [name, text] of [
   ['a question to an exact quoted title with a trailing owner withdrawal', '你给「02-合成查询」窗口问他今天干了啥，算了。'],
   ['a contextual question with a separate forwarding instruction', '帮我问问02窗口，插件还有哪些坑？把结果发给03窗口。今天能处理吗？'],
+  ['an explicit polite cancellation', '你给「02-合成查询」窗口问他今天干了啥，请取消委托。'],
+  ['a separate conditional forwarding instruction', '帮我问问02窗口，插件还有哪些坑？收到回复后请把结果发给03窗口。今天能处理吗？'],
 ]) {
   test('direct authorization rejects ' + name, () => {
     const auth = createWorkflowAuthorization({}, {
@@ -74,3 +77,10 @@ for (const [name, text] of [
     assert.notEqual(context?.mode, 'direct-workflow')
   })
 }
+
+test('a question about the delegation feature preserves its topic and punctuation', () => {
+  const goal = '委托功能的状态，为什么没有更新？'
+  assert.deepEqual(contextualRequest('帮我问问02窗口，' + goal), {
+    action: 'ask', selector: { kind: 'alias', value: '02' }, goal,
+  })
+})

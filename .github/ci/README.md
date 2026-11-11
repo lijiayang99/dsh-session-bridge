@@ -41,3 +41,5 @@ Sidebar activity cases cover transport limits and deadlines, observer isolation 
 A history-only write must notify the activity observer after the transaction commits. The archival reconciliation test verifies that this path publishes the same persisted delivery state as an active-ledger update.
 
 Contextual direct tests cover adjacent owner proofs, workspace-scoped aliases, exact question text and one native result without controller tools. An explicit trailing withdrawal and a separate forwarding instruction are authorization negatives. The native Chrome fixture covers visible clarification, renames, pre-queued input and ordinary relay.
+
+The question boundary also covers a polite explicit cancellation, a separate forwarding instruction with a time condition, and a legitimate single question whose topic names the delegation feature.
