@@ -1,6 +1,28 @@
 # dsh-session-bridge
 
-当前 `main` 提供 `0.5.0-rc.8`，固定包已通过独立技术复审。插件仅支持 DSH Web `0.2.2-rc.1`，需要 Node `24.9+`。DSH 包名为 `@local/dsh-session-bridge`，右栏入口为「开始 → dsh-session-bridge」。侧栏显示宿主兼容状态。宿主身份未知时拒绝新发送与派工。
+当前版本为 `0.5.0-rc.12`，固定包已通过独立技术复审。插件仅支持 DSH Web `0.2.2-rc.1`，需要 Node `24.9+`。DSH 包名为 `@local/dsh-session-bridge`，右栏入口为「开始 → dsh-session-bridge」。侧栏显示宿主兼容状态。宿主身份未知时拒绝新发送与派工。
+
+## 从 GitHub 换包
+
+在「插件 → 添加插件」输入以下固定安装地址。DSH Web `0.2.2-rc.1` 的「更新」只处理 npm registry 来源，GitHub 来源通过「添加插件」手动换包。
+
+```text
+github:lijiayang99/dsh-session-bridge#d75d9b70dda847d793db88eed0691787afea81ef
+```
+
+换包前停发并排空，记录开关和白名单，关闭互传与委托，完整停机备份配置、回执和账本。换包并完整重启后，核对版本、设置和历史，再按原授权恢复功能。[固定安装源码](https://github.com/lijiayang99/dsh-session-bridge/tree/d75d9b70dda847d793db88eed0691787afea81ef) · [停机换包与回退](../README.md#停机换包与回退)
+
+已在隔离环境验收的回退入口为 `0.5.0-rc.8`，固定引用为 `github:lijiayang99/dsh-session-bridge#11e4b546949922e7a07fb84285c45ff1aa24c438`。此前从 rc.8 换入 rc.10 并回退 rc.8，保留了设置、白名单、普通回执和已收口直派历史。回退前先核对并收口或取消活动任务，保全未决尝试和账本。[rc.8 固定源码](https://github.com/lijiayang99/dsh-session-bridge/tree/11e4b546949922e7a07fb84285c45ff1aa24c438)
+
+更早的隔离原生测试从 rc.4 换入 rc.8 并回退固定 `0.5.0-rc.4`（`9018c657c25fd2bea07ea44555e53fc60d6c7fd8`），重启后读回了白名单、关闭状态、两代普通回执和工作流历史。`0.4.5-rc.2` 回退基线为 `87b06bf9fc8f9b3fc523d0ab227edd9d284c8609`。从旧命名版本换包还须停机迁移。[旧命名迁移规程](../README.md#迁移与回退)
+
+## rc.12 的跨窗口操作
+
+所有者给出唯一白名单窗口和明确问题时，宿主在原生输入轮正常结束并核验后自动派工。目标同名或不明确时，原主控聊天显示澄清提示。执行窗口提交的回报会在原主控聊天显示。[跨窗口任务](../README.md#跨窗口任务)
+
+右栏总开关同时控制会话互传和任务委托。旧版开关值分别保留，两项值不一致时显示部分启用。仅保存白名单时保留这两个值，显式操作总开关并保存时才将两项设为同一状态。[插件设置](../README.md)
+
+普通互传、派工和结果回传在左栏会话行显示状态。启用动效时，宿主实际尝试投递且两行都在视口内，小飞机会从发送行飞到接收行。重新打开页面时不会补播。归档对账完成后，相关会话行显示「已对账」。[左栏传递状态](../README.md#左栏传递状态)
 
 ## `0.5.0-rc.8` 单次直派回报与收口
 
@@ -26,13 +48,7 @@ PR #7 和合入后的主线 GitHub Actions 各通过 33 项合成测试，含双
 
 一次所有者授权可交办多个子任务。执行窗口领取并提交报告，结果回到原主控。两个功能开关独立，普通互传保留逐条授权。
 
-## 从 GitHub 换包
-
-DSH Web `0.2.2-rc.1` 的「更新」只处理 npm registry 来源。GitHub 来源使用「插件 → 添加插件」手动换包，`0.5.0-rc.8` 的固定安装引用为 `github:lijiayang99/dsh-session-bridge#11e4b546949922e7a07fb84285c45ff1aa24c438`。固定产品和审核组合的离线复打与已验收归档指纹一致。[固定安装源码](https://github.com/lijiayang99/dsh-session-bridge/tree/11e4b546949922e7a07fb84285c45ff1aa24c438)
-
 此前已在隔离环境实测 GitHub 手动换包，从固定 0.4.4-rc.3 换入当时主线的 0.4.5-rc.2。原生 `listVersions` 和 `updateBundle` 均拒绝 GitHub 来源。关闭两个功能开关、移除旧包并从「添加插件」换入后，完整重启读回两个开关均关闭，合成白名单保留。
-
-本次已实测的回退版本为 `0.5.0-rc.4`，固定源码引用为 `github:lijiayang99/dsh-session-bridge#9018c657c25fd2bea07ea44555e53fc60d6c7fd8`。隔离原生测试用固定归档从 rc.4 换入 rc.8 并回退 rc.4，完整重启后读回白名单、关闭状态、两代普通回执和工作流历史。按包 README 停发、排空、关闭两个开关并完整停机备份。换包后完整重启，核对版本、设置和历史后再恢复开关。更早的 `0.4.5-rc.2` 回退基线保留在固定提交 `87b06bf9fc8f9b3fc523d0ab227edd9d284c8609`。从旧命名版本换包还须停机迁移。[包 README 的换包与回退规程](../README.md#从-044-rc3-或-045-rc2-换入或回退) · [旧命名迁移规程](../README.md#迁移与回退)
 
 0.4.2 已验收的 GitHub 原生安装使用固定提交 `8fa0a210b3bf8241a5eebdc21794b49da49f447a`。该版本的右栏入口显示为「窗口互传」。[0.4.2 固定源码](https://github.com/lijiayang99/dsh-session-bridge/tree/8fa0a210b3bf8241a5eebdc21794b49da49f447a)
 
