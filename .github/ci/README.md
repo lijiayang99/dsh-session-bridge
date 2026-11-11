@@ -21,3 +21,5 @@ The 0.5.0 collaboration cases run against the product and CI combination tree. T
 The closeout cases cover dispatch and duplicate requests while closeout is pending, cancellation and expiry before turn completion, and restart with or without durable turn completion. They check the first closeout payload, preserve the committed downstream attempt, and exercise explicit owner reconciliation before success.
 
 Time-context cases use the fixed host's source-attributed clock snapshot. They cover owner confirmation, result dispatch and closeout replay. An owner or relay message carrying the same visible text remains a separate input and must preserve the mixed-turn fence.
+
+The ordinary send cases check the same native time snapshot around the complete preview and the subsequent owner confirmation. They also verify that an additional owner or relay input containing the same text clears the frozen send authorization.

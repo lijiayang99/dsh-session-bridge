@@ -588,3 +588,59 @@ for (const [kind, source] of [
     host.end(main)
   })
 }
+
+const ordinaryBody = '保持原样的合成消息。'
+const ordinaryDraft = '请拟一条消息发给' + workerTitle
+const sendNatural = (host, args = {}) => host.call(main, 'send_natural_session_message', args)
+
+async function prepareOrdinaryDraft(host) {
+  host.begin(main, ordinaryDraft)
+  const prepared = await sendNatural(host, { draft: ordinaryBody })
+  assert.equal(prepared.confirmation, 'owner_reply_required', JSON.stringify(prepared))
+  assert(prepared.preview.includes(ordinaryBody))
+  return prepared.preview
+}
+
+for (const phase of ['preview', 'confirmation']) {
+  test('ordinary send preserves the confirmed draft across a host time snapshot during ' + phase, async t => {
+    const host = await collaborationHost(t)
+    const preview = await prepareOrdinaryDraft(host)
+    if (phase === 'preview') emitTimeSnapshot(host, main)
+    host.reply(main, preview)
+    host.end(main)
+    assert.deepEqual(host.deliveries, [])
+
+    host.begin(main, '确认发送')
+    if (phase === 'confirmation') emitTimeSnapshot(host, main)
+    const sent = await sendNatural(host)
+    assert.equal(sent.delivery, 'delivered', JSON.stringify(sent))
+    assert.equal(sent.duplicate, false)
+    const replay = await sendNatural(host)
+    assert.equal(replay.duplicate, true)
+    assert.equal(replay.messageId, sent.messageId)
+    host.end(main)
+    const received = await host.receive(worker)
+    assert.equal(received.id, sent.messageId)
+    assert.equal(received.source.senderSessionId, main)
+    assert(received.content[0].text.endsWith('\n' + ordinaryBody))
+    assert.equal(host.deliveries.length, 1)
+    host.end(worker)
+  })
+}
+
+for (const [kind, source] of [
+  ['owner', { kind: 'user', rpcId: 'synth-extra-owner-input' }],
+  ['relay', relaySource],
+]) {
+  test('ordinary send still rejects confirmation followed by ' + kind + ' input with time-context text', async t => {
+    const host = await collaborationHost(t)
+    host.reply(main, await prepareOrdinaryDraft(host))
+    host.end(main)
+
+    host.begin(main, '确认发送')
+    host.appendInput(main, timeText, source)
+    assert.deepEqual(await sendNatural(host), { error: 'message_authorization_required' })
+    assert.deepEqual(host.deliveries, [])
+    host.end(main)
+  })
+}
