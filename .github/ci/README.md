@@ -39,3 +39,9 @@ The clarification case leaves one of the same-named windows outside the allowlis
 Sidebar activity cases cover transport limits and deadlines, observer isolation from committed writes, and direction and sequence for actual attempts only. Reconnected clients receive a baseline frame, and a revoked endpoint is omitted even if its activity is still in memory. The separate native Chrome fixture checks geometry, overlap, visibility and rendering.
 
 A history-only write must notify the activity observer after the transaction commits. The archival reconciliation test verifies that this path publishes the same persisted delivery state as an active-ledger update.
+
+Contextual direct tests cover adjacent owner proofs, workspace-scoped aliases, exact question text and one native result without controller tools. An explicit trailing withdrawal and a separate forwarding instruction are authorization negatives. The native Chrome fixture covers visible clarification, renames, pre-queued input and ordinary relay.
+
+The question boundary also covers a polite explicit cancellation, a separate forwarding instruction with a time condition, and a legitimate single question whose topic names the delegation feature.
+
+Conversation cases cover cancellation queued before a provisional named-window message can be released, and native final-body supplementation restricted to the exact live parent and current child run. Native Chrome tests exercise the real host tools, preserved permissions and the rendered final reply.

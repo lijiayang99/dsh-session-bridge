@@ -21,9 +21,9 @@ export function createActivity(allowed) {
     const now = Date.now()
     prune(now)
     const rows = []
-    for (const { id, from, to, kind, state, flight, startedAt } of routes.values()) {
+    for (const { id, from, to, kind, state, flight, startedAt, nativeParent } of routes.values()) {
       let visible
-      try { visible = allowed(from) && allowed(to) } catch { continue }
+      try { visible = nativeParent ? allowed(nativeParent) : allowed(from) && allowed(to) } catch { continue }
       if (visible) rows.push({
         id, from, to, kind, state,
         ...(flight && now - startedAt < 2500 ? { flight } : {}),
@@ -40,7 +40,7 @@ export function createActivity(allowed) {
     }
   }
 
-  function record({ key, from, to, kind, state, at = Date.now(), keepUntil }, attempt = false) {
+  function record({ key, from, to, kind, state, at = Date.now(), keepUntil, nativeParent }, attempt = false) {
     if (typeof key !== 'string' || typeof from !== 'string' || typeof to !== 'string' || from === to) return
     const previous = routes.get(key)
     if (previous?.state === state && (!attempt || previous.flight)) return
@@ -50,7 +50,7 @@ export function createActivity(allowed) {
     if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return
     routes.delete(key)
     routes.set(key, {
-      id: previous?.id ?? ++nextId, from, to, kind, state, expiresAt,
+      id: previous?.id ?? ++nextId, from, to, kind, state, expiresAt, nativeParent,
       ...(attempt && !previous?.flight
         ? { flight: ++sequence, startedAt: Date.now() }
         : { flight: previous?.flight, startedAt: previous?.startedAt }),

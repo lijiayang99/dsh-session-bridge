@@ -1,20 +1,30 @@
 # dsh-session-bridge
 
-当前版本为 `0.5.0-rc.12`，固定包已通过独立技术复审。插件仅支持 DSH Web `0.2.2-rc.1`，需要 Node `24.9+`。DSH 包名为 `@local/dsh-session-bridge`，右栏入口为「开始 → dsh-session-bridge」。侧栏显示宿主兼容状态。宿主身份未知时拒绝新发送与派工。
+当前版本为 `0.5.0-rc.16`，固定包已通过独立技术复审。插件仅支持 DSH Web `0.2.2-rc.1`，需要 Node `24.9+`。DSH 包名为 `@local/dsh-session-bridge`，右栏入口为「开始 → dsh-session-bridge」。侧栏显示宿主兼容状态。宿主身份未知时拒绝新发送与派工。
 
 ## 从 GitHub 换包
 
 在「插件 → 添加插件」输入以下固定安装地址。DSH Web `0.2.2-rc.1` 的「更新」只处理 npm registry 来源，GitHub 来源通过「添加插件」手动换包。
 
 ```text
-github:lijiayang99/dsh-session-bridge#d75d9b70dda847d793db88eed0691787afea81ef
+github:lijiayang99/dsh-session-bridge#a72d2496f82b05fde841ded6230c180e9e3b087a
 ```
 
-换包前停发并排空，记录开关和白名单，关闭互传与委托，完整停机备份配置、回执和账本。换包并完整重启后，核对版本、设置和历史，再按原授权恢复功能。[固定安装源码](https://github.com/lijiayang99/dsh-session-bridge/tree/d75d9b70dda847d793db88eed0691787afea81ef) · [停机换包与回退](../README.md#停机换包与回退)
+换包前停发并排空，记录开关和白名单，关闭互传与委托，完整停机备份配置、回执和账本。换包并完整重启后，核对版本、设置和历史，再按原授权恢复功能。[固定安装源码](https://github.com/lijiayang99/dsh-session-bridge/tree/a72d2496f82b05fde841ded6230c180e9e3b087a) · [停机换包与回退](../README.md#停机换包与回退)
+
+上一公开版本 `0.5.0-rc.12` 的固定安装地址为 `github:lijiayang99/dsh-session-bridge#d75d9b70dda847d793db88eed0691787afea81ef`。[rc.12 固定源码](https://github.com/lijiayang99/dsh-session-bridge/tree/d75d9b70dda847d793db88eed0691787afea81ef)
 
 已在隔离环境验收的回退入口为 `0.5.0-rc.8`，固定引用为 `github:lijiayang99/dsh-session-bridge#11e4b546949922e7a07fb84285c45ff1aa24c438`。此前从 rc.8 换入 rc.10 并回退 rc.8，保留了设置、白名单、普通回执和已收口直派历史。回退前先核对并收口或取消活动任务，保全未决尝试和账本。[rc.8 固定源码](https://github.com/lijiayang99/dsh-session-bridge/tree/11e4b546949922e7a07fb84285c45ff1aa24c438)
 
 更早的隔离原生测试从 rc.4 换入 rc.8 并回退固定 `0.5.0-rc.4`（`9018c657c25fd2bea07ea44555e53fc60d6c7fd8`），重启后读回了白名单、关闭状态、两代普通回执和工作流历史。`0.4.5-rc.2` 回退基线为 `87b06bf9fc8f9b3fc523d0ab227edd9d284c8609`。从旧命名版本换包还须停机迁移。[旧命名迁移规程](../README.md#迁移与回退)
+
+## rc.16 的跨窗口操作
+
+点名一个唯一的白名单窗口后，可以直接提出问题，也可以在紧邻的下一轮补问。宿主核验所有者输入后按问题原文派工，结果回到原主控。[用相邻对话问一个窗口](../README.md#用相邻对话问一个窗口)
+
+同一任务中，主控和执行窗口可以往返追加指示、问题和进展。原主控已排队的撤回会拦住同任务尚未送达的追加，保留已送达消息和回执。重启后可查回执。[同一任务持续往返](../README.md#同一任务持续往返)
+
+原生子代理沿用宿主的父子消息和权限。子代理遇到权限阻塞时回报主控，由主控通过 DSH 原生审批处理。[原生子代理](../README.md#原生子代理)
 
 ## rc.12 的跨窗口操作
 
