@@ -19,3 +19,5 @@ Native Web installation, browser UI, actual host authentication and durable queu
 The 0.5.0 collaboration cases run against the product and CI combination tree. They drive the registered tools with exact and modified previews, queued and non-owner confirmations, same-window claims, batch retries, and mismatched artifact references. The interrupted-close case verifies that a result turn without completion or reconciliation cannot leave a completed task in the durable ledger. Run the full suite with the launcher above.
 
 The closeout cases cover dispatch and duplicate requests while closeout is pending, cancellation and expiry before turn completion, and restart with or without durable turn completion. They check the first closeout payload, preserve the committed downstream attempt, and exercise explicit owner reconciliation before success.
+
+Time-context cases use the fixed host's source-attributed clock snapshot. They cover owner confirmation, result dispatch and closeout replay. An owner or relay message carrying the same visible text remains a separate input and must preserve the mixed-turn fence.

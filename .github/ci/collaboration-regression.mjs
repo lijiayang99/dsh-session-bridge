@@ -388,7 +388,7 @@ for (const terminalState of ['cancelled', 'expired']) {
 
     await host.restart()
     host.begin(main, 'Inspect the stopped synthetic closeout.')
-    await waitForContinuation(host, task, id, 'verified')
+    await waitForContinuation(host, task, id, terminalState === 'cancelled' ? 'interrupted' : 'verified')
     const snapshot = await waitForClosure(host, terminalState)
     assert.equal(snapshot.state, terminalState)
     assertUnclosed(snapshot)
@@ -474,7 +474,8 @@ test('a different input in the pending closeout turn prevents automatic success'
   host.end(main)
   await host.restart()
   host.begin(main, 'Read the synthetic mixed closeout.')
-  await waitForContinuation(host, task, id, 'verified')
+  const { continuation } = await waitForContinuation(host, task, id, 'interrupted')
+  assert.equal(continuation.reason, 'mixed_turn')
   const snapshot = await waitForClosure(host, 'interrupted')
   assertUnclosed(snapshot)
   assert.equal(snapshot.state, 'paused')
@@ -482,3 +483,108 @@ test('a different input in the pending closeout turn prevents automatic success'
   assert.equal(host.deliveries.length, 2)
   host.end(main)
 })
+
+const timeText = 'Time sampled while preparing turn 8, step 2: 2026-01-01T00:00:00+00:00[UTC]\n' +
+  'Browser time zone for this request: unavailable. Ask the user to clarify otherwise-unqualified dates and times.\n' +
+  'Elapsed since the preceding step context: 1s.'
+const timeSnapshot = {
+  kind: 'time-context', form: 'snapshot', sections: [{ name: 'time-context', text: timeText }],
+}
+
+function emitTimeSnapshot(host, session) {
+  host.appendInput(session, timeText, timeSnapshot)
+}
+
+test('host time context does not consume or create the original owner confirmation', async t => {
+  const host = await collaborationHost(t)
+  host.begin(main, proposalInput)
+  emitTimeSnapshot(host, main)
+  const draft = await host.call(main, 'workflow_propose', proposal)
+  assert.equal(draft.confirmation, 'owner_reply_required')
+  host.reply(main, draft.preview)
+  emitTimeSnapshot(host, main)
+  host.end(main)
+  assert.deepEqual(host.deliveries, [])
+
+  host.begin(main, '确认委托')
+  emitTimeSnapshot(host, main)
+  assert.equal((await confirm(host)).duplicate, false)
+  const saved = await status(host)
+  assert.equal(saved.authorization.kind, 'native-owner-workflow-confirmation')
+  assert(saved.authorization.preview.turn < saved.authorization.confirmation.turn)
+  assert.deepEqual(host.deliveries, [])
+  host.end(main)
+})
+
+test('a fixed host time snapshot preserves result authority and verified closeout across restart', async t => {
+  const host = await collaborationHost(t)
+  const first = await openCloseout(host)
+  emitTimeSnapshot(host, main)
+  const downstream = await dispatchForClose(host, downstreamAssignment)
+  assert.equal(downstream.duplicate, false, JSON.stringify(downstream))
+  host.end(main)
+
+  const lease = await claim(host, reviewer, downstream.id)
+  emitTimeSnapshot(host, reviewer)
+  assert.equal((await report(host, reviewer, lease)).recorded, true)
+  host.end(reviewer)
+  assert.equal((await host.receive(main)).source.bridgeWorkflowId, downstream.id)
+  emitTimeSnapshot(host, main)
+  assert.equal((await consume(host, downstream.id)).duplicate, false)
+  await waitForContinuation(host, task, first, 'verified')
+
+  assert.deepEqual(await completed(host), closeRequest(task))
+  emitTimeSnapshot(host, main)
+  const pending = await status(host)
+  assertUnclosed(pending)
+  assert.equal(pending.closure.state, 'pending')
+  const expectedWakes = wakeIds(host)
+  host.end(main)
+  await host.restart()
+
+  host.begin(main, 'Read the synthetic time-context closeout.')
+  const closed = await waitClosed(host)
+  assert.equal(closed.closure.turnEnd.reason, 'completed')
+  assert.equal(closed.outcome.status, 'completed')
+  assert.deepEqual(closed.jobs.map(job => job.id), [first, downstream.id])
+  assert.deepEqual(wakeIds(host), expectedWakes)
+  host.end(main)
+})
+
+for (const [kind, source] of [
+  ['owner', { kind: 'user', rpcId: 'synth-extra-owner-input' }],
+  ['relay', relaySource],
+  ['malformed snapshot', { ...timeSnapshot, sections: [{ name: 'time-context', text: 'Mismatched snapshot text.' }] }],
+]) {
+  test(kind + ' input with time-context text still blocks dispatch and pending closeout', async t => {
+    const host = await collaborationHost(t)
+    const id = await openCloseout(host)
+    // Match the clock text without changing the input's native source.
+    host.appendInput(main, timeText, source)
+    assert.deepEqual(await dispatchForClose(host, downstreamAssignment), { error: 'workflow_context_required' })
+    host.end(main)
+
+    host.begin(main, 'Inspect the synthetic mixed result.')
+    const { continuation } = await waitForContinuation(host, task, id, 'interrupted')
+    assert.equal(continuation.reason, 'mixed_turn')
+    host.end(main)
+    host.begin(main, '对账委托 ' + task + ' ' + id + ' result\n已核对合成结果。')
+    const reconciled = await status(host)
+    assert.equal(reconciled.jobs[0].continuation.continuation.reconciliation.decision, 'reviewed_without_replay')
+    host.end(main)
+
+    host.begin(main, '继续委托 ' + task)
+    assert.deepEqual(await completed(host), closeRequest(task))
+    host.appendInput(main, timeText, source)
+    host.end(main)
+    await host.restart()
+
+    host.begin(main, 'Read the synthetic mixed closeout.')
+    const snapshot = await waitForClosure(host, 'interrupted')
+    assertUnclosed(snapshot)
+    assert.equal(snapshot.state, 'paused')
+    assert.deepEqual(snapshot.jobs.map(job => job.id), [id])
+    assert.equal(host.deliveries.length, 2)
+    host.end(main)
+  })
+}
