@@ -174,3 +174,24 @@ test('an interrupted direct attempt keeps the queued receipt and produces no ans
   assert.deepEqual(host.deliveries.map(({ target }) => target), [worker])
   host.end(main)
 })
+
+test('a completed ambiguous owner request emits one bound clarification and no assignment', async t => {
+  const host = await queryHost(t)
+  host.rename(secondMain, queryTitle)
+  host.setAllowedSessions([main, worker])
+  host.begin(main, colloquial)
+  assert.deepEqual(host.deliveries, [])
+  host.end(main)
+
+  const notice = await host.receive(main)
+  assert.equal(notice.role, 'user')
+  assert.deepEqual(notice.source, {
+    kind: 'agent-message', form: 'relay', senderSessionId: main,
+    bridgeWorkflowKind: 'direct-notice', bridgeWorkflowOwner: main,
+  })
+  assert.deepEqual(notice.content, [{ type: 'text',
+    text: '委托未发送。请在原窗口重试，使用引号写出一个完整且唯一的窗口名。' }])
+  assert.deepEqual(await ownerDispatch(host), { error: 'workflow_direct_owner_request_required' })
+  host.end(main)
+  assert.deepEqual(host.deliveries.map(({ target }) => target), [main])
+})

@@ -33,3 +33,5 @@ One-shot closeout cases exercise the 128-grant boundary, archived grant and atte
 Expiry recovery cases hold the durable history scan to check that an expired grant cannot resume work while awaiting evidence. They verify capacity is reusable once recovery settles, and that a missing turn end or unreadable history results in expiration and no replay.
 
 Native direct-result cases verify owner-turn admission, no-tool dispatch, original-controller report text and no replay after restart. A provisional tool receipt remains idempotent if the title changes, while admission rejects the changed binding. Older jobs without the native-result marker retain the model-visible reply fence.
+
+The clarification case leaves one of the same-named windows outside the allowlist and checks that ambiguity produces only an owner-bound native clarification. The isolated Chrome integration checks default visibility and a normal relay copying the clarification text.
