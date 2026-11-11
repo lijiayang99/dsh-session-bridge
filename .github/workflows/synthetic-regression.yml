@@ -22,4 +22,7 @@ jobs:
           node-version: '24.22.2'
           package-manager-cache: false
       - name: Run loopback-only synthetic regression
-        run: bash .github/ci/run.sh
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git show -s --format='CI commit %H%nCI tree %T' HEAD
+          bash .github/ci/run.sh
