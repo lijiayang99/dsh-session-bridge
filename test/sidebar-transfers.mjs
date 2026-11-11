@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
@@ -6,8 +8,13 @@ import { latestPrompt, tool, withCollaborationHost } from './collaboration-host.
 
 const [dsh, archive, playwright, chrome, mode] = process.argv.slice(2)
 const existingOwner = 'synthetic-flight-owner'
-assert(dsh && archive && playwright && chrome,
-  'Usage: node test/sidebar-transfers.mjs <dsh> <candidate.tgz> <playwright-core index.mjs> <Chrome> [new]')
+const baseline = mode === 'rc11'
+assert(dsh && archive && playwright && chrome && (mode === undefined || mode === 'new' || baseline),
+  'Usage: node test/sidebar-transfers.mjs <dsh> <candidate.tgz> <playwright-core index.mjs> <Chrome> [new|rc11]')
+if (baseline) {
+  assert.equal(createHash('sha256').update(await readFile(archive)).digest('hex'),
+    'eeb9023482de8493a6ac9851d682255764ffc4a486455ea26386c0d01a4baec5')
+}
 const { chromium } = await import(pathToFileURL(resolve(playwright)).href)
 const worker = 'synthetic-flight-worker'
 const second = 'synthetic-flight-second'
@@ -18,6 +25,9 @@ const hiddenTitle = '合成折叠窗口'
 const queuePrompt = '保持合成执行窗占用'
 const goal = '报告合成投递状态'
 const brokenGoal = '保持合成执行等待取消'
+const resultGoal = '提交合成回报并中断原主控接续'
+const resultSummary = '合成回报，用于核对中断接续'
+const isInterruptedResult = (text) => text.startsWith('委托回报 · ') && text.includes(resultSummary)
 const direct = (text) => '你给' + workerTitle + '这个窗口问他' + text
 const privateBody = 'SYNTHETIC-BODY-NOT-IN-ACTIVITY'
 const reportBody = 'SYNTHETIC-REPORT-NOT-IN-ACTIVITY'
@@ -27,12 +37,23 @@ let queueEntered = false
 let releaseQueue = false
 let claimSeen = false
 let releaseReport = false
+let resultJobId
+let releaseResultReport = false
+let resultConsumed = false
 
 async function decide({ messages }, { signal }) {
-  const current = latestPrompt(messages, (text) => ordinaryPlans.has(text) || text === queuePrompt || marker.test(text))
+  const current = latestPrompt(messages, (text) =>
+    ordinaryPlans.has(text) || text === queuePrompt || marker.test(text) || isInterruptedResult(text))
   if (!current) return { reply: '合成会话正常结束。' }
   const { text, results } = current
   if (ordinaryPlans.has(text)) return results.length ? undefined : tool('send_session_message', ordinaryPlans.get(text))
+  if (isInterruptedResult(text)) {
+    if (!results.length) return tool('workflow_consume', { id: resultJobId })
+    assert.equal(results[0]?.report?.summary, resultSummary)
+    resultConsumed = true
+    await delay(60_000, undefined, { signal })
+    return
+  }
   if (text === queuePrompt) {
     queueEntered = true
     while (!releaseQueue) await delay(20, undefined, { signal })
@@ -43,10 +64,13 @@ async function decide({ messages }, { signal }) {
   if (results.length !== 1) return
   const claim = results[0]
   claimSeen = true
-  while (!releaseReport || claim.goal === brokenGoal) await delay(20, undefined, { signal })
+  if (claim.goal === resultGoal) resultJobId = id
+  while (!releaseReport || claim.goal === brokenGoal || (claim.goal === resultGoal && !releaseResultReport)) {
+    await delay(20, undefined, { signal })
+  }
   return tool('workflow_report', {
     id, attempt: claim.attempt, token: claim.token, status: 'completed',
-    summary: reportBody, evidence: ['synthetic:sidebar'],
+    summary: claim.goal === resultGoal ? resultSummary : reportBody, evidence: ['synthetic:sidebar'],
   })
 }
 
@@ -153,6 +177,51 @@ async function openOwner(host, page) {
   return id
 }
 
+async function reconcileArchived(host, page, owner, initiated, kind) {
+  const task = 'direct-' + createHash('sha256').update(JSON.stringify([owner, initiated.input.data.id])).digest('hex')
+  const getJob = () => host.snapshot(owner, task).jobs[0]
+  const statusOf = (entry) => kind === 'task' ? entry.wake : entry.resume.continuation
+  const job = getJob()
+  const initialState = kind === 'task' ? 'uncertain' : 'interrupted'
+  assert.equal(statusOf(job).state, initialState)
+  await host.prompt(owner, '取消委托 ' + task)
+  await host.until(async () => {
+    const { body } = await host.post('/api/dsh-session-bridge/workflow-view', { sessionId: owner, task })
+    return body.archivedJobs === 1 && body.jobs.some(({ id }) => id === job.id)
+  }, 'cancelled attempt has entered history before owner reconciliation')
+  const sequence = (await frameList(page)).at(-1).sequence
+  const count = (await flights(page)).length
+  const wakeIds = async (id) => (await host.history(id)).filter(({ type, data }) =>
+    type === 'user/message' && data.source?.bridgeWorkflowId === job.id).map(({ data }) => data.id)
+  const before = await Promise.all([wakeIds(worker), wakeIds(owner)])
+  assert.deepEqual(before, [[job.wake.id], kind === 'task' ? [] : [job.resume.id]])
+
+  const turn = await host.prompt(owner, '对账委托 ' + task + ' ' + job.id + ' ' + kind + '\n已在隔离试验核对。')
+  assert.equal(turn.end.data.reason.kind, 'completed')
+  await host.until(() => statusOf(getJob()).reconciliation, 'native owner reconciliation updates the archived attempt')
+  const updated = statusOf(getJob())
+  assert.equal(updated.state, kind === 'task' ? 'reconciled' : 'interrupted')
+  assert.equal(updated.reconciliation.owner, owner)
+  assert.equal(updated.reconciliation.decision, kind === 'task' ? 'release_without_replay' : 'reviewed_without_replay')
+  if (baseline) {
+    await page.waitForTimeout(1600)
+    assert.equal(await state(page, owner, 'uncertain').count(), 1)
+    assert.equal(await state(page, worker, 'uncertain').count(), 1)
+  } else {
+    for (const sessionId of [owner, worker]) {
+      const indicator = state(page, sessionId, 'reconciled')
+      await indicator.waitFor()
+      assert.match(await indicator.getAttribute('aria-label'), /Reconciled/)
+    }
+  }
+  assert.equal((await frameList(page)).at(-1).sequence, sequence)
+  assert.equal((await flights(page)).length, count)
+  assert.deepEqual(await Promise.all([wakeIds(worker), wakeIds(owner)]), before)
+  console.log(baseline
+    ? 'PASS fixed rc.11 reproduces stale sidebar after archived ' + kind + ' reconciliation without replay'
+    : 'PASS archived ' + kind + ' reconciliation updates both sidebar rows without dispatch or flight')
+}
+
 async function run(host, page, launchUrl) {
   const owner = await openOwner(host, page)
   await host.save({ enabled: true, workflowEnabled: true, allowedSessions: [owner, worker, second, hidden] })
@@ -195,7 +264,7 @@ async function run(host, page, launchUrl) {
   console.log('PASS queued assignment has no flight or success flag, claim shows execution, result flies in reverse')
 
   claimSeen = false
-  await host.prompt(owner, direct(brokenGoal))
+  const interruptedTask = await host.prompt(owner, direct(brokenGoal))
   await host.until(() => claimSeen, 'second worker claim awaits cancellation')
   await waitFlights(page, 4)
   await host.rpc('session/cancel', { request: { sessionId: worker } })
@@ -203,6 +272,7 @@ async function run(host, page, launchUrl) {
   assert.equal((await flights(page)).length, 4)
   assert.match(await state(page, owner, 'uncertain').getAttribute('aria-label'), /Needs reconciliation/)
   console.log('PASS interrupted claimed work shows needs reconciliation with no result flight')
+  await reconcileArchived(host, page, owner, interruptedTask, 'task')
 
   const hiddenProject = page.getByText('synthetic-hidden', { exact: true })
   if (await row(page, hidden).isVisible()) await hiddenProject.click()
@@ -319,6 +389,17 @@ async function run(host, page, launchUrl) {
     { signal: AbortSignal.timeout(3000) })
   assert([401, 403].includes(unauthenticated.status))
   console.log('PASS the open stream drops revoked routes and unauthenticated peers cannot read activity')
+
+  const interruptedResult = await host.prompt(owner, direct(resultGoal))
+  await waitFlights(page, 8)
+  releaseResultReport = true
+  await host.until(() => resultConsumed, 'the original controller has consumed the result')
+  await waitFlights(page, 9)
+  await host.rpc('session/cancel', { request: { sessionId: owner } })
+  await state(page, owner, 'uncertain').waitFor()
+  const activity = await state(page, owner, 'uncertain').getAttribute('aria-label')
+  assert.match(activity, /Returned result.*Needs reconciliation/)
+  await reconcileArchived(host, page, owner, interruptedResult, 'result')
 }
 
 await withCollaborationHost({ dsh, archive, decide }, async (host) => {

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { test } from 'node:test'
 import { createActivity } from '../activity.js'
 import { openLedger } from '../workflow-ledger.js'
@@ -74,4 +75,47 @@ test('an activity observer failure cannot invalidate a committed workflow write'
     return { changed: true, value: 'committed' }
   }), 'committed')
   assert.deepEqual(ledger.read().grants.synthetic, { state: 'active' })
+})
+
+test('archive-only job writes are observed after commit and rollback emits nothing', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'bridge-activity-history-'))
+  const notifications = []
+  const ledger = openLedger(dir, (state, archived) => {
+    notifications.push({
+      state, archived, persisted: ledger.history.job('synthetic-history'),
+    })
+  })
+  t.after(async () => {
+    ledger.close()
+    await rm(dir, { recursive: true, force: true })
+  })
+  const database = new DatabaseSync(join(dir, 'workflow-v1.sqlite'))
+  try {
+    database.exec(`CREATE TRIGGER forbid_active_update BEFORE UPDATE ON ledger
+      BEGIN SELECT RAISE(ABORT, 'archive-only write touched the active snapshot'); END`)
+  } finally {
+    database.close()
+  }
+  const job = {
+    id: 'synthetic-history', key: 'owner:task', item: 'execute', attempt: 1,
+    wake: { state: 'uncertain' },
+  }
+  assert.equal(ledger.change((_state, archive) => {
+    archive.job(job)
+    return { changed: false, value: 'archived' }
+  }), 'archived')
+  const reconciled = { ...job, wake: { state: 'reconciled' } }
+  assert.equal(ledger.change((_state, archive) => {
+    archive.job(reconciled)
+    return { changed: false, value: 'reconciled' }
+  }), 'reconciled')
+  assert.throws(() => ledger.change((_state, archive) => {
+    archive.job(job)
+    throw new Error('synthetic rollback')
+  }), /synthetic rollback/)
+  ledger.change(() => ({ changed: false }))
+  assert.deepEqual(notifications, [job, reconciled].map((entry) => ({
+    state: { grants: {}, jobs: {} }, archived: [entry], persisted: entry,
+  })))
+  assert.deepEqual(ledger.history.job(job.id), reconciled)
 })

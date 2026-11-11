@@ -325,14 +325,18 @@ export function applyWorkflow(ctx, config, allowed, activity) {
     try {
       const delivery = deliveryOf(job, kind)
       const continuation = delivery.continuation
+      const reviewedAt = continuation?.state === 'interrupted' &&
+        continuation.reconciliation?.decision === 'reviewed_without_replay' &&
+        Number.isFinite(continuation.reconciliation.at) ? continuation.reconciliation.at : undefined
       let state = activityStates[delivery.state]
       if (attempt) state = 'sending'
+      else if (reviewedAt !== undefined) state = 'reconciled'
       else if ((delivery.state === 'sending' && delivery.reason) || continuation?.state === 'interrupted') state = 'uncertain'
       else if (delivery.state === 'reported' && job.report?.status === 'failed') state = 'failed'
       else if (continuation?.state === 'verified') state = 'received'
       if (state) activity.record({
         key: delivery.id, from: senderOf(job, kind), to: receiverOf(job, kind), kind, state, keepUntil,
-        at: attempt ? Date.now() : continuation?.settledAt ?? delivery.updatedAt,
+        at: attempt ? Date.now() : reviewedAt ?? continuation?.settledAt ?? delivery.updatedAt,
       }, attempt)
     } catch {
       ctx.logger.warn('workflow activity could not be projected')

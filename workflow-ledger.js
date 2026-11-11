@@ -121,10 +121,9 @@ export function openLedger(dir, onCommit) {
               archived.push(entry)
             },
           } : archive)
-          if (changed) {
-            if (set.run(JSON.stringify(state)).changes !== 1) throw new Error('Workflow ledger write failed')
-            committed = state
-          }
+          if (changed && set.run(JSON.stringify(state)).changes !== 1) throw new Error('Workflow ledger write failed')
+          // Archive-only reconciliation writes history without replacing the active snapshot.
+          if (changed || archived.length) committed = state
           return value
         })
         if (onCommit && committed) {
