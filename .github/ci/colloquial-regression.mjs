@@ -19,12 +19,18 @@ async function queryHost(t) {
 
 test('an exact colloquial owner question delegates once and returns the answer to the original controller', async t => {
   const host = await queryHost(t)
-  host.begin(main, colloquial)
+  const receiptTitle = '你是谁'
+  const receiptQuestion = '今天成都天气怎么样'
+  host.rename(worker, receiptTitle)
+  host.begin(main, '你给' + receiptTitle + '这个窗口问他' + receiptQuestion)
   const opened = await ownerDispatch(host)
   assert.equal(opened.duplicate, false, JSON.stringify(opened))
   assert.deepEqual(opened.scopes[0].targets, [worker])
-  assert(opened.goal.includes(question))
+  assert.equal(opened.goal, receiptQuestion)
+  assert.equal(opened.state, 'queued')
+  assert.equal(opened.targetTitle, receiptTitle)
   assert.equal(opened.budget, 1)
+  host.rename(worker, '合成派工后改名')
   assert.deepEqual(await ownerDispatch(host), { ...opened, duplicate: true })
   host.end(main)
 
@@ -63,6 +69,7 @@ test('an exact colloquial owner question delegates once and returns the answer t
     return state.state === 'closed' && state
   }, 'Expected the original controller answer to close normally')
   assert.equal(verified.outcome.summary, resultText)
+  assert.deepEqual(verified.authorization.targets, [{ id: worker, title: receiptTitle }])
   assert.deepEqual(host.deliveries.map(({ target }) => target), [worker, main])
   host.end(main)
 })
@@ -111,4 +118,58 @@ test('an explicit quoted message with an outside window suffix stays an exact or
   assert.equal(message.content[0].text, '[DSH 会话消息｜发送方 ' + main + ']\n' + body)
   assert.deepEqual(host.deliveries.map(({ target }) => target), [worker])
   host.end(worker)
+})
+
+test('a changed title or allowlist before dispatch cannot issue a direct receipt', async t => {
+  const host = await queryHost(t)
+  let reads = 0
+  host.faults.list = () => {
+    if (++reads === 2) host.rename(worker, '合成派工前改名')
+  }
+  host.begin(main, colloquial)
+  assert.deepEqual(await ownerDispatch(host), { error: 'workflow_target_changed' })
+  assert.equal(reads, 2)
+  host.end(main)
+  host.rename(worker, queryTitle)
+
+  reads = 0
+  host.faults.list = () => {
+    if (++reads === 2) host.setAllowedSessions([main, secondMain, reviewer])
+  }
+  host.begin(main, colloquial)
+  assert.deepEqual(await ownerDispatch(host), { error: 'workflow_target_changed' })
+  assert.equal(reads, 2)
+  host.end(main)
+
+  delete host.faults.list
+  host.begin(main, colloquial)
+  assert.deepEqual(await ownerDispatch(host), { error: 'workflow_target_not_available' })
+  host.end(main)
+  assert.deepEqual(host.deliveries, [])
+})
+
+test('an interrupted direct attempt keeps the queued receipt and produces no answer or replay', async t => {
+  const host = await queryHost(t)
+  host.begin(main, colloquial)
+  const opened = await ownerDispatch(host)
+  assert.equal(opened.targetTitle, queryTitle)
+  assert.equal(opened.state, 'queued')
+  host.end(main)
+  assert.equal((await host.receive(worker)).source.bridgeWorkflowId, opened.id)
+  assert.equal((await host.call(worker, 'workflow_claim', { id: opened.id })).duplicate, false)
+  await host.restart()
+
+  host.begin(main, '核对合成中断尝试。')
+  const interrupted = await until(async () => {
+    const current = await status(host, opened.task)
+    return current.jobs?.[0]?.delivery.state === 'uncertain' && current
+  }, 'Expected the claimed attempt to remain unverified after restart')
+  const [job] = interrupted.jobs
+  assert.equal(job.id, opened.id)
+  assert.equal(job.delivery.reason, 'execution_interrupted_after_claim')
+  assert.equal(job.report, undefined)
+  assert.equal(interrupted.outcome, undefined)
+  assert.deepEqual(interrupted.authorization.targets, [{ id: worker, title: queryTitle }])
+  assert.deepEqual(host.deliveries.map(({ target }) => target), [worker])
+  host.end(main)
 })

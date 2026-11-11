@@ -61,7 +61,7 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
     records.get(agent.session.id).push(event)
     for (const listen of listeners) listen(agent.session, event)
   }
-  const allowedSessions = [main, secondMain, worker, reviewer, ...additionalSessions]
+  let allowedSessions = [main, secondMain, worker, reviewer, ...additionalSessions]
   for (const id of [...allowedSessions, outsider]) {
     const queue = []
     pending.set(id, queue)
@@ -99,6 +99,7 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
         return { agent: agents.get(id) }
       },
       async list() {
+        await faults.list?.()
         return { items: [...titles].map(([sessionId, title]) => ({
           sessionId, projections: { values: { title } },
         })) }
@@ -170,6 +171,10 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
     },
     begin(id, text, source = ownerSource) {
       begin(id, ownerMessage(text, source))
+    },
+    setAllowedSessions(ids) {
+      assert(ids.every(id => agents.has(id)))
+      allowedSessions = [...ids]
     },
     rename(id, title) {
       assert(titles.has(id))

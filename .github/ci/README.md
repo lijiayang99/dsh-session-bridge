@@ -25,3 +25,5 @@ Time-context cases use the fixed host's source-attributed clock snapshot. They c
 The ordinary send cases check the same native time snapshot around the complete preview and the subsequent owner confirmation. They also verify that an additional owner or relay input containing the same text clears the frozen send authorization.
 
 Colloquial routing cases exercise a bounded owner question to one named window and the original controller's result. They also verify that ambiguous or untrusted inputs do not dispatch, and that a quoted literal with a window suffix outside the title is delivered as ordinary text.
+
+Direct-delegation receipt cases bind the queued status and exact title to the accepted target, preserve that receipt on a same-turn retry, and exercise route drift before dispatch and interruption after claim.
