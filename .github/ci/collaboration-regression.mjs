@@ -644,3 +644,21 @@ for (const [kind, source] of [
     host.end(main)
   })
 }
+
+test('ordinary exact owner text still delivers once when the host inserts time context', async t => {
+  const host = await collaborationHost(t)
+  host.begin(main, '给' + workerTitle + '发消息：' + ordinaryBody)
+  emitTimeSnapshot(host, main)
+  const sent = await sendNatural(host)
+  assert.equal(sent.delivery, 'delivered', JSON.stringify(sent))
+  assert.equal(sent.duplicate, false)
+  const replay = await sendNatural(host)
+  assert.equal(replay.duplicate, true)
+  assert.equal(replay.messageId, sent.messageId)
+  host.end(main)
+  const received = await host.receive(worker)
+  assert.equal(received.id, sent.messageId)
+  assert(received.content[0].text.endsWith('\n' + ordinaryBody))
+  assert.equal(host.deliveries.length, 1)
+  host.end(worker)
+})
