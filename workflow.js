@@ -105,7 +105,9 @@ function wakeText(job, kind) {
   const header = 'DSH-WORKFLOW ' + kind.toUpperCase() + ' ' + job.id
   if (kind !== 'result' || !job.nativeResult || !job.report || job.report.late) return header
   const { status, summary, evidence } = job.report
-  return '委托回报 · ' + reportLabels[status] + '\n\n' + summary +
+  const route = job.conversation ? ' · ' + job.key.slice(job.owner.length + 1) + ' · ' +
+    job.target + ' → ' + job.owner : ''
+  return '委托回报 · ' + reportLabels[status] + route + '\n\n' + summary +
     (evidence.length ? '\n\n证据\n' + evidence.join('\n') : '')
 }
 
@@ -135,7 +137,8 @@ function setGrantState(grant, state) {
 }
 
 const batchOf = (grant, id) => grant?.batches?.find(({ batch }) => batch === id)
-const isDirectGrant = (grant) => grant?.authorization?.kind === 'native-owner-workflow-direct'
+const isDirectGrant = (grant) => grant?.authorization?.kind === 'native-owner-workflow-direct' ||
+  grant?.conversation && grant.authorization?.kind === 'native-owner-workflow-confirmation' && grant.budget === 1
 
 function sent(delivery) {
   return delivery?.state === 'sending' || delivery?.state === 'admitted'
@@ -288,7 +291,7 @@ async function hostEvidence(ctx, job, kind, signal) {
   }
 }
 
-function closeTurnEvidence(events, closure, anchor) {
+function closeTurnEvidence(events, closure, anchor, matchesInput) {
   const [start] = events
   if (!closure.input || start?.type !== 'turn/start' || start.seq !== closure.startSeq || start.data.turn !== closure.turn) return
   let inputSeen = false
@@ -297,7 +300,7 @@ function closeTurnEvidence(events, closure, anchor) {
     if (event.type === 'turn/start') return
     if (event.type === 'user/message' && !hostContext(event.data)) {
       const { data, seq } = event
-      const matchesSource = anchor ? isWake(anchor, 'result', data)
+      const matchesSource = matchesInput ? matchesInput(data) : anchor ? isWake(anchor, 'result', data)
         : closure.notice ? matchesContextNotice(data, closure.notice)
           : nativeOwner(data) && data.source.rpcId === closure.input.rpcId
       if (inputSeen || seq !== closure.input.sequence || data.id !== closure.input.messageId || !matchesSource ||
@@ -320,7 +323,7 @@ const activityStates = {
   skipped: 'stopped', reconciled: 'reconciled',
 }
 
-export function applyWorkflow(ctx, config, allowed, activity) {
+export function applyWorkflow(ctx, config, allowed, activity, matchConversation) {
   if (lstatSync(join(ctx.profileContext.dir, 'session-bridge-workflow'), { throwIfNoEntry: false })) {
     throw new Error('dsh-session-bridge: migrate the legacy workflow directory with DSH stopped before enabling delegation')
   }
@@ -464,6 +467,7 @@ export function applyWorkflow(ctx, config, allowed, activity) {
       }
       if (evidence) Object.assign(grant, {
         collaboration: true, state: directJob?.ownerAdmission ? 'collaboration_authorizing' : 'collaboration_active',
+        ...(input.conversation ? { conversation: true } : {}),
         budget: input.budget, dispatched: directJob ? 1 : 0,
         authorization: evidence, batches: [],
       })
@@ -475,8 +479,20 @@ export function applyWorkflow(ctx, config, allowed, activity) {
 
   function workflowInput(session, message) {
     const { bridgeWorkflowId: id, bridgeWorkflowKind: kind } = message.source ?? {}
-    if (!UUID.test(id ?? '') || (kind !== 'task' && kind !== 'result')) return
-    const job = jobFor(ledger.read().jobs, id)
+    if (!UUID.test(id ?? '')) return
+    const { grants, jobs } = ledger.read()
+    if (kind === 'conversation') {
+      const job = jobFor(jobs, id)
+      const grant = job && grantFor(grants, job.key)
+      const from = message.source.senderSessionId
+      const to = session.id
+      if (!job?.conversation || !grant?.conversation || !participantPair(job, from, to)) return
+      const route = { id, task: grant.task, from, to }
+      if (!matchConversation(route, message)) return
+      return { mode: 'conversation', id, messageId: message.id, route }
+    }
+    if (kind !== 'task' && kind !== 'result') return
+    const job = jobFor(jobs, id)
     if (!job || receiverOf(job, kind) !== session.id || !isWake(job, kind, message)) return
     return { mode: kind, id, messageId: message.id }
   }
@@ -501,7 +517,7 @@ export function applyWorkflow(ctx, config, allowed, activity) {
         if (hostContext(event.data)) return
         const wake = source?.kind === 'agent-message' ? workflowInput(session, event.data) : undefined
         if (wake) {
-          turn.wakes.push(wake)
+          if (wake.mode !== 'conversation') turn.wakes.push(wake)
           if (wake.mode === 'result') ledger.change(({ jobs }) => {
             const resume = jobs[wake.id]?.resume
             if (!sent(resume) || resume.hostTurn) return noChange()
@@ -514,6 +530,7 @@ export function applyWorkflow(ctx, config, allowed, activity) {
         const natural = authorization.input(session, turn, event.data)
         if (!turn.mixed) {
           turn.context = wake ?? natural ?? controlInput(session, turn, event.data)
+          if (nativeOwner(event.data)) turn.ownerMessage = event.data
           if (wake || natural?.mode === 'direct-context-notice' || nativeOwner(event.data)) turn.input = {
             sequence: event.seq, messageId: event.data.id,
             ...(source?.kind === 'user' ? { rpcId: source.rpcId } : {}),
@@ -530,6 +547,7 @@ export function applyWorkflow(ctx, config, allowed, activity) {
       authorization.end(session, turn, event)
       turns.delete(session.id)
       finishOwnerInput(session, turn, event)
+      finishConversationTurn(session, turn, event)
       ledger.change(({ jobs }) => {
         let changed = false
         for (const wake of turn.wakes) {
@@ -537,6 +555,8 @@ export function applyWorkflow(ctx, config, allowed, activity) {
           if (!job) continue
           const delivery = deliveryOf(job, wake.mode)
           if (wake.mode === 'result' && job.nativeResult && sent(delivery)) continue
+          if (wake.mode === 'task' && job.conversation && delivery.state === 'claimed' &&
+              !turn.mixed && event.data.reason.kind === 'completed') continue
           if (sent(delivery) || (wake.mode === 'task' && delivery.state === 'claimed')) {
             setDelivery(delivery, 'uncertain', wake.mode === 'task' && job.claim
               ? 'execution_ended_without_report' : 'host_turn_ended_without_handshake')
@@ -579,14 +599,15 @@ export function applyWorkflow(ctx, config, allowed, activity) {
     const now = Date.now()
     const target = input.scopes[0].targets[0]
     const job = {
-      id: randomUUID(), key, owner: caller.id, target, item: 'execute', attempt: 1, scope: 'execute',
+      id: randomUUID(), key, owner: caller.id, target, item: 'execute', attempt: 1, scope: input.scopes[0].name,
       instructions: input.goal, acceptance: '按所有者原文完成目标并回报实际结果及证据。',
       after: null, dispatchedTurn: caller.turn.number, createdAt: now, nativeResult: true,
+      ...(input.conversation ? { conversation: true } : {}),
       ...(ownerAdmission ? { ownerAdmission } : {}),
       wake: { id: randomUUID(), state: 'queued', updatedAt: now },
     }
     compact()
-    const grant = openGrant(input, key, caller.id, evidence.request.messageId,
+    const grant = openGrant(input, key, caller.id, (evidence.request ?? evidence.confirmation).messageId,
       caller.turn.number, now, evidence, job)
     if (!grant) return denied('grant_not_opened')
     schedule()
@@ -603,7 +624,8 @@ export function applyWorkflow(ctx, config, allowed, activity) {
   function finishOwnerInput(session, turn, event) {
     const context = turn.context
     const isNotice = context?.mode === 'direct-context-notice'
-    if (context?.mode !== 'direct-workflow' && !isNotice) return
+    const automaticConfirmation = context?.mode === 'confirm-workflow' && isSingleConversation(context.draft?.grant)
+    if (context?.mode !== 'direct-workflow' && !isNotice && !automaticConfirmation) return
     const agent = ctx.agents.get(session.id)
     const clean = enabled() && !turn.mixed && event.data.reason.kind === 'completed' &&
       agent?.session === session && cleanInbox(agent) && turn.input &&
@@ -617,7 +639,7 @@ export function applyWorkflow(ctx, config, allowed, activity) {
       if (clean) authorization.rememberAfterNotice(session.id, context.saved, proof)
       return
     }
-    if (context.contextual && context.direct.action === 'topic') {
+    if (context.contextual && context.direct?.action === 'topic') {
       if (clean) authorization.rememberTopic(session.id, context.direct, proof)
       return
     }
@@ -638,7 +660,7 @@ export function applyWorkflow(ctx, config, allowed, activity) {
       ctx.agents.get(session.id) === agent && cleanInbox(agent) ? caller : undefined
     void Promise.resolve().then(async () => {
       await bounded(() => ctx.sessions.flush(session))
-      const proofs = [...(context.direct.prior?.proofs ?? []), proof]
+      const proofs = [...(context.direct?.prior?.proofs ?? []), proof]
       const events = await bounded((deadline) => hostEvents(ctx, session.id, proofs[0].startSeq, deadline))
       let end
       let offset = 0
@@ -653,6 +675,21 @@ export function applyWorkflow(ctx, config, allowed, activity) {
         offset = events.findIndex(({ seq }) => seq === end.sequence) + 1
       }
       if (!stillCurrent()) return
+      if (automaticConfirmation) {
+        const { previewProof, preview } = context.draft
+        const [shown, ...afterPreview] = await bounded((deadline) =>
+          hostEvents(ctx, session.id, previewProof.sequence, deadline))
+        const shownText = shown?.data.message?.content?.filter(({ type }) => type !== 'reasoning')
+        if (previewProof.turn + 1 !== turn.number || shown?.seq !== previewProof.sequence ||
+            shown.type !== 'assistant/message' || shown.data.turn !== previewProof.turn || shown.data.interrupted ||
+            shown.data.message.id !== previewProof.messageId || shownText?.length !== 1 ||
+            shownText[0].type !== 'text' || shownText[0].text !== preview ||
+            !afterPreview.some(({ type, data }) => type === 'turn/end' &&
+              data.turn === previewProof.turn && data.reason.kind === 'completed')) return
+        await bounded((deadline) => authorization.confirm({ agent, signal: deadline }, caller, stillCurrent,
+          (input, evidence) => openDirect(caller, input, { ...evidence, ownerTurnEnd: end })))
+        return
+      }
       const result = await bounded((deadline) => authorization.delegateDirect({ agent, signal: deadline }, caller, stillCurrent,
         (input, evidence) => openDirect(caller, input, { ...evidence, ownerTurnEnd: end })))
       const notice = (context.contextual ? contextualNotices[result?.error] : undefined) ?? directNotices[result?.error]
@@ -689,12 +726,24 @@ export function applyWorkflow(ctx, config, allowed, activity) {
     })
 
   register('propose',
-    'For an explicit owner delegation request in this turn, prepare a bounded plan with its goal, window titles, purposes, expiry and total assignment budget. Mark each formal review scope with review:true when the owner requests review. Clarify uncertain titles or scope first. If preview is returned, copy its exact text as your entire final reply and wait for the owner.',
-    workflowProposalProperties, (args, exec, caller) => authorization.propose(args, exec, caller, current))
+    'For a delegation requested by the owner in this turn, draft a concrete plan with the goal, window titles, purposes, expiry and assignment budget. Use conversation:true when the owner wants ongoing exchanges with assigned workers. Mark each formal review scope with review:true when the owner requests review. Clarify uncertain titles or scope first. If preview is returned, copy its exact text as your entire final reply and wait for the owner.',
+    workflowProposalProperties, (args, exec, caller) => {
+      if (caller.context.mode === 'owner') {
+        const context = authorization.proposalInput(caller.turn.ownerMessage, caller.turn)
+        if (context) caller.context = caller.turn.context = context
+      }
+      return authorization.propose(args, exec, caller, current)
+    }, Object.keys(workflowProposalProperties).filter((key) => key !== 'conversation'))
+
+  const isSingleConversation = (input) => input?.conversation && input.budget === 1 &&
+    input.scopes.length === 1 && input.scopes[0].targets.length === 1 && !input.scopes[0].review
 
   register('confirm',
-    'Open the frozen workflow plan after the owner replies 确认委托 in the original controller. Call with no arguments. A successful response allows dispatch in this turn.',
+    'Open the frozen workflow plan after the owner affirms the visible preview in the original controller. Call with no arguments. A successful response allows dispatch in this turn.',
     {}, async (_args, exec, caller) => {
+      if (caller.context.draft && isSingleConversation(caller.context.draft.grant)) {
+        return { state: 'waiting_for_owner_turn_end' }
+      }
       const result = await authorization.confirm(exec, caller, current, (input, evidence) => {
         const key = taskKey(caller.id, input.task)
         compact()
@@ -800,6 +849,7 @@ export function applyWorkflow(ctx, config, allowed, activity) {
         const jobId = randomUUID()
         jobs[jobId] = {
           id: jobId, key, owner: id, target, item, attempt, scope, instructions, acceptance,
+          ...(grant.conversation ? { conversation: true } : {}),
           ...(group ? { batch: group.batch } : {}),
           ...(reviewOf ? { reviewOf, artifact } : {}),
           after: context.after ?? null, dispatchedTurn: turn.number, createdAt: now,
@@ -840,17 +890,117 @@ export function applyWorkflow(ctx, config, allowed, activity) {
       return dispatch(task, assignments, exec, caller, { batch, completion })
     })
 
+  const participantPair = (job, from, to) =>
+    from === job.owner && to === job.target || from === job.target && to === job.owner
+
+  function conversationRoute(grant, job, from, to) {
+    if (!job?.conversation || !grant?.conversation || grant.owner !== job.owner ||
+        !grant.scopes.some(({ name, targets }) => name === job.scope && targets.includes(job.target)) ||
+        !canRoute(grant, job, 'task') || job.report || job.wake.state !== 'claimed' ||
+        !claimedHere.has(job.id) || !participantPair(job, from, to)) return
+    return { id: job.id, task: grant.task, from, to }
+  }
+
+  function liveConversation(route) {
+    const { grants, jobs } = ledger.read()
+    const job = jobs[route.id]
+    const active = conversationRoute(grants[job?.key], job, route.from, route.to)
+    return active?.task === route.task
+  }
+
+  function queueMessage({ to, task }, exec, reserve) {
+    const caller = current(exec)
+    const { grants, jobs } = ledger.read()
+    const from = exec.agent?.session?.id
+    const context = turns.get(from)?.context
+    const bound = context?.mode === 'task' || context?.mode === 'conversation' ? jobFor(jobs, context.id) : undefined
+    let job
+    if (bound?.conversation) {
+      if (!caller) return denied('workflow_task_context_required')
+      if (task && task !== bound.id && task !== grantFor(grants, bound.key)?.task) return denied('workflow_task_mismatch')
+      job = jobs[bound.id]
+    } else {
+      const ownerInput = caller?.turn.ownerMessage
+      const text = ownerInput && plainText(ownerInput)
+      const references = new Set(text?.match(/[a-zA-Z0-9_-]+/g))
+      const owned = Object.values(jobs).filter((entry) => entry.conversation && entry.owner === from)
+      const candidates = owned.filter((entry) => entry.target === to)
+      if (!candidates.length && !task) {
+        if (owned.some((entry) => references.has(entry.id) || references.has(grants[entry.key]?.task))) {
+          return denied('workflow_task_route_inactive')
+        }
+        return
+      }
+      if (!text || !['owner', 'main'].includes(context.mode)) return denied('workflow_task_context_required')
+      const named = candidates.filter((entry) => references.has(entry.id) ||
+        references.has(grants[entry.key]?.task))
+      const eligible = named.length ? named : candidates.filter((entry) =>
+        conversationRoute(grants[entry.key], entry, from, to))
+      if (task && !named.length && (eligible.length !== 1 ||
+          task !== eligible[0].id && task !== grants[eligible[0].key]?.task)) {
+        return denied('workflow_task_reference_required')
+      }
+      if (eligible.length > 1) return {
+        error: 'workflow_task_reference_required',
+        tasks: eligible.map((entry) => ({ task: grants[entry.key]?.task, job: entry.id, goal: grants[entry.key]?.goal })),
+      }
+      job = eligible[0]
+      if (job && task && task !== job.id && task !== grants[job.key]?.task) return denied('workflow_task_mismatch')
+    }
+    const route = conversationRoute(grants[job?.key], job, from, to)
+    if (!route) return denied('workflow_task_route_inactive')
+    if (caller.turn.deferred?.length >= 8) return denied('workflow_turn_message_limit')
+    const { receipt, send, stop } = reserve(route)
+    if (send) defer(caller.turn, {
+      run: (deadline) => send(deadline, () => liveConversation(route)),
+      stop,
+    })
+    return receipt
+  }
+
+  function defer(turn, work) {
+    turn.deferred ??= []
+    turn.deferred.push(work)
+  }
+
+  function finishConversationTurn(session, turn, event) {
+    if (!turn.deferred?.length) return
+    const { context, input } = turn
+    const job = (context.mode === 'task' || context.mode === 'conversation') && ledger.read().jobs[context.id]
+    const matchesInput = context.mode === 'conversation' ? (data) => matchConversation(context.route, data)
+      : job ? (data) => isWake(job, 'task', data) : undefined
+    const sourceDigest = turn.ownerMessage && digest(plainText(turn.ownerMessage) ?? '')
+    const proof = { turn: turn.number, startSeq: turn.startSeq, input, requestedAt: 0, sourceDigest }
+    void Promise.resolve().then(async () => {
+      if (turn.mixed || !input || event.data.reason.kind !== 'completed') return
+      await bounded(() => ctx.sessions.flush(session))
+      const end = await bounded(async (deadline) =>
+        closeTurnEvidence(await hostEvents(ctx, session.id, turn.startSeq, deadline), proof, undefined, matchesInput))
+      if (end?.reason !== 'completed' || end.sequence !== event.seq) return
+      for (const entry of turn.deferred) await bounded(entry.run)
+    }).catch(() => {
+      if (!signal.aborted) ctx.logger.warn('workflow task exchange could not be verified')
+    }).finally(() => {
+      for (const entry of turn.deferred) entry.stop?.()
+    })
+  }
+
   register('claim',
-    'When this turn receives DSH-WORKFLOW TASK <id>, call once to claim the task and get its instructions, approved purpose, attempt number and claim token. Execute only under that purpose and the host’s permissions. Do not execute on a duplicate or rejected claim.',
+    'When this turn receives DSH-WORKFLOW TASK <id>, call once to claim the task and get its instructions, approved purpose, attempt number and claim token. Execute only under that purpose and the host’s permissions. For a verified ongoing task message, the same job id retrieves its existing claim. Do not execute on a duplicate or rejected claim.',
     { id: uuidSchema },
     ({ id }, _exec, caller) => {
       const { context, turn } = caller
-      if (context.mode !== 'task' || context.id !== id) return denied('task_wake_required')
+      if (!['task', 'conversation'].includes(context.mode) || context.id !== id) return denied('task_wake_required')
       const result = ledger.change(({ grants, jobs }) => {
         const job = jobFor(jobs, id)
         if (!job) return noChange(denied('task_wake_required'))
-        if (job.claim) return noChange({ id, duplicate: true })
         const grant = grants[job.key]
+        if (context.mode === 'conversation') {
+          if (caller.id !== job.target || !conversationRoute(grant, job, context.route.from, context.route.to)) return noChange(denied('grant_inactive'))
+          return noChange({ id, task: grant.task, owner: job.owner, attempt: job.attempt, token: job.claim.token,
+            instructions: job.instructions, acceptance: job.acceptance, expiresAt: grant.expiresAt, continuation: true })
+        }
+        if (job.claim) return noChange({ id, duplicate: true })
         if (!canRoute(grant, job, 'task') || !jobs[id]) return noChange(denied('grant_inactive'))
         if (!sent(job.wake)) return noChange(denied('delivery_not_claimable'))
         const token = randomUUID()
@@ -869,7 +1019,7 @@ export function applyWorkflow(ctx, config, allowed, activity) {
     })
 
   register('report',
-    'Submit the structured result in the exact turn that claimed the task. Include concrete evidence. A completed producer may report immutable artifacts. An approval or change request for a bound review must give reviewedArtifact exactly as claimed.',
+    'Submit the final structured result in the claiming turn or a verified ongoing task turn. Use send_session_message for interim progress or questions. Include concrete evidence. A completed producer may report immutable artifacts. An approval or change request for a bound review must give reviewedArtifact exactly as claimed.',
     {
       id: uuidSchema, attempt: attemptSchema, token: uuidSchema,
       status: { type: 'string', enum: statuses },
@@ -879,17 +1029,20 @@ export function applyWorkflow(ctx, config, allowed, activity) {
     },
     ({ id, attempt, token, status, summary, evidence, artifacts, reviewedArtifact }, _exec, caller) => {
       const { context, turn } = caller
-      if (context.mode !== 'task' || context.id !== id) return denied('task_wake_required')
+      if (!['task', 'conversation'].includes(context.mode) || context.id !== id) return denied('task_wake_required')
       if (!statuses.includes(status) || !validText(summary, 2400) || !Array.isArray(evidence) ||
           evidence.length > 8 || !evidence.every((entry) => validText(entry, 300)) ||
           (artifacts !== undefined && (!validArtifacts(artifacts) || status !== 'completed')) ||
           (reviewedArtifact !== undefined && !validArtifact(reviewedArtifact)) ||
           (['approved', 'changes_requested'].includes(status) && evidence.length === 0)) return denied('invalid_report')
-      const result = ledger.change(({ grants, jobs }) => {
+      const recordReport = () => ledger.change(({ grants, jobs }) => {
         const job = jobFor(jobs, id)
         const claim = job?.claim
-        if (!claim || job.attempt !== attempt || claim.token !== token ||
-            claim.turn !== turn.number || claim.messageId !== context.messageId) return noChange(denied('claim_mismatch'))
+        const continuation = context.mode === 'conversation' && job?.conversation
+        if (!claim || job.target !== caller.id || job.attempt !== attempt || claim.token !== token ||
+            (!continuation && (claim.turn !== turn.number || claim.messageId !== context.messageId))) {
+          return noChange(denied('claim_mismatch'))
+        }
         if (job.report) {
           const exact = job.report.status === status && job.report.summary === summary &&
             JSON.stringify(job.report.evidence) === JSON.stringify(evidence) &&
@@ -911,6 +1064,7 @@ export function applyWorkflow(ctx, config, allowed, activity) {
         }
         const late = !enabled() || !available(job.owner) || !available(job.target) ||
           !['active', 'paused'].includes(stateOf(grant))
+        if (job.conversation && (late || !activeGrant(grant))) return noChange(denied('grant_inactive'))
         job.report = {
           status, summary, evidence, reporter: caller.id, turn: turn.number, at: Date.now(), late,
           ...(artifacts !== undefined ? { artifacts } : {}),
@@ -923,6 +1077,23 @@ export function applyWorkflow(ctx, config, allowed, activity) {
         }
         return success({ id, recorded: true, duplicate: false, late })
       })
+      const { grants, jobs } = ledger.read()
+      const job = jobs[id]
+      if (job?.conversation) {
+        if (job.target !== caller.id || job.attempt !== attempt || job.claim?.token !== token) return denied('claim_mismatch')
+        if (!conversationRoute(grants[job.key], job, caller.id, job.owner)) return denied('grant_inactive')
+        const reportDigest = digest(JSON.stringify([status, summary, evidence, artifacts, reviewedArtifact]))
+        if (turn.pendingReport) return turn.pendingReport === reportDigest
+          ? { id, queued: true, duplicate: true } : denied('report_conflict')
+        // Validate formal review evidence before promising to record the result.
+        if ((['approved', 'changes_requested'].includes(status) || reviewedArtifact !== undefined) &&
+            (!job.reviewOf || reviewedArtifact !== job.artifact) ||
+            job.reviewOf && (status === 'completed' || artifacts !== undefined)) return denied('artifact_binding_required')
+        turn.pendingReport = reportDigest
+        defer(turn, { run: () => { recordReport(); schedule() } })
+        return { id, queued: true, duplicate: false }
+      }
+      const result = recordReport()
       schedule()
       return result
     }, ['id', 'attempt', 'token', 'status', 'summary', 'evidence'])
@@ -1165,7 +1336,7 @@ export function applyWorkflow(ctx, config, allowed, activity) {
         (state === 'missing_grant' && other.quarantine)
       if (recipient === other.target && (other !== job || kind !== 'task') &&
           active && (!other.quarantine || other.quarantine.taskHadHostRisk) &&
-          (unresolved(other.wake) || other.wake.state === 'claimed')) return true
+          (unresolved(other.wake) || other.wake.state === 'claimed' && !other.conversation)) return true
       return recipient === other.owner && (other !== job || kind !== 'result') &&
         active && (!other.quarantine || other.quarantine.resultHadHostRisk) && unresolved(other.resume)
     })
@@ -1234,6 +1405,7 @@ export function applyWorkflow(ctx, config, allowed, activity) {
           kind: 'agent-message', form: 'relay', senderSessionId: senderOf(job, kind),
           bridgeWorkflowKind: kind, bridgeWorkflowId: job.id,
           ...(kind === 'result' && job.nativeResult ? { bridgeWorkflowOwner: job.owner } : {}),
+          ...(job.conversation ? { bridgeWorkflowTask: job.key.slice(job.owner.length + 1) } : {}),
         },
       })
       if (await bounded(() => ctx.sessions.flush(agent.session)) && !signal.aborted) {
@@ -1249,7 +1421,16 @@ export function applyWorkflow(ctx, config, allowed, activity) {
   async function reconcile(job, kind) {
     const { id, state, updatedAt } = deliveryOf(job, kind)
     if (state === 'claimed') {
-      if (!claimedHere.has(job.id)) checkpoint(job, kind, state, 'uncertain', 'execution_interrupted_after_claim')
+      if (claimedHere.has(job.id)) return
+      if (job.conversation) {
+        const proof = await bounded((deadline) => hostEvidence(ctx, job, kind, deadline)).catch(() => undefined)
+        if (proof?.admissions === 1 && proof.consumptions === 1 && !proof.mixedTurn &&
+            proof.turn === job.claim.turn && proof.endReason === 'completed') {
+          claimedHere.add(job.id)
+          return
+        }
+      }
+      checkpoint(job, kind, state, 'uncertain', 'execution_interrupted_after_claim')
       return
     }
     const to = receiverOf(job, kind)
@@ -1693,7 +1874,8 @@ export function applyWorkflow(ctx, config, allowed, activity) {
       }
       for (const kind of ['task', 'result']) {
         const delivery = deliveryOf(job, kind)
-        if (delivery?.state === 'claimed' || (sent(delivery) && enabled())) {
+        if (delivery?.state === 'claimed' && (!job.conversation || !claimedHere.has(job.id)) ||
+            sent(delivery) && enabled()) {
           add(job, kind, reconcile, 1)
         } else if (delivery?.state === 'queued' && (delivery.retryAt ?? 0) <= Date.now() &&
             canRoute(grants[job.key], job, kind) &&
@@ -1759,4 +1941,5 @@ export function applyWorkflow(ctx, config, allowed, activity) {
       ledger.close()
     }
   }, 'dsh-session-bridge workflow ledger and dispatcher')
+  return { queueMessage }
 }

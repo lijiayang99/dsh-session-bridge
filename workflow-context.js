@@ -20,18 +20,7 @@ const statedQuestion = /^(?:问题是[ \t]*[：:]?[ \t]*|问(?:他|她|它|对�
 const quotedTitle = /^(?:「([^」]+)」|『([^』]+)』|“([^”]+)”)$/u
 const numeric = /^([0-9]{1,3})(?:号)?(?:窗口)?$/u
 const unsafeTitle = /[和与及或跟]|^(?:我|你|他|她|它|对方|那边|另一个|其他|取消|算了|不用问了|先别问了?|取消委托)$/u
-const withdrawal = /^(?:算了|取消(?:委托)?|(?:先)?(?:别|不用|不要|不)问(?:他|她|它|对方)?(?:了)?)$/u
-const requestCourtesy = /^(?:请你|请|麻烦你|麻烦|帮我|你)[ \t]*/u
-const continuationLead = /^(?:再|然后|顺便|顺手|另外|同时|并且|接着|随后|接下来|最后|完成后|结束后|拿到(?:结果|回报|回复)后|记得)[ \t]*[：:]?[ \t]*/u
-const routed = '(?:发(?:送)?(?:给|到)|转(?:发|交|给)|交(?:给|由)|递给|委托给|派(?:给|发给)|(?:分配|分发|安排|指派|交办)给|回(?:传|复|报)给)'
-const followupTarget = '(?:' + title + '(?:窗口|会话)|[0-9]{1,3}(?:号)?|「[^」]{1,160}」|『[^』]{1,160}』|“[^”]{1,160}”)'
-const routingAction = new RegExp('^(?:' +
-  '(?:把|将).{1,160}?' + routed +
-  '|(?:(?:结果|答案|回报|报告|摘要|结论|资料|消息|回复|产物)[ \\t]*)?(?:' + routed +
-  '|发送|委托|派工|派发|指派|分派|分配|分发|交办|安排|告诉)' +
-  '|给.{1,160}?(?:发(?:送)?(?:消息)?|说|留言)' +
-  '|(?:让|' + ask + ')[ \\t]*' + followupTarget +
-  ')[ \\t]*\\S', 'u')
+const withdrawal = /^(?:算了|(?:请[ \t]*)?取消(?:委托)?|(?:先)?(?:别|不用|不要|不)问(?:他|她|它|对方)?(?:了)?)$/u
 const quotedEnd = new Map([['「', '」'], ['『', '』'], ['“', '”'], ['‘', '’'], ['"', '"'], ['`', '`']])
 const separators = new Set('，,。；;？！!?\r\n')
 
@@ -64,27 +53,18 @@ function independentClauses(text) {
   return clauses
 }
 
-function additionalAction(clause) {
-  let action = clause
-  let continued = false
-  for (;;) {
-    const continuation = continuationLead.exec(action)
-    const prefix = continuation ?? requestCourtesy.exec(action)
-    if (!prefix) break
-    continued ||= Boolean(continuation)
-    action = action.slice(prefix[0].length)
-  }
-  return routingAction.test(action) || continued && /^(?:发|转|问|派|委托|让|给|告诉)/u.test(action)
-}
-
 function withdrawsQuestion(text) {
   return independentClauses(text)?.some((clause) => withdrawal.test(clause))
 }
 
+// The direct path only forwards one clause. Compound requests need a
+// concrete plan the owner can see, rather than a classifier of side effects.
 export function directQuestionInScope(text) {
-  const clauses = independentClauses(text)
-  return Boolean(clauses?.length) && !clauses.some((clause) => withdrawal.test(clause)) &&
-    (clauses.length === 1 || !clauses.some(additionalAction))
+  // The previous direct-query entry accepts a trailing verbatim-copy note.
+  // Strip it for scope checking only; the delivery still preserves the input.
+  const question = text.replace(/\r?\n[ \t]*请保留问题原文[ \t]*$/u, '')
+  const clauses = independentClauses(question)
+  return clauses?.length === 1 && !withdrawal.test(clauses[0])
 }
 
 function clearQuestion(value) {
@@ -102,6 +82,21 @@ function selector(value) {
   if (unsafeTitle.test(value)) return
   const alias = numeric.exec(value)
   return alias ? { kind: 'alias', value: alias[1] } : { kind: 'title', value }
+}
+
+// A small, host-checkable subset. All other phrasing can use the visible
+// workflow proposal, where a model may draft the goal and scopes.
+const namedTask = new RegExp('^让[ \t]*(「[^」]{1,160}」|『[^』]{1,160}』|“[^”]{1,160}”|[0-9]{1,3}(?![0-9]))' +
+  '[ \t]*(?:号)?(?:窗口|会话)?[ \t]*[：:]?[ \t]*(.+)$', 'u')
+const extraWindow = /[0-9]{1,3}(?:号)?(?:窗口|会话)|(?:窗口|会话)[0-9]{1,3}|[「」『』“”]/u
+
+export function conversationRequest(text) {
+  const match = namedTask.exec(text.trim().replace(lead, ''))
+  if (!match) return
+  const [, target, goal] = match
+  if (!clearQuestion(goal) || /[？?]$/u.test(goal) || extraWindow.test(goal) ||
+      !/^(?:核对|检查|验证|复核|审查|审核|确认|看一下|看看|排查|分析|测试|整理|完成|实现|修复)\S/u.test(goal)) return
+  return { action: 'ask', selector: selector(target), goal, conversation: true }
 }
 
 export function contextualRequest(text, prior) {

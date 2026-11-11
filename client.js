@@ -569,10 +569,12 @@ window.__ModuleLoader__.load({
             if (node?.kind !== 'turn-trigger') continue
             const { source, content } = node.data
             if (source?.kind !== 'agent-message' || source.form !== 'relay' ||
-                source.bridgeWorkflowOwner !== sessionId ||
                 content.length !== 1 || content[0]?.type !== 'text') continue
+            if (source.bridgeWorkflowKind === 'conversation' && workflowId.test(source.bridgeWorkflowId ?? '') &&
+                typeof source.bridgeWorkflowTask === 'string') return node.data
+            if (source.bridgeWorkflowOwner !== sessionId) continue
             if (source.bridgeWorkflowKind === 'direct-notice' && source.senderSessionId === sessionId ||
-                source.bridgeWorkflowKind === 'result' &&
+                ['result', 'native-result'].includes(source.bridgeWorkflowKind) &&
                 typeof source.bridgeWorkflowId === 'string' && workflowId.test(source.bridgeWorkflowId)) return node.data
           }
         })
@@ -584,7 +586,9 @@ window.__ModuleLoader__.load({
         }
         const split = text.indexOf('\n\n')
         if (split < 0) return null
-        return h('section', { 'data-dsh-bridge-direct-result': '', style: { ...taskBox, ...section } },
+        const conversation = message.source.bridgeWorkflowKind === 'conversation'
+        return h('section', { [conversation ? 'data-dsh-bridge-task-message' : 'data-dsh-bridge-direct-result']: '',
+          style: { ...taskBox, ...section } },
           h('strong', null, text.slice(0, split)),
           h('p', { style: bodyStyle }, text.slice(split + 2)))
       }

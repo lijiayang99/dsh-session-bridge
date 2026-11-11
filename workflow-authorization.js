@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto'
 import { matchingTitles, naturalIntent, plainText } from './natural-message.js'
-import { contextualRequest, directQuestionInScope } from './workflow-context.js'
+import { contextualRequest, conversationRequest, directQuestionInScope } from './workflow-context.js'
 
 const ID = /^[a-zA-Z0-9_-]{1,128}$/
 const confirmationText = '确认委托'
+const shortConfirmation = /^(?:好|好的|可以|同意)[。！!]?$/u
 const draftLifetime = 120_000
 const contextTurnLimit = 5
 const directLifetimeMinutes = 30
@@ -22,6 +23,7 @@ export const workflowProposalProperties = {
   goal: textSchema(2000),
   ttlMinutes: integerSchema(1440),
   budget: integerSchema(32),
+  conversation: { type: 'boolean', description: 'Allow ongoing exchanges with the workers assigned under this visible plan' },
   scopes: {
     type: 'array', minItems: 1, maxItems: 16,
     items: {
@@ -88,7 +90,8 @@ function hasKeys(value, names) {
 }
 
 function validateProposal(value) {
-  if (!hasKeys(value, ['task', 'goal', 'ttlMinutes', 'budget', 'scopes']) ||
+  const required = ['task', 'goal', 'ttlMinutes', 'budget', 'scopes']
+  if (!(hasKeys(value, required) || hasKeys(value, [...required, 'conversation']) && typeof value.conversation === 'boolean') ||
       !isId(value.task) || !boundedText(value.goal, 2000) || placeholder.test(value.goal.trim()) ||
       !Number.isInteger(value.ttlMinutes) || value.ttlMinutes < 1 || value.ttlMinutes > 1440 ||
       !Number.isInteger(value.budget) || value.budget < 1 || value.budget > 32 ||
@@ -109,7 +112,7 @@ function validateProposal(value) {
     })
   }
   const { task, goal, ttlMinutes, budget } = value
-  const proposal = { task, goal, ttlMinutes, budget, scopes }
+  const proposal = { task, goal, ttlMinutes, budget, scopes, ...(value.conversation ? { conversation: true } : {}) }
   if (Buffer.byteLength(JSON.stringify(proposal)) <= 6000) return proposal
 }
 
@@ -146,12 +149,17 @@ export function matchesContextNotice(message, notice) {
     source.bridgeWorkflowKind === 'direct-notice' && plainText(message) === notice.text
 }
 
-function resolvePlan(items, proposal, source, owner, available) {
+function planTarget(items, registry, owner, query) {
+  const alias = /^([0-9]{1,3})(?:号)?(?:窗口)?$/u.exec(query)
+  return alias ? contextTarget(items, registry, owner, { kind: 'alias', value: alias[1] }) : uniqueTitle(items, query)
+}
+
+function resolvePlan(items, proposal, source, owner, available, registry) {
   const bindings = new Map()
   const bind = (query) => {
     if (bindings.has(query)) return bindings.get(query)
-    const match = uniqueTitle(items, query)
-    if (!match) return denied('workflow_target_clarification_required')
+    const match = planTarget(items, registry, owner, query)
+    if (!match?.to) return denied('workflow_target_clarification_required')
     if (match.to === owner || !available(match.to)) return denied('workflow_target_not_allowed')
     const value = { id: match.to, title: match.title }
     bindings.set(query, value)
@@ -178,7 +186,7 @@ function resolvePlan(items, proposal, source, owner, available) {
     if (binding.error) return { ...binding, title: query }
     if (!targets.has(binding.id)) return { ...denied('workflow_owner_target_missing'), title: query }
   }
-  return { grant: { task, goal, ttlMinutes, budget, scopes }, targets: [...targets.values()], bindings }
+  return { grant: { task, goal, ttlMinutes, budget, scopes, ...(proposal.conversation ? { conversation: true } : {}) }, targets: [...targets.values()], bindings }
 }
 
 function quoted(value) {
@@ -194,13 +202,15 @@ function renderPreview(grant, targets) {
     '有效期 ' + grant.ttlMinutes + ' 分钟（确认后起算）',
     '任务预算 ' + grant.budget + ' 次派工（含返修）',
   ]
+  if (grant.conversation) details.push('往返范围 主控与已派工的执行窗口，限下列用途')
   for (const scope of grant.scopes) {
     details.push((scope.review ? '正式审核范围 ' : '范围 ') + quoted(scope.name), '  用途 ' + quoted(scope.purpose))
     for (const id of scope.targets) details.push('  窗口 ' + quoted(titles.get(id)))
   }
   return '请核对以下跨窗口委托方案。\n\n' +
     details.map((line) => '    ' + line).join('\n') +
-    '\n\n请等本轮完成后在原窗口回复「确认委托」。回复「取消委托」可作废方案。'
+    (grant.conversation ? '\n\n请等本轮完成后在原窗口回复「好」或「可以」。回复「取消委托」可作废方案。'
+      : '\n\n请等本轮完成后在原窗口回复「确认委托」。回复「取消委托」可作废方案。')
 }
 
 function emptyNativeInbox(ctx, session) {
@@ -239,7 +249,7 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
       return
     }
     const identity = { messageId: message.id, rpcId: message.source.rpcId, turn: turn.number }
-    if (text.trim() === confirmationText) {
+    if (text.trim() === confirmationText || draft && shortConfirmation.test(text.trim())) {
       return { mode: 'confirm-workflow', identity, draft }
     }
     const direct = directIntent(text)
@@ -247,18 +257,27 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
     // must keep an independent follow-up action outside the one-window path.
     if (direct?.question && !directQuestionInScope(direct.goal)) return
     if (direct && !direct.alias) return { mode: 'direct-workflow', identity, text, direct }
+    const prior = adjacent?.notice ? undefined : adjacent
     const request = direct?.alias ? {
       action: 'ask', selector: { kind: 'alias', value: direct.alias }, goal: direct.goal,
-    } : !naturalIntent(text) && contextualRequest(text, adjacent?.notice ? undefined : adjacent)
+    } : !naturalIntent(text) && (conversationRequest(text) ||
+      contextualRequest(text, prior))
     if (request) {
+      if (request.prior?.conversation) request.conversation = true
       if (request.action === 'topic' && request.selector) {
         request.binding = selectTarget(session.id, request.selector, AbortSignal.any([signal, AbortSignal.timeout(5000)]))
       }
       return { mode: 'direct-workflow', identity, text, direct: request, contextual: true }
     }
-    if (delegationIntent(text)) {
-      return { mode: 'propose-workflow', identity, text }
-    }
+  }
+
+  function proposalInput(message, turn) {
+    const text = message && proposalSource(message)
+    if (!text || /^(?:[「『“"'‘`>]|示例|例如|比如|引用|转述|转发|他说|她说|对方说)/u.test(text.trim()) ||
+        /^(?:请[ \t]*)?(?:取消委托|算了)[。！!]?$/u.test(text.trim()) ||
+        /(?:^|[，,。；;！？!?\n])\s*(?:请\s*)?取消委托[。！!]?\s*$/u.test(text)) return
+    return { mode: 'propose-workflow', text,
+      identity: { messageId: message.id, rpcId: message.source.rpcId, turn: turn.number } }
   }
 
   function reply(_session, turn, event) {
@@ -293,7 +312,8 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
 
   async function propose(value, exec, caller, current) {
     const { id, context } = caller
-    if (context.mode !== 'propose-workflow' || !inTurn(exec, caller, current)) {
+    if (context.mode !== 'propose-workflow' || !inTurn(exec, caller, current) ||
+        value?.conversation !== true && !delegationIntent(context.text)) {
       return denied('workflow_proposal_owner_request_required')
     }
     const proposal = validateProposal(value)
@@ -308,7 +328,7 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
     try {
       const { items } = await readWindows(requestSignal)
       if (!inTurn(exec, caller, current)) return denied('workflow_proposal_owner_request_required')
-      const resolved = resolvePlan(items, proposal, context.text, id, available)
+      const resolved = resolvePlan(items, proposal, context.text, id, available, ctx.workspaceRegistry)
       if (resolved.error) return resolved
       const { grant, targets, bindings } = resolved
       if (!(await Promise.all(targets.map(({ id }) => existing(id, requestSignal)))).every(Boolean)) {
@@ -348,7 +368,7 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
       }
       const { items } = await readWindows(requestSignal)
       for (const [query, expected] of draft.bindings) {
-        const live = uniqueTitle(items, query)
+        const live = planTarget(items, ctx.workspaceRegistry, caller.id, query)
         if (live?.to !== expected.id || live.title !== expected.title || !available(expected.id)) {
           return denied('workflow_target_changed')
         }
@@ -408,8 +428,8 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
 
   async function contextualTarget(caller, requestSignal) {
     const { id, context: { direct } } = caller
-    const { selector, goal, prior, inheritedTarget } = direct
-    const need = (error, clarification) => ({ error, clarification })
+    const { selector, goal, prior, inheritedTarget, conversation } = direct
+    const need = (error, clarification) => ({ error, clarification: { ...clarification, ...(conversation ? { conversation } : {}) } })
     if (!selector) return goal ? need('workflow_context_target_required', { missing: 'target', goal })
       : need('workflow_context_both_required', { missing: 'both' })
     const clarifyTarget = (error) => need(error, { missing: goal ? 'target' : 'both', goal })
@@ -470,6 +490,7 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
     const task = 'direct-' + digest(JSON.stringify([id, context.identity.messageId]))
     const grant = {
       task, goal, ttlMinutes: directLifetimeMinutes, budget: 1,
+      ...(context.direct.conversation ? { conversation: true } : {}),
       scopes: [{ name: 'execute', purpose: '执行所有者明确给出的原文目标', targets: [target.to] }],
     }
     const targets = [{ id: target.to, title: target.title }]
@@ -493,6 +514,6 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
     pending.delete(id)
     contextual.delete(id)
   }
-  return { input, reply, end, clear, propose, confirm, delegateDirect,
+  return { input, proposalInput, reply, end, clear, propose, confirm, delegateDirect,
     rememberTopic, rememberClarification, rememberAfterNotice }
 }

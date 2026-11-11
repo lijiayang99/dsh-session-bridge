@@ -1,4 +1,4 @@
-# dsh-session-bridge 0.5.0-rc.14
+# dsh-session-bridge 0.5.0-rc.15
 
 适用于 DeepSeek Harness Web 0.2.2-rc.1。全新安装可通过「插件 → 添加插件」输入宿主机可读的包绝对路径并启用。已有版本请先按下文迁移。
 
@@ -60,6 +60,20 @@
 
 主控在批准范围内并行派工、等齐汇总、按原任务返修和收口。共用执行窗口逐项领取。批次等待每项回报、失败或进入待核对，只返回一次结果通知。主控可查看部分失败并按剩余预算返修。遇到待核对或明确要求所有者决定的回报，主控从原窗口继续处理，确认后可输入 `继续委托 <任务>`。右栏「开始 → dsh-session-bridge → 原主控任务」可查看批次、尝试、执行窗口、回报、失败和接续状态。
 
+### 原生子代理
+
+如果任务可在主控窗口下另起子代理，直接请主控派一个本地子代理。固定 Web 的 Standard preset 提供宿主的 `subagent` 和 `send_message`。父子双方可以追加指示、提问和报告进展，子代理结束后宿主向父窗口回报。模型误选 `send_session_message` 时，插件核对原生直系血缘，复用宿主送达并保留去重回执。对启用了任务委托且在白名单内的父窗口，插件只补上宿主因同轮主动发消息而省略的不同结束正文。已主动发过的相同正文只出现一次。
+
+原生本地子代理带有宿主记录的父子血缘、父窗口的 sandbox 和 preset。宿主把子代理的审批策略设置为 `never`。遇到权限阻塞时，子代理把阻塞、所需动作及原因回给主控，由主控用 DSH 原生权限和审批继续处理。
+
+### 同一任务持续往返
+
+明确点名已存在的独立窗口时，可以说「请让99窗口核对合成候选并回报结果」。宿主核对原生所有者轮、当前工作区短号和白名单后，按目标正文建立一项任务。复合或不清楚的要求先由主控拟定具体窗口、目标、用途、期限和预算。看到启用往返的完整预览后，在原窗口说「好」或「可以」。单窗口、一次派工的方案在确认轮结束后自动派工。多窗口方案沿用正式派工和审核流程。
+
+执行窗口领取后可把进展、证据、问题或阻塞直接发给原主控，主控也可以补充指示。同一收件窗口有多项活动任务时，主控可引用「原主控任务」里的任务号或尝试 ID。插件用任务 ID、宿主身份及回执绑定每次消息，正文原样带到收件窗口。执行窗口用 `workflow_report` 提交最终回报，单窗口任务会自动回到原主控。普通进展和等待主控补充可继续用任务消息。
+
+每次消息只在发送轮正常结束且核实原生来源后入宿主收件队列，使用任务内稳定请求号去重。混合输入、撤销、到期或收口会阻止继续发送。启动后可核对保留的回执，未投递或投递不明的消息不会自动重发。第三窗口须处于已批准的派工范围并领取自己的任务。独立窗口继续使用各自的宿主权限和审批。
+
 ### 用相邻对话问一个窗口
 
 在原主控输入「你看一下02窗口今天干了啥，你问一下他」，或者先说「你看一下02窗口今天干了啥」，等该轮结束后再说「你问一下他」。前一句建立本轮话题，实际查问由带「问」的原生所有者输入触发。也可以直接说「帮我问问02窗口，插件还有哪些坑？」。派工按原话里的问题发送。独立分句撤回或追加外发、派工时，这句不走自动查问。多个窗口的任务可走方案预览和确认。
@@ -71,7 +85,7 @@
 | 工具 | 参数与约束 |
 | --- | --- |
 | `workflow_delegate_direct` | 无参数。只接受原主控所有者本轮明确引用的单窗口和目标原文。开立与一次派工写入同一笔账本事务。收到 `state: queued` 后，用回执中的 `targetTitle` 确认已派工。同轮精确重试返回原入队回执及原匹配标题。 |
-| `workflow_propose` | `task`、`goal`、`ttlMinutes`、`budget`、`scopes`。每个范围用 `name`、`windows`（宿主窗口标题）和 `purpose`。用户要求正式审核时，审核范围加 `review: true`，成功收口须有通过的固定产物。预算为整个任务可新建的尝试数，最多 32，包含返修。返回 `preview` 时主控须原样作为整条最终回复展示。 |
+| `workflow_propose` | `task`、`goal`、`ttlMinutes`、`budget`、`scopes`。用 `conversation: true` 生成可持续往返的可见方案。每个范围用 `name`、`windows`（宿主窗口标题）和 `purpose`。用户要求正式审核时，审核范围加 `review: true`，成功收口须有通过的固定产物。预算为整个任务可新建的尝试数，最多 32，包含返修。返回 `preview` 时主控须原样作为整条最终回复展示。 |
 | `workflow_confirm` | 所有者在原窗口新回复「确认委托」后，无参数调用。成功返回冻结的任务、范围、已解析窗口 ID、预算和到期时间，可在该轮继续派工。 |
 | `workflow_dispatch_batch` | `task`、`batch`、`completion`、`assignments`。每项填写 `item`、`attempt`、`target`、`scope`、`instructions`、`acceptance`。一次原子入账，成员固定，最多 16 项。等齐后原主控调用 `workflow_consume` 得到 `batch.items`。单项仍用 `workflow_dispatch`。 |
 | `workflow_claim`、`workflow_report` | 执行窗口领取到本次尝试及用途后再执行。产出固定产物时，回报 `artifacts`，支持 `git:<40 位小写十六进制>` 或 `sha256:<64 位小写十六进制>`。 |
@@ -135,27 +149,27 @@ npm pack --offline --pack-destination "$lab"
 npm install --prefix "$lab/tools" playwright-core@1.65.0
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.14.tgz" full \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.15.tgz" full \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.14.tgz" stress
+  "$lab/local-dsh-session-bridge-0.5.0-rc.15.tgz" stress
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration-auto.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.14.tgz" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.15.tgz" \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/sidebar-transfers.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.14.tgz" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.15.tgz" \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration-contextual.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.14.tgz" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.15.tgz" \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
-for test in collaboration-auto collaboration-direct collaboration-recovery collaboration-expiry; do
+for test in collaboration-native collaboration-conversation collaboration-auto collaboration-direct collaboration-recovery collaboration-expiry; do
   unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
     "$(command -v node)" "./test/$test.mjs" "$(command -v dsh)" \
-    "$lab/local-dsh-session-bridge-0.5.0-rc.14.tgz"
+    "$lab/local-dsh-session-bridge-0.5.0-rc.15.tgz"
 done
 bash .github/ci/run.sh
 ```
@@ -164,7 +178,7 @@ bash .github/ci/run.sh
 
 0.4.5-rc.2 同布局换包用 `test/collaboration-rollback.mjs <dsh> <固定 0.4.5-rc.2 tgz> <候选 tgz>`，同样在 loopback 命名空间运行。基线包从 `87b06bf9fc8f9b3fc523d0ab227edd9d284c8609` 打包，SHA-256 为 `fb5de752634093c23be783fdf507b86e23ca362250ea787756de09f1e6ff6a91`。
 
-恢复和真实模型闭环测试在一次性宿主启用逐步时间快照，复验派工、接续重启和收口。真实模型闭环用 `node ./test/collaboration-pilot.mjs "$(command -v dsh)" "$lab/local-dsh-session-bridge-0.5.0-rc.14.tgz" gpt-6.1-sol`。该脚本使用合成窗口和文件、loopback 模型适配器，以及已授权的 Codex 模型访问。适配器只传合成任务，并把模型选择交给宿主真实执行的委托工具。
+恢复和真实模型闭环测试在一次性宿主启用逐步时间快照，复验派工、接续重启和收口。真实模型闭环用 `node ./test/collaboration-pilot.mjs "$(command -v dsh)" "$lab/local-dsh-session-bridge-0.5.0-rc.15.tgz" gpt-6.1-sol`。该脚本使用合成窗口和文件、loopback 模型适配器，以及已授权的 Codex 模型访问。适配器只传合成任务，并把模型选择交给宿主真实执行的委托工具。
 
 ### 自然语句隔离复验
 
@@ -176,11 +190,11 @@ npm pack --offline --pack-destination "$lab"
 npm install --prefix "$lab/tools" playwright-core@1.65.0
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/natural-send.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.14.tgz" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.15.tgz" \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/natural-send-time-context.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.14.tgz"
+  "$lab/local-dsh-session-bridge-0.5.0-rc.15.tgz"
 bash .github/ci/run.sh
 ```
 
