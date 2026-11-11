@@ -19,7 +19,7 @@ export function assertIsolated() {
   assert(networkInterfaces().lo.every(({ internal }) => internal))
 }
 
-export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSessions = [] } = {}) {
+export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSessions = [], workspaces = [] } = {}) {
   assertIsolated()
   const root = await mkdtemp(join(tmpdir(), 'bridge-fixture-'))
   const schemaDir = join(root, 'node_modules', '@deepseek-ai', 'schemastery')
@@ -89,7 +89,7 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
 
   const ctx = {
     profileContext: { name: 'web', dir: profile },
-    workspaceRegistry: { archivedSessionIds: [] },
+    workspaceRegistry: { archivedSessionIds: [], list: () => workspaces },
     agents,
     tools: { register: ({ name, execute }) => tools.set(name, execute) },
     sessions: { flush: async session => faults.flush ? faults.flush(session.id) : true },
