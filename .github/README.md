@@ -1,14 +1,16 @@
 # dsh-session-bridge
 
-当前 `main` 提供 `0.4.5-rc.2` 候选，仅支持 DSH Web `0.2.2-rc.1`，需要 Node `24.9+`。DSH 包名为 `@local/dsh-session-bridge`，右栏入口为「开始 → dsh-session-bridge」。侧栏显示宿主兼容状态。宿主身份未知时拒绝新发送与派工。
+当前 `main` 提供 `0.5.0-rc.4`，已通过最终独立验收并经 PR #7 合入。插件仅支持 DSH Web `0.2.2-rc.1`，需要 Node `24.9+`。DSH 包名为 `@local/dsh-session-bridge`，右栏入口为「开始 → dsh-session-bridge」。侧栏显示宿主兼容状态。宿主身份未知时拒绝新发送与派工。[PR #7](https://github.com/lijiayang99/dsh-session-bridge/pull/7)
 
-## `0.5.0-rc.4` 跨窗口协作候选
+## `0.5.0-rc.4` 跨窗口协作
 
-固定候选已通过独立技术复审，真实模型整体验收仍在进行。原主控可用明确的单窗口原文直接委托一次，也可展示冻结的多窗口方案，由所有者在原窗口确认一次。批次等齐后回传一次，审核、返修及复审绑定相应尝试与固定产物。「原主控任务」可查看批次、回报、失败及接续状态。请求收口后，账本等到同一宿主轮正常结束的持久证据才提交结果。轮次中断时，原主控所有者可对账并在新轮请求收口。[跨窗口任务用法](../README.md#跨窗口任务)
+原主控可用明确的单窗口原文直接委托一次，也可展示冻结的多窗口方案，由所有者在原窗口确认一次。批次等齐后回传一次，审核、返修及复审绑定相应尝试与固定产物。「原主控任务」可查看批次、回报、失败及接续状态。请求收口后，账本等到同一宿主轮正常结束的持久证据才提交结果。轮次中断时，原主控所有者可对账并在新轮请求收口。[跨窗口任务用法](../README.md#跨窗口任务)
 
 协作委托和普通互传均按事件来源识别宿主自动追加的时间快照。固定宿主的独立隔离复验覆盖草稿生成后、确认工具前的时间刷新，以及原文和结构化命令直发。来自所有者或中继的相同文本仍按额外输入处理，原草稿会失效。[普通互传与隔离复验](../README.md#普通互传)
 
-候选固定源码为 `f469297cbaabeb7192e9d9692cdd80953d6325a6`，GitHub 安装引用待合入后核对。固定归档已通过隔离 DSH Web 的停机换入与回退复验，读回设置、白名单、普通回执和委托历史。换包沿用设置 ID、普通回执和委托账本路径。回退基线为 `github:lijiayang99/dsh-session-bridge#87b06bf9fc8f9b3fc523d0ab227edd9d284c8609`（0.4.5-rc.2）。[换入与回退规程](../README.md#从-044-rc3-或-045-rc2-换入或回退)
+在隔离的固定 DSH Web 上，GPT-6 Luna 通过两项固定包试验。单主控多窗流程完成一次所有者确认、并行派工、审核退回、返修、复审通过和持久收口。单窗流程完成一次明确授权、领取、回报和持久收口。两项均使用合成输入、预置合成产物及受限适配器。适配器裁剪上下文、限制工具选择并生成部分例行回复，最终收口轮由模型结束，宿主核验持久证据。[验收范围与固定证据](https://github.com/lijiayang99/dsh-session-bridge/pull/7)
+
+PR #7 和合入后的主线 GitHub Actions 各通过 33 项合成测试，含双主控同名任务和 30 窗口负载。真实模型的跨主控并发和 30 窗口负载、真实供应商限流、独立非所有者登录及外部副作用工具审批仍未实测。[PR Actions](https://github.com/lijiayang99/dsh-session-bridge/actions/runs/42985878951) · [主线 Actions](https://github.com/lijiayang99/dsh-session-bridge/actions/runs/42987784922)
 
 所有者可在发送窗口输入「给审核窗口发消息：候选已就绪」。助手通过插件工具将明确原文发给白名单内唯一匹配的窗口。请助手拟稿或转发上下文时，先等完整预览及该轮结束，再在同一窗口回复「确认发送」。[自然语句用法](../README.md#普通互传)
 
@@ -18,11 +20,11 @@
 
 ## 从 GitHub 换包
 
-DSH Web `0.2.2-rc.1` 的「更新」只处理 npm registry 来源。隔离实测从固定 GitHub 提交 `b6b5af3` 安装 0.4.4-rc.3 后，原生 `listVersions` 和 `updateBundle` 均拒绝该 GitHub 来源。
+DSH Web `0.2.2-rc.1` 的「更新」只处理 npm registry 来源。GitHub 来源使用「插件 → 添加插件」手动换包，`0.5.0-rc.4` 的固定安装引用为 `github:lijiayang99/dsh-session-bridge#9018c657c25fd2bea07ea44555e53fc60d6c7fd8`。该提交已从 GitHub 离线复打并核对包指纹。原生换入与回退验收使用同一固定归档，重启后读回设置、白名单、普通回执和委托历史。[固定安装源码](https://github.com/lijiayang99/dsh-session-bridge/tree/9018c657c25fd2bea07ea44555e53fc60d6c7fd8)
 
-已验证的手动换包流程是关闭两个功能开关、移除旧包，再通过「插件 → 添加插件」手动添加一次 `github:lijiayang99/dsh-session-bridge#main`。隔离环境换入了 0.4.5-rc.2，完整重启后读回两个开关均关闭，合成白名单保留。复现固定候选时，使用 `github:lijiayang99/dsh-session-bridge#e6ab3f77684fa578e75188848e2627bad3d3bfd7`。
+此前已在隔离环境实测 GitHub 手动换包，从固定 0.4.4-rc.3 换入当时主线的 0.4.5-rc.2。原生 `listVersions` 和 `updateBundle` 均拒绝 GitHub 来源。关闭两个功能开关、移除旧包并从「添加插件」换入后，完整重启读回两个开关均关闭，合成白名单保留。
 
-从 0.4.4-rc.3 换入时，沿用原设置 ID、回执和委托账本路径。按包 README 停发、排空、关闭两个开关并备份数据，换包后完整重启，核对版本、设置及历史后再恢复开关。回退到 0.4.4-rc.3 时使用 `github:lijiayang99/dsh-session-bridge#b6b5af3d2f95c00b8b9f50e9a1c6af280d16c1a4`。从旧命名版本换包还须停机迁移。[包 README 的换包与回退规程](../README.md#从-044-rc3-换入或回退) · [旧命名迁移规程](../README.md#迁移与回退)
+已审核的回退基线为 `github:lijiayang99/dsh-session-bridge#87b06bf9fc8f9b3fc523d0ab227edd9d284c8609`（`0.4.5-rc.2`）。换包沿用设置 ID、回执和委托账本路径。按包 README 停发、排空、关闭两个开关并完整停机备份。换包后完整重启，核对版本、设置和历史后再恢复开关。从旧命名版本换包还须停机迁移。[包 README 的换包与回退规程](../README.md#从-044-rc3-或-045-rc2-换入或回退) · [旧命名迁移规程](../README.md#迁移与回退)
 
 0.4.2 已验收的 GitHub 原生安装使用固定提交 `8fa0a210b3bf8241a5eebdc21794b49da49f447a`。该版本的右栏入口显示为「窗口互传」。[0.4.2 固定源码](https://github.com/lijiayang99/dsh-session-bridge/tree/8fa0a210b3bf8241a5eebdc21794b49da49f447a)
 
