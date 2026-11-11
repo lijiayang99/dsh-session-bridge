@@ -37,6 +37,8 @@ export const workflowProposalProperties = {
 // Explicit delegation requests can prepare a proposal. Opening a grant always
 // requires a second native owner message after the complete preview.
 const requestLead = /^(?:请你帮我|请(?:你|帮我)?|帮我|麻烦(?:你|帮我)?|你|我想让你)[ \t]*/u
+const directQuestion = /^给[ \t]*(?:(?:『([^』\r\n]{1,160})』|「([^」\r\n]{1,160})」|“([^”\r\n]{1,160})”)[ \t]*(?:这个)?窗口|([\p{L}\p{N}_.·-]{1,160})[ \t]*这个窗口)[ \t]*问(?:他|她|它)(?!们)([\s\S]+)$/u
+const ambiguousQuestionTitle = /[和与及或跟]|(?:这个|那个)窗口|^(?:我|你|他|她|它|对方|那边|另一个|其他)$/u
 const delegationVerb = /^(?:委托|分派|派发|分发|交办|拆派)\s*[：:，,]?\s*\S/u
 const delegationObject = /^(?:把|将)[\s\S]{1,220}?(?:交给|交由|委托给|派给|指派给|分配给|分发给|分发到|派发给|拆派|分派)/u
 const delegationRecipient = /^(?:让|安排)[^\r\n]{1,160}?(?:窗口|会话|agent)/iu
@@ -55,9 +57,13 @@ function delegationIntent(text) {
 
 function directIntent(text) {
   const match = directRequest.exec(text)
-  if (!match) return
-  const goal = match[1] ?? match[2] ?? match[3]
-  const title = match[4] ?? match[5] ?? match[6]
+  const question = match ? undefined : directQuestion.exec(text.replace(requestLead, ''))
+  if (!match && !question) return
+  const unquotedTitle = question?.[4]
+  if (unquotedTitle && ambiguousQuestionTitle.test(unquotedTitle)) return
+  if (question && !/[\p{L}\p{N}]/u.test(question[5])) return
+  const goal = match ? match[1] ?? match[2] ?? match[3] : question[5]
+  const title = match ? match[4] ?? match[5] ?? match[6] : question[1] ?? question[2] ?? question[3] ?? question[4]
   if (boundedText(goal, 2000) && !placeholder.test(goal.trim()) && boundedText(title, 160) && title === title.trim()) {
     return { goal, title }
   }

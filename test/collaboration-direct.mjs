@@ -13,9 +13,14 @@ const worker = 'synthetic-direct-worker'
 const other = 'synthetic-direct-other'
 const workerTitle = '合成开发窗口'
 const otherTitle = '合成备用窗口'
+const queryTitle = '合成查询'
 const direct = (goal, title = workerTitle) => '把『' + goal + '』委托给『' + title + '』'
+const question = (body, title = queryTitle) => '你给' + title + '这个窗口问他' + body
 const callDirect = (args) => tool('workflow_delegate_direct', args)
 const goal = '合成目标原文，核对原样。\n第二行保留两个空格  '
+const questionBody = '今天气温怎么样'
+let expectedGoal = goal
+const replyText = '合成回答，样本气温 21°C。'
 const wake = /^DSH-WORKFLOW (TASK|RESULT) ([a-f0-9-]+)$/
 const plans = new Map()
 const observed = { claims: 0, reports: 0, consumes: 0, closes: 0 }
@@ -35,15 +40,15 @@ function decide(body, { signal }) {
     }
     if (results.length === 1) {
       const claim = results[0]
-      assert.equal(claim.instructions, goal)
-      assert.equal(claim.goal, goal)
+      assert.equal(claim.instructions, expectedGoal)
+      assert.equal(claim.goal, expectedGoal)
       assert.equal(claim.item, 'execute')
       assert.equal(claim.scope, 'execute')
       assert.equal(claim.attempt, 1)
       assert.equal(claim.owner, owner)
       return tool('workflow_report', {
         id, attempt: claim.attempt, token: claim.token, status: 'completed',
-        summary: 'Synthetic original task executed once.', evidence: ['synthetic:direct'],
+        summary: replyText, evidence: ['synthetic:direct'],
       })
     }
     assert.equal(results[1]?.recorded, true)
@@ -56,8 +61,9 @@ function decide(body, { signal }) {
     }
     if (results.length === 1) {
       const result = results[0]
-      assert.equal(result.goal, goal)
+    assert.equal(result.goal, expectedGoal)
       assert.equal(result.report?.status, 'completed')
+      assert.equal(result.report?.summary, replyText)
       return tool('workflow_close', {
         task: result.task, outcome: 'completed', summary: 'Synthetic direct task closed.',
       })
@@ -141,10 +147,10 @@ async function resultAfterInput(host, matches) {
   }, 'synthetic native input and its tool result')
 }
 
-async function rejectForeignSources(host) {
-  const relayText = direct('中继合成目标')
+async function rejectForeignSources(host, requestText = direct, tag = 'quoted') {
+  const relayText = requestText('中继合成目标')
   const wrapped = '[DSH 会话消息｜发送方 ' + other + ']\n' + relayText
-  const request = 'synthetic-direct-relay'
+  const request = 'synthetic-direct-relay-' + tag
   plans.set(wrapped, once(callDirect()))
   try {
     const relayed = await withPlan(host, other, '授权互传 ' + owner + ' ' + request + '\n' + relayText,
@@ -155,7 +161,7 @@ async function rejectForeignSources(host) {
     assert.equal(typeof result.result?.error, 'string')
   } finally { plans.delete(wrapped) }
 
-  const text = direct('非所有者合成目标')
+  const text = requestText('非所有者合成目标')
   plans.set(text, once(callDirect()))
   try {
     const launched = await withPlan(host, other, '发送合成非所有者消息',
@@ -168,8 +174,7 @@ async function rejectForeignSources(host) {
   assert.deepEqual(await list(host), [])
 }
 
-async function rejectMixedTurn(host) {
-  const first = direct('第一条合成同轮输入')
+async function rejectMixedTurn(host, first = direct('第一条合成同轮输入')) {
   const second = direct('第二条合成同轮输入')
   let modelEntered = false
   let release = false
@@ -200,6 +205,86 @@ async function rejectMixedTurn(host) {
   }
 }
 
+async function verifyDirect(host, request, body, checkOrdinary = false) {
+  expectedGoal = body
+  const started = await withPlan(host, owner, request, (results) => {
+    if (checkOrdinary && results.length === 0) return tool('send_natural_session_message')
+    const directResults = checkOrdinary ? results.slice(1) : results
+    if (directResults.length < 2) return callDirect()
+    if (directResults.length === 2) return tool('workflow_dispatch', {
+      task: directResults[0].task, item: 'extra', target: worker, scope: 'execute', attempt: 1,
+      instructions: 'Unauthorized synthetic followup.', acceptance: 'Synthetic negative control.',
+    })
+  })
+  if (checkOrdinary) assert.deepEqual(started.results[0], { error: 'message_authorization_required' })
+  const [result, repeated, expanded] = checkOrdinary ? started.results.slice(1) : started.results
+  assert.equal(result?.task, 'direct-' + digest(JSON.stringify([owner, started.input.data.id])), JSON.stringify(started.results))
+  assert.equal(result.goal, body)
+  assert.equal(result.budget, 1)
+  assert.equal(result.duplicate, false)
+  assert.equal(result.scopes.length, 1)
+  assert.equal(result.scopes[0].name, 'execute')
+  assert.deepEqual(result.scopes[0].targets, [worker])
+  assert.deepEqual(repeated, { ...result, duplicate: true })
+  assert.equal(typeof expanded?.error, 'string')
+
+  const persisted = await host.until(() => {
+    const state = host.snapshot(owner, result.task)
+    return state.grant?.state === 'closed' && state
+  }, 'direct delegation claims, reports, consumes and closes')
+  await host.idle(owner)
+  assert.equal(persisted.grant.goal, body)
+  assert.equal(persisted.grant.authorization.kind, 'native-owner-workflow-direct')
+  assert.equal(persisted.grant.authorization.request.messageId, started.input.data.id)
+  assert.equal(persisted.grant.authorization.request.sourceDigest, digest(request))
+  assert.equal(persisted.grant.expiresAt - persisted.grant.openedAt, 30 * 60_000)
+  assert.equal(persisted.grant.outcome?.status, 'completed')
+  assert.equal(persisted.grant.outcome.summary, 'Synthetic direct task closed.')
+  assert.equal(persisted.jobs.length, 1)
+  const [job] = persisted.jobs
+  assert.equal(job.id, result.id)
+  assert.equal(job.instructions, body)
+  assert.equal(job.target, worker)
+  assert.equal(job.wake.state, 'reported')
+  assert.equal(job.resume.state, 'consumed')
+  for (const [session, kind, id] of [[worker, 'task', job.wake.id], [owner, 'result', job.resume.id]]) {
+    const notifications = (await host.history(session)).filter(({ type, data }) =>
+      type === 'user/message' && data.source?.bridgeWorkflowId === job.id && data.source.bridgeWorkflowKind === kind)
+    assert.deepEqual(notifications.map(({ data }) => data.id), [id])
+  }
+  return result.task
+}
+
+async function verifyQuotedOrdinary(host) {
+  const body = '  合成正文第一行\n第二行保留两个空格  '
+  const text = '把『' + body + '』发给『' + queryTitle + '』窗口'
+  const send = tool('send_natural_session_message')
+  await host.rename(other, queryTitle)
+  assert.deepEqual((await withPlan(host, owner, text, once(send))).results,
+    [{ error: 'ambiguous_session_title', title: queryTitle }])
+  await host.rename(other, otherTitle)
+  await host.save({ allowedSessions: [owner, other] })
+  assert.deepEqual((await withPlan(host, owner, text, once(send))).results,
+    [{ error: 'session_title_required', title: queryTitle }])
+  await host.save({ allowedSessions: [owner, worker, other] })
+  const result = await withPlan(host, owner, text, (results) => {
+    if (!results.length) return callDirect()
+    if (results.length < 3) return send
+  })
+  const [delegation, sent, repeated] = result.results
+  assert.equal(delegation?.error, 'workflow_direct_owner_request_required')
+  assert.equal(sent?.delivery, 'delivered', JSON.stringify(result.results))
+  assert.equal(sent.to, worker)
+  assert.equal(repeated?.duplicate, true)
+  assert.equal(repeated.messageId, sent.messageId)
+  await host.idle(worker)
+  const messages = (await host.history(worker)).filter(({ type, data }) =>
+    type === 'user/message' && data.source?.bridgeReceiptKey && data.source.senderSessionId === owner)
+  assert.deepEqual(messages.map(({ data }) => [data.id, data.content[0].text]), [
+    [sent.messageId, '[DSH 会话消息｜发送方 ' + owner + ']\n' + body],
+  ])
+}
+
 await withCollaborationHost({ dsh, archive, decide }, async (host) => {
   await host.createSessions([[owner, '合成直派主控'], [worker, workerTitle], [other, otherTitle]])
   await host.save({ enabled: true, workflowEnabled: true, allowedSessions: [owner, worker, other] })
@@ -220,51 +305,45 @@ await withCollaborationHost({ dsh, archive, decide }, async (host) => {
   } finally { plans.delete(forged) }
   await rejectForeignSources(host)
   await rejectMixedTurn(host)
+  await host.rename(worker, queryTitle)
+  await host.rename(other, queryTitle)
+  await host.save({ allowedSessions: [owner, worker] })
+  await assertDenied(host, question(questionBody), 'workflow_target_clarification_required')
+  await host.rename(other, otherTitle)
+  await host.save({ allowedSessions: [owner, other] })
+  await assertDenied(host, question(questionBody), 'workflow_target_not_available')
+  await host.save({ allowedSessions: [owner, worker, other] })
+  const ambiguous = queryTitle + '和' + otherTitle
+  await host.rename(other, ambiguous)
+  await assertDenied(host, question(questionBody, ambiguous))
+  await host.rename(other, otherTitle)
+  for (const text of [question('', queryTitle), question('。'), question(questionBody, '不存在的合成查询'),
+    '这是合成示例：' + question(questionBody), '你给这个窗口问他' + questionBody,
+    '你给合成查询这个窗口问他们' + questionBody,
+    '你给合成查询这个窗口和合成备用这个窗口问他们' + questionBody]) {
+    await assertDenied(host, text)
+  }
+  await rejectForeignSources(host, question, 'colloquial')
+  await rejectMixedTurn(host, question('第一条合成同轮问题'))
   assert.deepEqual(observed, { claims: 0, reports: 0, consumes: 0, closes: 0 })
   console.log('PASS direct delegation rejects quoted examples, unresolved titles, model arguments, relay, non-owner and mixed native input')
 
-  const started = await withPlan(host, owner, direct(goal), (results) => {
-    if (results.length < 2) return callDirect()
-    if (results.length === 2) return tool('workflow_dispatch', {
-      task: results[0].task, item: 'extra', target: worker, scope: 'execute', attempt: 1,
-      instructions: 'Unauthorized synthetic followup.', acceptance: 'Synthetic negative control.',
-    })
-  })
-  const [result, repeated, expanded] = started.results
-  assert.equal(result?.task, 'direct-' + digest(JSON.stringify([owner, started.input.data.id])))
-  assert.equal(result.goal, goal)
-  assert.equal(result.budget, 1)
-  assert.equal(result.duplicate, false)
-  assert.equal(result.scopes.length, 1)
-  assert.equal(result.scopes[0].name, 'execute')
-  assert.deepEqual(result.scopes[0].targets, [worker])
-  assert.deepEqual(repeated, { ...result, duplicate: true })
-  assert.equal(typeof expanded?.error, 'string')
-
-  const persisted = await host.until(() => {
-    const state = host.snapshot(owner, result.task)
-    return state.grant?.state === 'closed' && state
-  }, 'direct delegation claims, reports, consumes and closes')
-  await host.idle(owner)
-  assert.equal(persisted.grant.goal, goal)
-  assert.equal(persisted.grant.authorization.kind, 'native-owner-workflow-direct')
-  assert.equal(persisted.grant.authorization.request.messageId, started.input.data.id)
-  assert.equal(persisted.grant.authorization.request.sourceDigest, digest(direct(goal)))
-  assert.equal(persisted.grant.expiresAt - persisted.grant.openedAt, 30 * 60_000)
-  assert.equal(persisted.grant.outcome?.status, 'completed')
-  assert.equal(persisted.jobs.length, 1)
-  const [job] = persisted.jobs
-  assert.equal(job.id, result.id)
-  assert.equal(job.instructions, goal)
-  assert.equal(job.target, worker)
-  assert.equal(job.wake.state, 'reported')
-  assert.equal(job.resume.state, 'consumed')
-  for (const [session, kind, id] of [[worker, 'task', job.wake.id], [owner, 'result', job.resume.id]]) {
-    const notifications = (await host.history(session)).filter(({ type, data }) =>
-      type === 'user/message' && data.source?.bridgeWorkflowId === job.id && data.source.bridgeWorkflowKind === kind)
-    assert.deepEqual(notifications.map(({ data }) => data.id), [id])
-  }
+  await host.rename(worker, workerTitle)
+  const quoted = await verifyDirect(host, direct(goal), goal)
   assert.deepEqual(observed, { claims: 1, reports: 1, consumes: 1, closes: 1 })
-  assert.deepEqual((await list(host)).map(({ task }) => task), [result.task])
   console.log('PASS one native exact owner prompt opens, dispatches and closes the immutable direct task exactly once')
+
+  await host.rename(worker, queryTitle)
+  const asked = await verifyDirect(host, question(questionBody), questionBody, true)
+  assert.deepEqual(observed, { claims: 2, reports: 2, consumes: 2, closes: 2 })
+  console.log('PASS colloquial one-window question preserves exact goal and returns a single result to the original controller')
+
+  const quotedQuestionBody = '样本怎么样？  \n请保留问题原文  '
+  const askedWithTitle = await verifyDirect(host, '请你给『合成查询』窗口问它' + quotedQuestionBody, quotedQuestionBody, true)
+  assert.deepEqual(observed, { claims: 3, reports: 3, consumes: 3, closes: 3 })
+
+  await verifyQuotedOrdinary(host)
+  assert.deepEqual((await list(host)).map(({ task }) => task).sort(), [asked, askedWithTitle, quoted].sort())
+  assert.deepEqual(observed, { claims: 3, reports: 3, consumes: 3, closes: 3 })
+  console.log('PASS quoted outside window suffix relays the exact text once without creating a workflow')
 })
