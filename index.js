@@ -7,6 +7,7 @@ import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { draftPreview, hostContext, matchingTitles, naturalIntent } from './natural-message.js'
+import { directIntent } from './workflow-authorization.js'
 import { applyWorkflow } from './workflow.js'
 
 // Local DSH bundles are linked, so resolve the schema from the running DSH CLI.
@@ -178,7 +179,7 @@ export function apply(ctx, config) {
       if (source?.kind === 'user') {
         const input = !active.hasRelay && config.enabled.get() ? ownerText(event.data) : undefined
         active.authorization = input === undefined ? undefined : ownerAuthorization(input, event.data.id)
-        if (web && input !== undefined) {
+        if (web && input !== undefined && !directIntent(input)) {
           const confirmed = input.trim() === '确认发送' && draft?.expiresAt > performance.now() ? draft : undefined
           const intent = confirmed ? { kind: 'confirmed' } : naturalIntent(input)
           if (intent) {
