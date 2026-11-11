@@ -15,3 +15,5 @@ The launcher clears the environment and creates temporary HOME and XDG directori
 - The GitHub job verifies the checked-out commit against the event SHA and prints the commit and tree. The pull request run identifies the tested merge tree. A push to main records its own commit and tree. Compare the product archive digest across those runs for the reviewed version.
 
 Native Web installation, browser UI, actual host authentication and durable queues, version migration, rollback and real model behavior have separate integration evidence.
+
+The 0.5.0 collaboration cases run against the product and CI combination tree. They drive the registered tools with exact and modified previews, queued and non-owner confirmations, same-window claims, batch retries, and mismatched artifact references. The interrupted-close case verifies that a result turn without completion or reconciliation cannot leave a completed task in the durable ledger. Run the full suite with the launcher above.

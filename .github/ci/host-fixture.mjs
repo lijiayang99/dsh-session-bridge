@@ -50,6 +50,7 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
   const listeners = []
   const warnings = []
   const pending = new Map()
+  const titles = new Map()
   const deliveries = []
   const wakes = []
   const faults = {}
@@ -65,31 +66,44 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
     const queue = []
     pending.set(id, queue)
     records.set(id, [])
+    titles.set(id, id)
     const agent = {
       session: { id, seq: 0 },
       status: 'idle',
       inbox: { nextTurn: queue, nextStep: [], get hasPending() { return queue.length > 0 } },
       followup(message) {
-        const start = queue.length
-        queue.push(message)
         deliveries.push({ target: id, message })
-        emit(agent, 'agent/inbox/spliced', { target: 'next-turn', start, inserted: [message] })
+        enqueue(id, message)
         faults.afterFollowup?.(id, message)
       },
       wakeDriver() { wakes.push(id) },
     }
     agents.set(id, agent)
   }
+  function enqueue(id, message) {
+    const queue = pending.get(id)
+    const start = queue.length
+    queue.push(message)
+    emit(agents.get(id), 'agent/inbox/spliced', { target: 'next-turn', start, inserted: [message] })
+  }
+
   const ctx = {
     profileContext: { name: 'web', dir: profile },
     workspaceRegistry: { archivedSessionIds: [] },
     agents,
     tools: { register: ({ name, execute }) => tools.set(name, execute) },
     sessions: { flush: async session => faults.flush ? faults.flush(session.id) : true },
-    sessionController: { resolveAgent: async id => {
-      await faults.resolve?.(id)
-      return { agent: agents.get(id) }
-    } },
+    sessionController: {
+      async resolveAgent(id) {
+        await faults.resolve?.(id)
+        return { agent: agents.get(id) }
+      },
+      async list() {
+        return { items: [...titles].map(([sessionId, title]) => ({
+          sessionId, projections: { values: { title } },
+        })) }
+      },
+    },
     sessionPersistence: {
       stat: async id => agents.has(id) ? { sizeBytes: 1, header: { cwd: root } } : undefined,
       open: async id => ({
@@ -157,15 +171,30 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
     begin(id, text, source = ownerSource) {
       begin(id, ownerMessage(text, source))
     },
+    rename(id, title) {
+      assert(titles.has(id))
+      titles.set(id, title)
+    },
+    enqueueInput(id, text, source = ownerSource) {
+      enqueue(id, ownerMessage(text, source))
+    },
+    reply(id, text, interrupted = false) {
+      const agent = agents.get(id)
+      assert.equal(agent.status, 'running')
+      emit(agent, 'assistant/message', {
+        turn: turns.get(id), interrupted,
+        message: { id: randomUUID(), role: 'assistant', content: [{ type: 'text', text }] },
+      })
+    },
     appendInput(id, text, source = ownerSource) {
       const agent = agents.get(id)
       assert.equal(agent.status, 'running')
       emit(agent, 'user/message', ownerMessage(text, source))
     },
-    end(id) {
+    end(id, reason = 'completed') {
       const agent = agents.get(id)
       agent.status = 'idle'
-      emit(agent, 'turn/end', { turn: turns.get(id), reason: { kind: 'completed' } })
+      emit(agent, 'turn/end', { turn: turns.get(id), reason: { kind: reason } })
     },
     async receive(id) {
       const queue = pending.get(id)
