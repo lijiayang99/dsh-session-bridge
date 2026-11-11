@@ -20,13 +20,16 @@ const callDirect = (args) => tool('workflow_delegate_direct', args)
 const goal = '合成目标原文，核对原样。\n第二行保留两个空格  '
 const questionBody = '今天气温怎么样'
 let expectedGoal = goal
+let completionMode = 'explicit'
+let heldResult
+let releaseResult
 const replyText = '合成回答，样本气温 21°C。'
 const wake = /^DSH-WORKFLOW (TASK|RESULT) ([a-f0-9-]+)$/
 const plans = new Map()
 const observed = { claims: 0, reports: 0, consumes: 0, closes: 0 }
 const digest = (value) => createHash('sha256').update(value).digest('hex')
 
-function decide(body, { signal }) {
+async function decide(body, { signal }) {
   const current = latestPrompt(body.messages, (text) => plans.has(text) || wake.test(text))
   if (!current) return
   const { text, results } = current
@@ -61,9 +64,15 @@ function decide(body, { signal }) {
     }
     if (results.length === 1) {
       const result = results[0]
-    assert.equal(result.goal, expectedGoal)
+      assert.equal(result.goal, expectedGoal)
       assert.equal(result.report?.status, 'completed')
       assert.equal(result.report?.summary, replyText)
+      if (completionMode === 'silent') return { reply: '   ' }
+      if (completionMode === 'recovery') {
+        heldResult = id
+        while (!releaseResult) await delay(25, undefined, { signal })
+      }
+      if (completionMode !== 'explicit') return { reply: replyText }
       return tool('workflow_close', {
         task: result.task, outcome: 'completed', summary: 'Synthetic direct task closed.',
       })
@@ -205,8 +214,13 @@ async function rejectMixedTurn(host, first = direct('第一条合成同轮输入
   }
 }
 
-async function verifyDirect(host, request, body, { targetTitle = workerTitle, checkOrdinary = false, renameTo } = {}) {
+async function verifyDirect(host, request, body, {
+  targetTitle = workerTitle, checkOrdinary = false, renameTo, mode = 'explicit',
+} = {}) {
   expectedGoal = body
+  completionMode = mode
+  heldResult = undefined
+  releaseResult = false
   const started = await withPlan(host, owner, request, async (results) => {
     if (checkOrdinary && results.length === 0) return tool('send_natural_session_message')
     const directResults = checkOrdinary ? results.slice(1) : results
@@ -234,9 +248,25 @@ async function verifyDirect(host, request, body, { targetTitle = workerTitle, ch
   assert(started.records.some(({ type, data }) => type === 'assistant/message' &&
     data.message.content.some(({ type, text }) => type === 'text' && text === '已派给「' + targetTitle + '」，等待结果。')))
 
+  if (mode === 'recovery') {
+    await host.until(() => heldResult === result.id, 'native result has been consumed before restart')
+    const snapshot = host.snapshot(owner, result.task)
+    assert.equal(snapshot.grant.state, 'collaboration_active')
+    assert.equal(snapshot.jobs[0].resume.continuation.state, 'started')
+    const name = '@local/dsh-session-bridge'
+    assert.equal((await host.rpc('pluginManager/setBundleEnabled', { name, enabled: false })).application, 'applied')
+    releaseResult = true
+    await host.idle(owner)
+    assert.deepEqual(host.snapshot(owner, result.task), snapshot)
+    await host.stop()
+    await host.start()
+    assert.equal((await host.rpc('pluginManager/setBundleEnabled', { name, enabled: true })).application, 'applied')
+  }
+
   const persisted = await host.until(() => {
     const state = host.snapshot(owner, result.task)
-    return state.grant?.state === 'closed' && state
+    const expectedState = mode === 'silent' ? 'collaboration_active' : 'closed'
+    return state.grant?.state === expectedState && state.jobs[0]?.resume?.continuation?.state === 'verified' && state
   }, 'direct delegation claims, reports, consumes and closes')
   await host.idle(owner)
   assert.equal(persisted.grant.goal, body)
@@ -245,8 +275,11 @@ async function verifyDirect(host, request, body, { targetTitle = workerTitle, ch
   assert.equal(persisted.grant.authorization.request.sourceDigest, digest(request))
   assert.deepEqual(persisted.grant.authorization.targets, [{ id: worker, title: targetTitle }])
   assert.equal(persisted.grant.expiresAt - persisted.grant.openedAt, 30 * 60_000)
-  assert.equal(persisted.grant.outcome?.status, 'completed')
-  assert.equal(persisted.grant.outcome.summary, 'Synthetic direct task closed.')
+  if (mode === 'silent') assert.equal(persisted.grant.outcome, undefined)
+  else {
+    assert.equal(persisted.grant.outcome?.status, 'completed')
+    assert.equal(persisted.grant.outcome.summary, mode === 'explicit' ? 'Synthetic direct task closed.' : replyText)
+  }
   assert.equal(persisted.jobs.length, 1)
   const [job] = persisted.jobs
   assert.equal(job.id, result.id)
@@ -254,6 +287,14 @@ async function verifyDirect(host, request, body, { targetTitle = workerTitle, ch
   assert.equal(job.target, worker)
   assert.equal(job.wake.state, 'reported')
   assert.equal(job.resume.state, 'consumed')
+  if (mode === 'reply' || mode === 'recovery') {
+    assert.equal(persisted.grant.closure, undefined)
+    const events = await host.history(owner)
+    const reply = events.find(({ type, data }) => type === 'assistant/message' &&
+      data.turn === persisted.grant.closedTurn && data.message.content.some(({ type, text }) =>
+        type === 'text' && text === replyText))
+    assert(reply && reply.seq > job.resume.continuation.replyAfterSeq)
+  }
   for (const [session, kind, id] of [[worker, 'task', job.wake.id], [owner, 'result', job.resume.id]]) {
     const notifications = (await host.history(session)).filter(({ type, data }) =>
       type === 'user/message' && data.source?.bridgeWorkflowId === job.id && data.source.bridgeWorkflowKind === kind)
@@ -350,19 +391,24 @@ await withCollaborationHost({ dsh, archive, decide }, async (host) => {
   await host.rename(worker, '你是谁')
   const originalQuestion = '今天成都天气怎么样'
   const asked = await verifyDirect(host, question(originalQuestion, '你是谁'), originalQuestion, {
-    targetTitle: '你是谁', checkOrdinary: true, renameTo: '合成派工后改名',
+    targetTitle: '你是谁', checkOrdinary: true, renameTo: '合成派工后改名', mode: 'reply',
   })
-  assert.deepEqual(observed, { claims: 2, reports: 2, consumes: 2, closes: 2 })
-  console.log('PASS original wording returns queued and the exact bound title, including a duplicate after the worker is renamed')
+  assert.deepEqual(observed, { claims: 2, reports: 2, consumes: 2, closes: 1 })
+  console.log('PASS original wording uses the exact bound title and closes on the visible reply without an explicit close tool')
 
   await host.rename(worker, queryTitle)
   const quotedQuestionBody = '样本怎么样？  \n请保留问题原文  '
   const askedWithTitle = await verifyDirect(host, '请你给『合成查询』窗口问它' + quotedQuestionBody, quotedQuestionBody,
     { targetTitle: queryTitle, checkOrdinary: true })
-  assert.deepEqual(observed, { claims: 3, reports: 3, consumes: 3, closes: 3 })
+  const silentGoal = '合成无可见答复的结果轮'
+  const silent = await verifyDirect(host, question(silentGoal), silentGoal, { targetTitle: queryTitle, mode: 'silent' })
+  console.log('PASS a completed result turn without non-empty visible text leaves its grant open')
+  const recoveryGoal = '合成插件停用后正常答复与恢复'
+  const recovered = await verifyDirect(host, question(recoveryGoal), recoveryGoal, { targetTitle: queryTitle, mode: 'recovery' })
+  console.log('PASS restart recovers the verified native reply and closes without replay')
 
   await verifyQuotedOrdinary(host)
-  assert.deepEqual((await list(host)).map(({ task }) => task).sort(), [asked, askedWithTitle, quoted].sort())
-  assert.deepEqual(observed, { claims: 3, reports: 3, consumes: 3, closes: 3 })
+  assert.deepEqual((await list(host)).map(({ task }) => task).sort(), [asked, askedWithTitle, quoted, silent, recovered].sort())
+  assert.deepEqual(observed, { claims: 5, reports: 5, consumes: 5, closes: 2 })
   console.log('PASS quoted outside window suffix relays the exact text once without creating a workflow')
 })

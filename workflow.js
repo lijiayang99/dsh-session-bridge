@@ -103,6 +103,7 @@ function setGrantState(grant, state) {
 }
 
 const batchOf = (grant, id) => grant?.batches?.find(({ batch }) => batch === id)
+const isDirectGrant = (grant) => grant?.authorization?.kind === 'native-owner-workflow-direct'
 
 function sent(delivery) {
   return delivery?.state === 'sending' || delivery?.state === 'admitted'
@@ -190,7 +191,10 @@ async function hostEvidence(ctx, job, kind, signal) {
   let inputs = 0
   let mixedTurn = false
   let endReason
-  for (const { type, data } of events) {
+  const replyAfterSeq = kind === 'result' ? job.resume.continuation?.replyAfterSeq : undefined
+  let replySeen = false
+  let replyEndTime
+  for (const { type, data, seq, time } of events) {
     if (type === 'turn/start') {
       turn = data.turn
       inMatchedTurn = false
@@ -210,10 +214,17 @@ async function hostEvidence(ctx, job, kind, signal) {
         }
       }
     }
+    if (inMatchedTurn && type === 'assistant/message' && data.turn === matchedTurn &&
+        Number.isSafeInteger(replyAfterSeq) && seq > replyAfterSeq && !data.interrupted &&
+        data.message?.role === 'assistant' && data.message.content?.some(({ type, text }) =>
+          type === 'text' && typeof text === 'string' && text.trim())) {
+      replySeen = true
+    }
     if (type === 'turn/end') {
       if (inMatchedTurn && data.turn === matchedTurn) {
         endReason = data.reason.kind
         mixedTurn = inputs !== 1
+        if (replySeen && Number.isFinite(time)) replyEndTime = time
       }
       inMatchedTurn = false
       turn = undefined
@@ -225,6 +236,7 @@ async function hostEvidence(ctx, job, kind, signal) {
     consumptions,
     ...(matchedTurn !== undefined ? { turn: matchedTurn } : {}),
     ...(endReason !== undefined ? { endReason } : {}),
+    ...(replyEndTime !== undefined ? { replyEndTime } : {}),
     ...(mixedTurn ? { mixedTurn } : {}),
   }
 }
@@ -738,9 +750,9 @@ export function applyWorkflow(ctx, config, allowed) {
     }, ['id', 'attempt', 'token', 'status', 'summary', 'evidence'])
 
   register('consume',
-    'When this turn receives DSH-WORKFLOW RESULT <id>, read the result once. A batch result contains all members, including failures and uncertain work. A successful consume opens the original task in this turn for further dispatch or close.',
+    'When this turn receives DSH-WORKFLOW RESULT <id>, read the result once. A batch result contains all members, including failures and uncertain work. For a successful direct delegation, reply with the result in this turn and the plugin can close the grant on normal turn completion. Other workflows can continue with further dispatch or explicit close.',
     { id: uuidSchema },
-    ({ id }, _exec, caller) => {
+    ({ id }, exec, caller) => {
       const { context, turn } = caller
       if (context.mode === 'main' && context.after === id) return { id, duplicate: true }
       if (context.mode !== 'result' || context.id !== id) return denied('result_wake_required')
@@ -764,6 +776,10 @@ export function applyWorkflow(ctx, config, allowed) {
         job.resume.consumedTurn = turn.number
         job.resume.handoffAt = Date.now()
         job.resume.continuation = { state: 'started', turn: turn.number, at: Date.now(), dispatches: [] }
+        const replyAfterSeq = exec.agent.session.seq
+        if (isDirectGrant(grant) && Number.isSafeInteger(replyAfterSeq) && replyAfterSeq >= turn.input?.sequence) {
+          job.resume.continuation.replyAfterSeq = replyAfterSeq
+        }
         return success({
           ...(batch ? { batch: batchView(grant, batch, jobs) } : jobView(job, grant)),
           task: grant.task, goal: grant.goal, duplicate: false,
@@ -1163,7 +1179,7 @@ export function applyWorkflow(ctx, config, allowed) {
       // Missing evidence is recorded conservatively after the host boundary.
     }
     if (signal.aborted) return
-    ledger.change(({ jobs }, archive) => {
+    ledger.change(({ grants, jobs }, archive) => {
       const stored = jobs[job.id]
       if (!stored) return noChange()
       const issue = continuationIssue(stored.resume)
@@ -1176,6 +1192,18 @@ export function applyWorkflow(ctx, config, allowed) {
       const exactTurn = evidence?.turn === continuation.turn && evidence.consumptions === 1
       if (exactTurn && evidence.endReason === 'completed' && !evidence.mixedTurn) {
         continuation.state = 'verified'
+        const grant = grants[stored.key]
+        if (isDirectGrant(grant) && grant.state === 'collaboration_active' && !grant.closure &&
+            grant.budget === 1 && grant.dispatched === 1 && !stored.batch && !continuation.dispatches.length &&
+            stored.wake.state === 'reported' && stored.report?.status === 'completed' && !stored.report.late &&
+            enabled() && available(stored.owner) && evidence.replyEndTime < grant.expiresAt) {
+          // Verify the native reply and close the one-shot grant in the same
+          // transaction. Explicit close and historical proofs remain separate.
+          grant.state = 'closed'
+          grant.closedAt = evidence.replyEndTime
+          grant.closedTurn = continuation.turn
+          grant.outcome = { status: 'completed', summary: stored.report.summary, finalArtifacts: [] }
+        }
       } else {
         continuation.state = 'interrupted'
         continuation.phase = continuation.dispatches.length ? 'after_dispatch' : 'before_dispatch'
