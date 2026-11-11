@@ -1,4 +1,4 @@
-# dsh-session-bridge 0.5.0-rc.10
+# dsh-session-bridge 0.5.0-rc.11
 
 适用于 DeepSeek Harness Web 0.2.2-rc.1。全新安装可通过「插件 → 添加插件」输入宿主机可读的包绝对路径并启用。已有版本请先按下文迁移。
 
@@ -107,6 +107,12 @@
 
 在发送会话由 DSH 所有者输入 `授权互传 目标会话ID 请求号`，下一行开始写准确正文。助手用 `send_session_message` 按原样发送，从原发送会话用 `session_message_status` 查投递和处理。精确重试只返回已有回执。迁移保留回执内容和去重键。目标轮次正常回复并落盘仅证明处理，项目验收仍要看结构化结果和产物。
 
+### 左栏传递状态
+
+普通互传、委托派工和结果回传在左侧会话行显示短期状态。宿主实际尝试投递时，两行均在视口内才出现从发送行到接收行的小飞机。结果回传沿相反方向飞。排队、已投递、执行、回传以及失败或待核对各有独立文字。已投递表示宿主接收了消息，任务验收以右栏的原主控任务记录为准。
+
+会话行折叠、滚出或隐藏，以及启用系统减少动态效果时，状态仍可在可见行上读取。重新展开或打开页面不会补播。每个页面只建立一条所有者活动订阅，同时最多显示四架飞机。活动数据仅保存在内存，限 128 条。委托活动保留至授权期限，普通互传的活动状态最多保留 15 分钟，终态保留 18 秒。活动流只返回当前白名单中双方的方向、类型和状态。
+
 ### 停机换包与回退
 
 排空在途消息和委托，保存两个开关与白名单的当前值，关闭两个开关并停用插件。完整停止宿主后备份当前配置、回执和委托账本，再换入固定包并完整重启。各版共用相同设置 ID、回执和账本路径。核对安装版本、白名单、开关和已有回执及委托记录，再按原授权恢复开关。
@@ -123,19 +129,23 @@ npm pack --offline --pack-destination "$lab"
 npm install --prefix "$lab/tools" playwright-core@1.65.0
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.10.tgz" full \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.11.tgz" full \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.10.tgz" stress
+  "$lab/local-dsh-session-bridge-0.5.0-rc.11.tgz" stress
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration-auto.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.10.tgz" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.11.tgz" \
+  "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
+unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+  "$(command -v node)" ./test/sidebar-transfers.mjs "$(command -v dsh)" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.11.tgz" \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 for test in collaboration-auto collaboration-direct collaboration-recovery collaboration-expiry; do
   unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
     "$(command -v node)" "./test/$test.mjs" "$(command -v dsh)" \
-    "$lab/local-dsh-session-bridge-0.5.0-rc.10.tgz"
+    "$lab/local-dsh-session-bridge-0.5.0-rc.11.tgz"
 done
 bash .github/ci/run.sh
 ```
@@ -144,7 +154,7 @@ bash .github/ci/run.sh
 
 0.4.5-rc.2 同布局换包用 `test/collaboration-rollback.mjs <dsh> <固定 0.4.5-rc.2 tgz> <候选 tgz>`，同样在 loopback 命名空间运行。基线包从 `87b06bf9fc8f9b3fc523d0ab227edd9d284c8609` 打包，SHA-256 为 `fb5de752634093c23be783fdf507b86e23ca362250ea787756de09f1e6ff6a91`。
 
-恢复和真实模型闭环测试在一次性宿主启用逐步时间快照，复验派工、接续重启和收口。真实模型闭环用 `node ./test/collaboration-pilot.mjs "$(command -v dsh)" "$lab/local-dsh-session-bridge-0.5.0-rc.10.tgz" gpt-6.1-sol`。该脚本使用合成窗口和文件、loopback 模型适配器，以及已授权的 Codex 模型访问。适配器只传合成任务，并把模型选择交给宿主真实执行的委托工具。
+恢复和真实模型闭环测试在一次性宿主启用逐步时间快照，复验派工、接续重启和收口。真实模型闭环用 `node ./test/collaboration-pilot.mjs "$(command -v dsh)" "$lab/local-dsh-session-bridge-0.5.0-rc.11.tgz" gpt-6.1-sol`。该脚本使用合成窗口和文件、loopback 模型适配器，以及已授权的 Codex 模型访问。适配器只传合成任务，并把模型选择交给宿主真实执行的委托工具。
 
 ### 自然语句隔离复验
 
@@ -156,11 +166,11 @@ npm pack --offline --pack-destination "$lab"
 npm install --prefix "$lab/tools" playwright-core@1.65.0
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/natural-send.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.10.tgz" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.11.tgz" \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/natural-send-time-context.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.10.tgz"
+  "$lab/local-dsh-session-bridge-0.5.0-rc.11.tgz"
 bash .github/ci/run.sh
 ```
 

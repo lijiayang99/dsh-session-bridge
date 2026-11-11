@@ -8,6 +8,7 @@ import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { draftPreview, hostContext, matchingTitles, naturalIntent } from './natural-message.js'
 import { directIntent } from './workflow-authorization.js'
+import { createActivity } from './activity.js'
 import { applyWorkflow } from './workflow.js'
 
 // Local DSH bundles are linked, so resolve the schema from the running DSH CLI.
@@ -126,15 +127,28 @@ export function apply(ctx, config) {
   const allowed = (id) => typeof id === 'string' && config.allowedSessions.get().includes(id)
     && !ctx.workspaceRegistry.archivedSessionIds.includes(id)
   let web = false
+  let activity
   if (supportsOwnerPrompt) {
     ctx.inject(['profileContext', 'sessionPersistence'], (workflowCtx) => {
       if (workflowCtx.profileContext.name !== 'web') return
       web = true
-      applyWorkflow(workflowCtx, config, allowed)
+      const projection = createActivity(allowed)
+      activity = projection
+      workflowCtx.inject(['connection'], (scope) => {
+        if (scope.connection) projection.register(scope)
+      })
+      applyWorkflow(workflowCtx, config, allowed, projection)
     })
   }
   const receiptPath = (key) => join(dir, key + '.json')
   const processingPath = (key) => join(dir, key + '.turn.json')
+  function messageActivity(record, state, attempt) {
+    try {
+      activity?.record({ key: record.messageId, from: record.from, to: record.to, kind: 'message', state }, attempt)
+    } catch {
+      ctx.logger.warn('message activity could not be projected')
+    }
+  }
 
   function hasEmptyInbox(session) {
     try {
@@ -197,7 +211,8 @@ export function apply(ctx, config) {
       const record = read(receiptPath(key))
       if (record?.messageId === event.data.id && record.to === session.id &&
           record.from === source.senderSessionId && allowed(record.from)) {
-        active.message = { key, id: event.data.id }
+        active.message = { key, id: event.data.id, record }
+        messageActivity(record, 'executing')
       }
       return
     }
@@ -226,15 +241,19 @@ export function apply(ctx, config) {
     clearNatural(active)
     turns.delete(session.id)
     if (!active.message) return
-    const { key, id } = active.message
+    const { key, id, record } = active.message
     const processing = reason === 'completed' && active.replied ? 'processed' : 'not_completed'
     void Promise.resolve().then(async () => {
       if (await ctx.sessions.flush(session)) {
         write(dir, processingPath(key), {
           messageId: id, processing, turn: active.turn, endReason: reason, at: now(),
         }, true)
-      }
-    }).catch(() => ctx.logger.warn('dsh-session-bridge could not persist turn evidence'))
+        messageActivity(record, processing === 'processed' ? 'processed' : 'uncertain')
+      } else messageActivity(record, 'uncertain')
+    }).catch(() => {
+      messageActivity(record, 'uncertain')
+      ctx.logger.warn('dsh-session-bridge could not persist turn evidence')
+    })
   })
 
   const senderId = (exec) => {
@@ -296,6 +315,7 @@ export function apply(ctx, config) {
       return existingResult(key, read(path), from, payloadHash)
     }
 
+    messageActivity(record, 'queued')
     let attempted = false
     try {
       const resolved = await ctx.sessionController.resolveAgent(to)
@@ -314,6 +334,7 @@ export function apply(ctx, config) {
         throw new Error('destination unavailable')
       }
       attempted = true
+      messageActivity(record, 'sending', true)
       target.followup({
         id: record.messageId, role: 'user',
         content: [{
@@ -327,7 +348,12 @@ export function apply(ctx, config) {
       record.delivery = attempted ? 'unknown' : 'not_delivered'
     }
     write(dir, path, record, false)
-    return result(key, record)
+    const receipt = result(key, record)
+    messageActivity(record, receipt.processing === 'processed' ? 'processed'
+      : receipt.processing === 'running' ? 'executing'
+        : receipt.processing === 'not_completed' || receipt.delivery === 'unknown' ? 'uncertain'
+          : receipt.delivery === 'delivered' ? 'delivered' : 'failed')
+    return receipt
   }
 
   function sendNatural(active, input, frozen, exec) {

@@ -1,7 +1,8 @@
 window.__ModuleLoader__.load({
   id: '@local/dsh-session-bridge',
   factory(require) {
-    const { createElement: h, useEffect, useState, useSyncExternalStore } = require('react')
+    const { createElement: h, useCallback, useEffect, useRef, useState, useSyncExternalStore } = require('react')
+    const { IconPaperPlaneOutlineRegular: PaperPlane } = require('@deepseek-ai/dsh-client-ui-primitives')
     const id = '@local/dsh-session-bridge'
     const kind = 'dsh-session-bridge-settings'
     const section = { display: 'grid', gap: 8 }
@@ -102,6 +103,232 @@ window.__ModuleLoader__.load({
       dictionaries.zh['wf_reason_' + reason] = zh
       dictionaries.en['wf_reason_' + reason] = en
     }
+    const transferLabels = {
+      message: ['会话消息', 'Session message'],
+      task: ['委托派工', 'Delegated assignment'],
+      result: ['结果回传', 'Returned result'],
+      outgoing: ['发出', 'Outgoing'], incoming: ['接收', 'Incoming'],
+      queued: ['排队中', 'Queued'], sending: ['传递中', 'Sending'],
+      delivered: ['已投递', 'Delivered'], executing: ['处理中', 'Processing'],
+      working: ['执行中', 'Executing'],
+      processed: ['已处理', 'Processed'], reported: ['已回报', 'Reported'],
+      received: ['已接续', 'Received'], failed: ['失败', 'Failed'],
+      uncertain: ['待核对', 'Needs reconciliation'], stopped: ['已停止', 'Stopped'],
+      reconciled: ['已对账', 'Reconciled'],
+    }
+    for (const [key, [zh, en]] of Object.entries(transferLabels)) {
+      dictionaries.zh['transfer_' + key] = zh
+      dictionaries.en['transfer_' + key] = en
+    }
+
+    function rowPoint(row) {
+      if (!row?.isConnected || document.hidden) return
+      const { left, right, top, width, height } = row.getBoundingClientRect()
+      if (width < 30 || height < 12) return
+      const y = top + height / 2
+      for (const x of [right - 18, left + width / 2, left + 16]) {
+        const hit = document.elementFromPoint(x, y)
+        if (hit && row.contains(hit)) return { x, y }
+      }
+    }
+
+    function transferColors(state) {
+      if (state === 'failed' || state === 'uncertain') return 'var(--dsw-alias-state-error, currentColor)'
+      if (['queued', 'stopped', 'reconciled'].includes(state)) return 'var(--dsw-alias-label-secondary)'
+      return 'var(--dsw-alias-state-business-primary, currentColor)'
+    }
+
+    function createTransferView(t) {
+      const anchors = new Map()
+      const listeners = new Set()
+      let rowStates = new Map()
+      const subscribe = (listener) => {
+        listeners.add(listener)
+        return () => listeners.delete(listener)
+      }
+
+      function updateRows(rows) {
+        const next = new Map()
+        for (const row of rows) {
+          for (const id of [row.from, row.to]) {
+            if (next.has(id)) continue
+            const last = rowStates.get(id)
+            next.set(id, last?.id === row.id && last.state === row.state ? last : row)
+          }
+        }
+        rowStates = next
+        for (const listener of listeners) listener()
+      }
+
+      function findAnchor(id) {
+        for (const anchor of anchors.get(id) ?? []) {
+          const point = rowPoint(anchor.closest('[role="treeitem"]'))
+          if (point) return point
+        }
+      }
+
+      const visibleState = (row) => row.kind === 'task' && row.state === 'executing' ? 'working' : row.state
+
+      function label(row, sessionId) {
+        return [row.kind, row.from === sessionId ? 'outgoing' : 'incoming', visibleState(row)]
+          .map((key) => t('transfer_' + key)).join(' · ')
+      }
+
+      function RowStatus({ sessionId }) {
+        const row = useSyncExternalStore(subscribe, () => rowStates.get(sessionId))
+        const current = useRef()
+        const bind = useCallback((node) => {
+          if (current.current) {
+            const members = anchors.get(sessionId)
+            members?.delete(current.current)
+            if (members?.size === 0) anchors.delete(sessionId)
+          }
+          current.current = node
+          if (!current.current) return
+          if (!anchors.has(sessionId)) anchors.set(sessionId, new Set())
+          anchors.get(sessionId).add(current.current)
+        }, [sessionId])
+        return h('span', { ref: bind, style: row ? {
+          display: 'inline-flex', alignItems: 'center', gap: 3, whiteSpace: 'nowrap',
+          fontSize: 10, color: transferColors(row.state),
+        } : { display: 'none' },
+        ...(row ? { role: 'img', 'aria-label': label(row, sessionId), title: label(row, sessionId),
+          'data-dsh-bridge-status': row.state } : {}),
+        }, row && h(PaperPlane, { size: 12, 'aria-hidden': true }),
+        row && h('span', { 'aria-hidden': true }, t('transfer_' + visibleState(row))))
+      }
+
+      function HoverStatus({ sessionId }) {
+        const row = useSyncExternalStore(subscribe, () => rowStates.get(sessionId))
+        return row ? h('span', { style: { color: transferColors(row.state) } }, label(row, sessionId)) : null
+      }
+
+      function PlaneFlight({ route, finish }) {
+        const node = useRef()
+        useEffect(() => {
+          const { from, to, motion, id } = route
+          const angle = (dx, dy) => Math.atan2(dy, dx) * 180 / Math.PI + 45
+          const move = (x, y, rotate, opacity) => ({
+            transform: 'translate(' + x + 'px, ' + y + 'px) translate(-50%, -50%) rotate(' + rotate + 'deg)',
+            opacity,
+          })
+          const path = ({ x: x1, y: y1 }, { x: x2, y: y2 }) => {
+            const midX = (x1 + x2) / 2 - Math.min(28, 9 + Math.abs(y2 - y1) / 4)
+            const midY = (y1 + y2) / 2
+            return [
+              move(x1, y1, angle(midX - x1, midY - y1), 0.9),
+              move(midX, midY, angle(x2 - x1, y2 - y1), 1),
+              move(x2, y2, angle(x2 - midX, y2 - midY), 0.45),
+            ]
+          }
+          const moved = (a, b) => Math.abs(a.x - b.x) >= 3 || Math.abs(a.y - b.y) >= 3
+          let frame
+          let animation
+          let start
+          let end
+          const check = () => {
+            const nextStart = findAnchor(from)
+            const nextEnd = findAnchor(to)
+            if (motion.matches || !nextStart || !nextEnd) {
+              finish(id)
+              return
+            }
+            if (!animation) {
+              start = nextStart
+              end = nextEnd
+              animation = node.current.animate(path(start, end), { duration: 820, easing: 'ease-in-out', fill: 'both' })
+              animation.onfinish = () => finish(id)
+            } else if (moved(start, nextStart) || moved(end, nextEnd)) {
+              start = nextStart
+              end = nextEnd
+              animation.effect.setKeyframes(path(start, end))
+            }
+            frame = requestAnimationFrame(check)
+          }
+          frame = requestAnimationFrame(check)
+          return () => {
+            cancelAnimationFrame(frame)
+            animation?.cancel()
+          }
+        }, [route, finish])
+        return h('span', {
+          ref: node, 'data-dsh-bridge-flight': route.kind,
+          style: { position: 'absolute', top: 0, left: 0, opacity: 0, display: 'inline-flex', color: transferColors('sending') },
+        }, h(PaperPlane, { size: 19, 'aria-hidden': true }))
+      }
+
+      function Overlay() {
+        const [flights, setFlights] = useState([])
+        const finish = useCallback((id) => setFlights((current) => current.filter((route) => route.id !== id)), [])
+        useEffect(() => {
+          const source = new EventSource('/api/dsh-session-bridge/activity')
+          const motion = window.matchMedia('(prefers-reduced-motion: reduce)')
+          let cursor
+          let frame
+          const pending = []
+          const launch = () => {
+            frame = undefined
+            if (motion.matches || document.hidden) {
+              pending.length = 0
+              return
+            }
+            const started = pending.splice(0).filter(({ from, to }) => findAnchor(from) && findAnchor(to))
+            if (started.length) {
+              setFlights((current) => [...current, ...started.slice(0, Math.max(0, 4 - current.length))])
+            }
+          }
+          const cancelPending = () => {
+            cancelAnimationFrame(frame)
+            frame = undefined
+            pending.length = 0
+          }
+          const receive = (event) => {
+            const { sequence, rows } = JSON.parse(event.data)
+            updateRows(rows)
+            if (event.type === 'baseline') {
+              cancelPending()
+              cursor = sequence
+              return
+            }
+            const after = cursor
+            cursor = sequence
+            if (after === undefined || motion.matches || document.hidden) return
+            for (const row of rows) {
+              if (pending.length >= 8) break
+              if (row.flight > after) pending.push({ id: row.flight, kind: row.kind, from: row.from, to: row.to, motion })
+            }
+            if (pending.length && frame === undefined) frame = requestAnimationFrame(launch)
+          }
+          const clear = () => {
+            cancelPending()
+            cursor = undefined
+            updateRows([])
+            setFlights([])
+          }
+          const onVisibility = () => {
+            if (!document.hidden) return
+            cancelPending()
+            setFlights([])
+          }
+          document.addEventListener('visibilitychange', onVisibility)
+          source.addEventListener('baseline', receive)
+          source.onmessage = receive
+          source.onerror = clear
+          return () => {
+            document.removeEventListener('visibilitychange', onVisibility)
+            cancelPending()
+            source.close()
+            updateRows([])
+          }
+        }, [])
+        return h('div', { 'aria-hidden': true, 'data-dsh-bridge-overlay': '',
+          style: { position: 'fixed', inset: 0, pointerEvents: 'none', zIndex: 100 },
+        }, flights.map((route) => h(PlaneFlight, { key: route.id, route, finish })))
+      }
+
+      return { RowStatus, HoverStatus, Overlay }
+    }
+
     const values = (entry) => ({
       enabled: entry.value.enabled === true,
       workflowEnabled: entry.value.workflowEnabled === true,
@@ -451,6 +678,15 @@ window.__ModuleLoader__.load({
             !view.writable && h('p', { role: 'status' }, t('readOnly')),
             (state === 'saved' || state === 'saveError') && h('p', { role: 'status', style: muted }, t(state))),
           (state === 'readError' || state === 'hostUnsupported') && h('button', { type: 'button', onClick: () => reload(generation + 1) }, t('refresh')))
+      }
+      const transfers = createTransferView(t)
+      for (const [name, component] of [
+        ['sidebar.session.row.trailing', transfers.RowStatus],
+        ['sidebar.session.row.hover', transfers.HoverStatus],
+        ['shell.overlay', transfers.Overlay],
+      ]) {
+        ctx.effect(() => ctx.slots.inject(name, () => ctx.slots.register({ name, id: id + '/activity' }, component)),
+          'dsh-session-bridge activity ' + name)
       }
       ctx.effect(() => ctx.locale.register('dsh-session-bridge', dictionaries), 'dsh-session-bridge copy')
       ctx.effect(() => ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register({

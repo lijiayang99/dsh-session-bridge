@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-session-bridge",
-  "version": "0.5.0-rc.10",
+  "version": "0.5.0-rc.11",
   "description": "Relay messages and delegate bounded tasks between existing DSH sessions.",
   "private": true,
   "type": "module",
@@ -12,6 +12,7 @@
   },
   "files": [
     "index.js",
+    "activity.js",
     "natural-message.js",
     "client.js",
     "cordis.patch.yml",
@@ -31,7 +32,8 @@
       "immediately": true,
       "inject": [
         "@deepseek-ai/dsh-client-ui-sidebar-right",
-        "@deepseek-ai/dsh-client-ui-chat"
+        "@deepseek-ai/dsh-client-ui-chat",
+        "@deepseek-ai/dsh-client-ui-workspace"
       ]
     }
   },

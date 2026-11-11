@@ -63,7 +63,7 @@ function migrate(database) {
 
 // Only the bounded active snapshot is read by the timer. Historical reads use
 // indexed lookups. Moving a row and updating the snapshot are one transaction.
-export function openLedger(dir) {
+export function openLedger(dir, onCommit) {
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   const lock = new DatabaseSync(join(dir, 'dispatcher.sqlite'), { timeout: 0 })
   let database
@@ -110,12 +110,27 @@ export function openLedger(dir) {
       read,
       history,
       change(update) {
-        return transaction(database, () => {
+        const archived = []
+        let committed
+        const result = transaction(database, () => {
           const state = read()
-          const { changed, value } = update(state, archive)
-          if (changed && set.run(JSON.stringify(state)).changes !== 1) throw new Error('Workflow ledger write failed')
+          const { changed, value } = update(state, onCommit ? {
+            ...archive,
+            job(entry) {
+              archive.job(entry)
+              archived.push(entry)
+            },
+          } : archive)
+          if (changed) {
+            if (set.run(JSON.stringify(state)).changes !== 1) throw new Error('Workflow ledger write failed')
+            committed = state
+          }
           return value
         })
+        if (onCommit && committed) {
+          try { onCommit(committed, archived) } catch { /* Observers cannot invalidate a committed mutation. */ }
+        }
+        return result
       },
       close() {
         try { database.close() } finally { lock.close() }

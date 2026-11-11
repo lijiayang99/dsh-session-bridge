@@ -300,11 +300,44 @@ function closeTurnEvidence(events, closure, anchor) {
   }
 }
 
-export function applyWorkflow(ctx, config, allowed) {
+const activityStates = {
+  queued: 'queued', sending: 'sending', admitted: 'delivered', claimed: 'executing',
+  reported: 'reported', consumed: 'delivered', failed: 'failed', uncertain: 'uncertain',
+  skipped: 'stopped', reconciled: 'reconciled',
+}
+
+export function applyWorkflow(ctx, config, allowed, activity) {
   if (lstatSync(join(ctx.profileContext.dir, 'session-bridge-workflow'), { throwIfNoEntry: false })) {
     throw new Error('dsh-session-bridge: migrate the legacy workflow directory with DSH stopped before enabling delegation')
   }
-  const ledger = openLedger(join(ctx.profileContext.dir, 'dsh-session-bridge-workflow'))
+  const ledger = openLedger(join(ctx.profileContext.dir, 'dsh-session-bridge-workflow'),
+    activity ? ({ jobs, grants }, archived) => {
+      for (const job of [...Object.values(jobs), ...archived]) {
+        if (!job?.wake) continue
+        const expiresAt = grants[job.key]?.expiresAt
+        publishDelivery(job, 'task', expiresAt)
+        if (job.resume) publishDelivery(job, 'result', expiresAt)
+      }
+    } : undefined)
+
+  function publishDelivery(job, kind, keepUntil, attempt = false) {
+    if (!activity) return
+    try {
+      const delivery = deliveryOf(job, kind)
+      const continuation = delivery.continuation
+      let state = activityStates[delivery.state]
+      if (attempt) state = 'sending'
+      else if ((delivery.state === 'sending' && delivery.reason) || continuation?.state === 'interrupted') state = 'uncertain'
+      else if (delivery.state === 'reported' && job.report?.status === 'failed') state = 'failed'
+      else if (continuation?.state === 'verified') state = 'received'
+      if (state) activity.record({
+        key: delivery.id, from: senderOf(job, kind), to: receiverOf(job, kind), kind, state, keepUntil,
+        at: attempt ? Date.now() : continuation?.settledAt ?? delivery.updatedAt,
+      }, attempt)
+    } catch {
+      ctx.logger.warn('workflow activity could not be projected')
+    }
+  }
   const lifetime = new AbortController()
   const signal = lifetime.signal
   const turns = new Map()
@@ -1143,6 +1176,7 @@ export function applyWorkflow(ctx, config, allowed) {
     const { id } = deliveryOf(job, kind)
     try {
       waking.add(id)
+      publishDelivery(job, kind, undefined, true)
       agent.followup({
         id, role: 'user',
         content: [{ type: 'text', text: wakeText(job, kind) }],
