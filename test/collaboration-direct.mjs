@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
 import { latestPrompt, tool, unpack, withCollaborationHost } from './collaboration-host.mjs'
 
@@ -68,7 +69,7 @@ async function decide(body, { signal }) {
       assert.equal(result.report?.status, 'completed')
       assert.equal(result.report?.summary, replyText)
       if (completionMode === 'silent') return { reply: '   ' }
-      if (completionMode === 'recovery') {
+      if (completionMode.startsWith('recovery')) {
         heldResult = id
         while (!releaseResult) await delay(25, undefined, { signal })
       }
@@ -214,6 +215,22 @@ async function rejectMixedTurn(host, first = direct('第一条合成同轮输入
   }
 }
 
+function shortenStoppedGrant(host, task, expiresAt) {
+  const file = join(host.dshHome, 'profiles/web/dsh-session-bridge-workflow/workflow-v1.sqlite')
+  const db = new DatabaseSync(file, { timeout: 1000 })
+  try {
+    const active = JSON.parse(db.prepare('SELECT body FROM ledger WHERE id = 1').get().body)
+    const key = owner + ':' + task
+    const job = Object.values(active.jobs).find((entry) => entry.key === key)
+    assert.equal(job.resume.continuation.state, 'started')
+    assert(job.report.at < expiresAt && expiresAt < active.grants[key].expiresAt)
+    active.grants[key].expiresAt = expiresAt
+    assert.equal(db.prepare('UPDATE ledger SET body = ? WHERE id = 1').run(JSON.stringify(active)).changes, 1)
+  } finally {
+    db.close()
+  }
+}
+
 async function verifyDirect(host, request, body, {
   targetTitle = workerTitle, checkOrdinary = false, renameTo, mode = 'explicit',
 } = {}) {
@@ -248,15 +265,41 @@ async function verifyDirect(host, request, body, {
   assert(started.records.some(({ type, data }) => type === 'assistant/message' &&
     data.message.content.some(({ type, text }) => type === 'text' && text === '已派给「' + targetTitle + '」，等待结果。')))
 
-  if (mode === 'recovery') {
+  const recovery = mode.startsWith('recovery')
+  const lateEnd = mode === 'recovery-late'
+  let originalDeadline
+  let testDeadline
+  if (recovery) {
     await host.until(() => heldResult === result.id, 'native result has been consumed before restart')
     const snapshot = host.snapshot(owner, result.task)
     assert.equal(snapshot.grant.state, 'collaboration_active')
     assert.equal(snapshot.jobs[0].resume.continuation.state, 'started')
+    originalDeadline = snapshot.grant.expiresAt
+    assert.equal(originalDeadline - snapshot.grant.openedAt, 30 * 60_000)
     const name = '@local/dsh-session-bridge'
     assert.equal((await host.rpc('pluginManager/setBundleEnabled', { name, enabled: false })).application, 'applied')
+    // Only in this disposable profile, compress the wall-clock gap between
+    // consume, native turn end and restart while the plugin has released SQLite.
+    if (lateEnd) {
+      testDeadline = Date.now() + 25
+      shortenStoppedGrant(host, result.task, testDeadline)
+      await host.until(() => Date.now() > testDeadline, 'synthetic deadline passes before native reply')
+    }
     releaseResult = true
     await host.idle(owner)
+    const resultTurn = snapshot.jobs[0].resume.continuation.turn
+    const ended = (await host.history(owner)).find(({ type, data }) =>
+      type === 'turn/end' && data.turn === resultTurn)
+    assert.equal(ended?.data.reason.kind, 'completed')
+    if (mode === 'recovery-expired') {
+      testDeadline = ended.time + 1
+      shortenStoppedGrant(host, result.task, testDeadline)
+      await host.until(() => Date.now() > testDeadline, 'synthetic deadline passes after native reply')
+    }
+    if (testDeadline !== undefined) {
+      snapshot.grant.expiresAt = testDeadline
+      assert.equal(ended.time > testDeadline, lateEnd)
+    }
     assert.deepEqual(host.snapshot(owner, result.task), snapshot)
     await host.stop()
     await host.start()
@@ -265,7 +308,7 @@ async function verifyDirect(host, request, body, {
 
   const persisted = await host.until(() => {
     const state = host.snapshot(owner, result.task)
-    const expectedState = mode === 'silent' ? 'collaboration_active' : 'closed'
+    const expectedState = lateEnd ? 'expired' : mode === 'silent' ? 'collaboration_active' : 'closed'
     return state.grant?.state === expectedState && state.jobs[0]?.resume?.continuation?.state === 'verified' && state
   }, 'direct delegation claims, reports, consumes and closes')
   await host.idle(owner)
@@ -274,8 +317,9 @@ async function verifyDirect(host, request, body, {
   assert.equal(persisted.grant.authorization.request.messageId, started.input.data.id)
   assert.equal(persisted.grant.authorization.request.sourceDigest, digest(request))
   assert.deepEqual(persisted.grant.authorization.targets, [{ id: worker, title: targetTitle }])
-  assert.equal(persisted.grant.expiresAt - persisted.grant.openedAt, 30 * 60_000)
-  if (mode === 'silent') assert.equal(persisted.grant.outcome, undefined)
+  assert.equal((originalDeadline ?? persisted.grant.expiresAt) - persisted.grant.openedAt, 30 * 60_000)
+  if (testDeadline !== undefined) assert.equal(persisted.grant.expiresAt, testDeadline)
+  if (mode === 'silent' || lateEnd) assert.equal(persisted.grant.outcome, undefined)
   else {
     assert.equal(persisted.grant.outcome?.status, 'completed')
     assert.equal(persisted.grant.outcome.summary, mode === 'explicit' ? 'Synthetic direct task closed.' : replyText)
@@ -287,13 +331,14 @@ async function verifyDirect(host, request, body, {
   assert.equal(job.target, worker)
   assert.equal(job.wake.state, 'reported')
   assert.equal(job.resume.state, 'consumed')
-  if (mode === 'reply' || mode === 'recovery') {
+  if (mode === 'reply' || recovery && !lateEnd) {
     assert.equal(persisted.grant.closure, undefined)
     const events = await host.history(owner)
     const reply = events.find(({ type, data }) => type === 'assistant/message' &&
       data.turn === persisted.grant.closedTurn && data.message.content.some(({ type, text }) =>
         type === 'text' && text === replyText))
     assert(reply && reply.seq > job.resume.continuation.replyAfterSeq)
+    assert(persisted.grant.closedAt < persisted.grant.expiresAt)
   }
   for (const [session, kind, id] of [[worker, 'task', job.wake.id], [owner, 'result', job.resume.id]]) {
     const notifications = (await host.history(session)).filter(({ type, data }) =>
@@ -406,9 +451,17 @@ await withCollaborationHost({ dsh, archive, decide }, async (host) => {
   const recoveryGoal = '合成插件停用后正常答复与恢复'
   const recovered = await verifyDirect(host, question(recoveryGoal), recoveryGoal, { targetTitle: queryTitle, mode: 'recovery' })
   console.log('PASS restart recovers the verified native reply and closes without replay')
+  const expiryGoal = '合成及时答复后到期才重启'
+  const recoveredAfterExpiry = await verifyDirect(host, question(expiryGoal), expiryGoal,
+    { targetTitle: queryTitle, mode: 'recovery-expired' })
+  console.log('PASS restart after expiry closes only the native reply that finished before the deadline')
+  const lateGoal = '合成到期后才结束的答复'
+  const late = await verifyDirect(host, question(lateGoal), lateGoal, { targetTitle: queryTitle, mode: 'recovery-late' })
+  console.log('PASS a native reply ending after expiry stays expired and is never replayed')
 
   await verifyQuotedOrdinary(host)
-  assert.deepEqual((await list(host)).map(({ task }) => task).sort(), [asked, askedWithTitle, quoted, silent, recovered].sort())
-  assert.deepEqual(observed, { claims: 5, reports: 5, consumes: 5, closes: 2 })
+  assert.deepEqual((await list(host)).map(({ task }) => task).sort(),
+    [asked, askedWithTitle, quoted, silent, recovered, recoveredAfterExpiry, late].sort())
+  assert.deepEqual(observed, { claims: 7, reports: 7, consumes: 7, closes: 2 })
   console.log('PASS quoted outside window suffix relays the exact text once without creating a workflow')
 })

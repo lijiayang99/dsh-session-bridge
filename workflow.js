@@ -146,6 +146,18 @@ function continuationIssue(resume) {
         typeof continuation.reason !== 'string')) return invalid
 }
 
+function pendingDirectCompletion(grant, job) {
+  const { resume } = job
+  const continuation = resume?.continuation
+  return isDirectGrant(grant) && grant.state === 'collaboration_active' && !grant.closure &&
+    grant.budget === 1 && grant.dispatched === 1 && grant.owner === job.owner &&
+    job.key === taskKey(grant.owner, grant.task) && !job.batch && !job.quarantine &&
+    job.wake?.state === 'reported' && job.report?.status === 'completed' && !job.report.late &&
+    continuation?.state === 'started' && !continuationIssue(resume) && !continuation.dispatches.length &&
+    Number.isSafeInteger(resume.startSeq) && Number.isSafeInteger(continuation.replyAfterSeq) &&
+    continuation.replyAfterSeq >= resume.startSeq
+}
+
 function jobView(job, grant) {
   const { id, item, attempt, scope, target, after, instructions, acceptance, wake, claim, report, resume } = job
   const title = grant?.authorization?.targets?.find(({ id }) => id === target)?.title
@@ -1191,11 +1203,8 @@ export function applyWorkflow(ctx, config, allowed) {
       if (continuation?.state !== 'started' || continuation.turn !== started.turn) return noChange()
       const exactTurn = evidence?.turn === continuation.turn && evidence.consumptions === 1
       if (exactTurn && evidence.endReason === 'completed' && !evidence.mixedTurn) {
-        continuation.state = 'verified'
         const grant = grants[stored.key]
-        if (isDirectGrant(grant) && grant.state === 'collaboration_active' && !grant.closure &&
-            grant.budget === 1 && grant.dispatched === 1 && !stored.batch && !continuation.dispatches.length &&
-            stored.wake.state === 'reported' && stored.report?.status === 'completed' && !stored.report.late &&
+        if (pendingDirectCompletion(grant, stored) &&
             enabled() && available(stored.owner) && evidence.replyEndTime < grant.expiresAt) {
           // Verify the native reply and close the one-shot grant in the same
           // transaction. Explicit close and historical proofs remain separate.
@@ -1204,6 +1213,7 @@ export function applyWorkflow(ctx, config, allowed) {
           grant.closedTurn = continuation.turn
           grant.outcome = { status: 'completed', summary: stored.report.summary, finalArtifacts: [] }
         }
+        continuation.state = 'verified'
       } else {
         continuation.state = 'interrupted'
         continuation.phase = continuation.dispatches.length ? 'after_dispatch' : 'before_dispatch'
@@ -1320,6 +1330,12 @@ export function applyWorkflow(ctx, config, allowed) {
     const now = Date.now()
     return ledger.change((state, archive) => {
       const { grants, jobs } = state
+      const pendingDirect = new Set()
+      for (const job of Object.values(jobs)) {
+        const grant = grants[job?.key]
+        if (stateOf(grant, now) === 'expired' && pendingDirectCompletion(grant, job) &&
+            turns.get(job.owner)?.number !== job.resume.continuation.turn) pendingDirect.add(job.key)
+      }
       let changed = false
       for (const [key, grant] of Object.entries(grants)) {
         const status = stateOf(grant, now)
@@ -1330,6 +1346,9 @@ export function applyWorkflow(ctx, config, allowed) {
           Object.assign(grant.closure, { state: 'expired', settledAt: now })
         }
         if (!terminal(status)) continue
+        // Keep the expired grant only until the scanner can check whether the
+        // consumed result already ended before expiry. Routing still sees expired.
+        if (pendingDirect.has(key)) continue
         grant.state = status
         archive.grant(key, grant)
         delete grants[key]
