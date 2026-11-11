@@ -95,8 +95,9 @@ function isWake(job, kind, message) {
 function stateOf(grant, now = Date.now()) {
   if (!grant) return 'missing_grant'
   const state = grant.state === 'collaboration_active' ? 'active'
-    : grant.state === 'collaboration_paused' ? 'paused' : grant.state
-  if (state !== 'active' && state !== 'paused') return state
+    : grant.state === 'collaboration_paused' ? 'paused'
+      : grant.state === 'collaboration_closing' ? 'closing' : grant.state
+  if (state !== 'active' && state !== 'paused' && state !== 'closing') return state
   return now >= grant.expiresAt ? 'expired' : state
 }
 
@@ -169,40 +170,80 @@ function jobView(job, grant) {
   }
 }
 
-// Exact durable host evidence. A matching ID in arbitrary text is irrelevant.
-async function hostEvidence(ctx, job, kind, signal) {
-  const handle = await ctx.sessionPersistence.open(receiverOf(job, kind), 'read', { signal })
+async function hostEvents(ctx, sessionId, startSeq, signal) {
+  const handle = await ctx.sessionPersistence.open(sessionId, 'read', { signal })
   try {
     const limit = 20_000
-    const { events } = await handle.read(deliveryOf(job, kind).startSeq, limit, { signal })
+    const { events } = await handle.read(startSeq, limit, { signal })
     if (events.length === limit) throw new Error('Recovery evidence exceeds the scan bound')
-    const queues = { 'next-turn': [], 'next-step': [] }
-    let admissions = 0
-    let consumptions = 0
-    let turn
-    let matchedTurn
-    let endReason
-    for (const { type, data } of events) {
-      if (type === 'turn/start') turn = data.turn
-      if (type === 'agent/inbox/spliced') {
-        queues[data.target].splice(data.start, data.removedCount ?? 0, ...data.inserted)
-        admissions += data.inserted.filter((message) => isWake(job, kind, message)).length
-      }
-      if (type === 'user/message' && isWake(job, kind, data)) {
-        consumptions++
-        if (consumptions === 1) matchedTurn = turn
-      }
-      if (type === 'turn/end' && data.turn === matchedTurn && endReason === undefined) endReason = data.reason.kind
-    }
-    return {
-      pending: Object.values(queues).flat().some((message) => isWake(job, kind, message)),
-      admissions,
-      consumptions,
-      ...(matchedTurn !== undefined ? { turn: matchedTurn } : {}),
-      ...(endReason !== undefined ? { endReason } : {}),
-    }
+    return events
   } finally {
     await handle.close()
+  }
+}
+
+// Exact durable host evidence. A matching ID in arbitrary text is irrelevant.
+async function hostEvidence(ctx, job, kind, signal) {
+  const events = await hostEvents(ctx, receiverOf(job, kind), deliveryOf(job, kind).startSeq, signal)
+  const queues = { 'next-turn': [], 'next-step': [] }
+  let admissions = 0
+  let consumptions = 0
+  let turn
+  let matchedTurn
+  let inMatchedTurn = false
+  let endReason
+  for (const { type, data } of events) {
+    if (type === 'turn/start') {
+      turn = data.turn
+      inMatchedTurn = false
+    }
+    if (type === 'agent/inbox/spliced') {
+      queues[data.target].splice(data.start, data.removedCount ?? 0, ...data.inserted)
+      admissions += data.inserted.filter((message) => isWake(job, kind, message)).length
+    }
+    if (type === 'user/message' && isWake(job, kind, data)) {
+      consumptions++
+      if (consumptions === 1) {
+        matchedTurn = turn
+        inMatchedTurn = turn !== undefined
+      }
+    }
+    if (type === 'turn/end') {
+      if (inMatchedTurn && data.turn === matchedTurn) endReason = data.reason.kind
+      inMatchedTurn = false
+      turn = undefined
+    }
+  }
+  return {
+    pending: Object.values(queues).flat().some((message) => isWake(job, kind, message)),
+    admissions,
+    consumptions,
+    ...(matchedTurn !== undefined ? { turn: matchedTurn } : {}),
+    ...(endReason !== undefined ? { endReason } : {}),
+  }
+}
+
+function closeTurnEvidence(events, closure, anchor) {
+  const [start] = events
+  if (start?.type !== 'turn/start' || start.seq !== closure.startSeq || start.data.turn !== closure.turn) return
+  let inputSeen = false
+  for (let index = 1; index < events.length; index++) {
+    const event = events[index]
+    if (event.type === 'turn/start') return
+    if (event.type === 'user/message' && event.data.source?.kind !== 'runtime-context') {
+      const { data, seq } = event
+      const matchesSource = anchor ? isWake(anchor, 'result', data)
+        : nativeOwner(data) && data.source.rpcId === closure.input.rpcId
+      if (inputSeen || seq !== closure.input.sequence || data.id !== closure.input.messageId || !matchesSource) return
+      inputSeen = true
+    }
+    if (event.type === 'turn/end') {
+      if (inputSeen && event.data.turn === closure.turn && Number.isFinite(event.time) &&
+          event.time >= closure.requestedAt) {
+        return { sequence: event.seq, time: event.time, reason: event.data.reason?.kind }
+      }
+      return
+    }
   }
 }
 
@@ -255,7 +296,10 @@ export function applyWorkflow(ctx, config, allowed) {
       if (command === '取消委托') {
         ledger.change(({ grants }) => {
           const grant = grants[key]
-          if (!grant || !['active', 'paused'].includes(stateOf(grant))) return noChange()
+          if (!grant || !['active', 'paused', 'closing'].includes(stateOf(grant))) return noChange()
+          if (grant.closure?.state === 'pending') {
+            Object.assign(grant.closure, { state: 'cancelled', settledAt: Date.now() })
+          }
           grant.state = 'cancelled'
           grant.closedAt = Date.now()
           grant.closedBy = message.id
@@ -340,7 +384,7 @@ export function applyWorkflow(ctx, config, allowed) {
         return
       }
       if (event.type === 'turn/start') {
-        turns.set(session.id, { number: event.data.turn, context: null, mixed: false, wakes: [] })
+        turns.set(session.id, { number: event.data.turn, startSeq: event.seq, context: null, mixed: false, wakes: [] })
         return
       }
       const turn = turns.get(session.id)
@@ -361,7 +405,13 @@ export function applyWorkflow(ctx, config, allowed) {
         // Mixed native or relay inputs never share workflow authority.
         if (turn.context) turn.mixed = true
         const natural = authorization.input(session, turn, event.data)
-        if (!turn.mixed) turn.context = wake ?? natural ?? controlInput(session, turn, event.data)
+        if (!turn.mixed) {
+          turn.context = wake ?? natural ?? controlInput(session, turn, event.data)
+          if (wake || nativeOwner(event.data)) turn.input = {
+            sequence: event.seq, messageId: event.data.id,
+            ...(wake ? {} : { rpcId: source.rpcId }),
+          }
+        }
         // A native owner cancellation still applies even in a mixed turn.
         else if (nativeOwner(event.data) && /^取消委托 /.test(plainText(event.data) ?? '')) {
           controlInput(session, turn, event.data)
@@ -799,7 +849,7 @@ export function applyWorkflow(ctx, config, allowed) {
     })
 
   register('close',
-    'Close a finished workflow task in its bound main turn. A collaboration task requires outcome and summary. completed requires successful latest attempts and exact finalArtifacts backed by the latest approved review whenever review was requested. Use partial or failed for settled failures. The owner can cancel with 取消委托 <task>.',
+    'Request closeout of a finished workflow in its bound main turn. A collaboration task returns closing until this exact native turn ends normally and its completion is durable. Finish the turn after requesting closeout. Include outcome and summary. completed requires successful latest attempts and exact finalArtifacts backed by the latest approved review whenever review was requested. Use partial or failed for settled failures. The owner can cancel with 取消委托 <task>.',
     {
       task: idSchema, outcome: { type: 'string', enum: ['completed', 'partial', 'failed'] },
       summary: textSchema(2400), finalArtifacts: artifactList,
@@ -809,9 +859,19 @@ export function applyWorkflow(ctx, config, allowed) {
       const key = taskKey(id, task)
       if (!enabled() || (context.mode !== 'main' && context.mode !== 'authorize') || context.key !== key) return denied('main_task_context_required')
       if (context.pending && !await context.pending) return denied('grant_not_opened')
-      if (current(exec)?.turn !== turn || turn.context !== context) return denied('main_task_context_required')
-      return ledger.change(({ grants, jobs }) => {
+      if (!enabled() || current(exec)?.turn !== turn || turn.context !== context) return denied('main_task_context_required')
+      const result = ledger.change(({ grants, jobs }) => {
         const grant = grants[key]
+        if (grant?.collaboration && stateOf(grant) === 'closing') {
+          const closure = grant.closure
+          if (closure?.state !== 'pending' || closure.turn !== turn.number || closure.startSeq !== turn.startSeq) {
+            return noChange(denied('close_pending'))
+          }
+          const requested = closure.requestedOutcome
+          const exact = requested.status === outcome && requested.summary === summary &&
+            JSON.stringify(requested.finalArtifacts) === JSON.stringify(finalArtifacts ?? [])
+          return noChange(exact ? { task, state: 'closing', duplicate: true } : denied('close_conflict'))
+        }
         if (!activeGrant(grant)) return noChange(denied('grant_inactive'))
         const unsettled = Object.values(jobs).some((job) => job.key === key &&
           (!['reported', 'failed', 'skipped', 'reconciled'].includes(job.wake.state) ||
@@ -820,6 +880,9 @@ export function applyWorkflow(ctx, config, allowed) {
         if (grant.collaboration) {
           if (!['completed', 'partial', 'failed'].includes(outcome) || !validText(summary, 2400) ||
               finalArtifacts !== undefined && !validArtifacts(finalArtifacts)) return noChange(denied('invalid_outcome'))
+          if (!Number.isSafeInteger(turn.startSeq) || !Number.isSafeInteger(turn.input?.sequence)) {
+            return noChange(denied('close_turn_identity_unavailable'))
+          }
           if (grant.batches.some((batch) => !batch.anchor || !batchMembers(grant, batch, jobs) ||
               jobFor(jobs, batch.anchor)?.resume?.state !== 'consumed')) return noChange(denied('batch_not_consumed'))
           const all = taskJobs(jobs, id, key)
@@ -853,15 +916,24 @@ export function applyWorkflow(ctx, config, allowed) {
             if ((reviewRequired || reviews.length) && (!refs.length || !refs.every(approved) || reviews.some((job) =>
               !producers.some(({ id }) => id === job.reviewOf)))) return noChange(denied('approved_artifacts_required'))
           }
-          grant.outcome = { status: outcome, summary, finalArtifacts: refs }
+          if (grant.closure?.state === 'interrupted') grant.previousClosure = grant.closure
+          grant.closure = {
+            state: 'pending', turn: turn.number, startSeq: turn.startSeq, input: turn.input,
+            after: context.after ?? null, requestedAt: Date.now(),
+            requestedOutcome: { status: outcome, summary, finalArtifacts: refs },
+          }
+          setGrantState(grant, 'closing')
+          return success({ task, state: 'closing', duplicate: false })
         } else if (outcome !== undefined || summary !== undefined || finalArtifacts !== undefined) {
           return noChange(denied('collaboration_grant_required'))
         }
         grant.state = 'closed'
         grant.closedAt = Date.now()
         grant.closedTurn = turn.number
-        return success({ task, state: 'closed', ...(grant.outcome ? { outcome: grant.outcome } : {}) })
+        return success({ task, state: 'closed' })
       })
+      schedule()
+      return result
     }, ['task'])
 
   const isIdle = (agent) => agent.status === 'idle' && !agent.inbox.hasPending && !turns.has(agent.session.id)
@@ -1092,7 +1164,7 @@ export function applyWorkflow(ctx, config, allowed) {
       }
       const continuation = stored.resume?.continuation
       if (continuation?.state !== 'started' || continuation.turn !== started.turn) return noChange()
-      const exactTurn = evidence?.turn === continuation.turn
+      const exactTurn = evidence?.turn === continuation.turn && evidence.consumptions === 1
       if (exactTurn && evidence.endReason === 'completed') {
         continuation.state = 'verified'
       } else {
@@ -1101,6 +1173,54 @@ export function applyWorkflow(ctx, config, allowed) {
         continuation.reason = exactTurn ? evidence.endReason ?? 'turn_end_not_proven' : 'turn_evidence_unavailable'
       }
       continuation.settledAt = Date.now()
+      return success()
+    })
+  }
+
+  async function finishClosure(key, grant) {
+    const requested = grant.closure
+    const observed = turns.get(grant.owner)
+    const live = ctx.agents.get(grant.owner)
+    if (observed?.startSeq === requested.startSeq || live?.status === 'running' && !observed) return
+    let evidence
+    try {
+      if (live) await bounded(() => ctx.sessions.flush(live.session))
+      const anchor = requested.after && jobFor(ledger.read().jobs, requested.after)
+      if (!requested.after || anchor?.key === key && anchor.owner === grant.owner) {
+        const events = await bounded((deadline) => hostEvents(ctx, grant.owner, requested.startSeq, deadline))
+        evidence = closeTurnEvidence(events, requested, anchor)
+      }
+    } catch {
+      // Missing durable evidence leaves the request uncommitted.
+    }
+    if (signal.aborted) return
+    ledger.change(({ grants, jobs }) => {
+      const stored = grants[key]
+      const closure = stored?.closure
+      if (stored?.state !== 'collaboration_closing' || closure?.state !== 'pending' ||
+          closure.startSeq !== requested.startSeq) return noChange()
+      const continuation = closure.after && jobFor(jobs, closure.after)?.resume?.continuation
+      if (continuation?.state === 'started') return noChange()
+      const permitted = enabled() && available(stored.owner)
+      const verified = !closure.after || continuation?.state === 'verified' && continuation.turn === closure.turn
+      const completed = evidence?.reason === 'completed' && evidence.time < stored.expiresAt && permitted && verified
+      closure.settledAt = Date.now()
+      if (evidence) closure.turnEnd = evidence
+      if (completed) {
+        closure.state = 'committed'
+        stored.state = 'closed'
+        stored.outcome = closure.requestedOutcome
+        stored.closedAt = evidence.time
+        stored.closedTurn = closure.turn
+      } else if (stateOf(stored) === 'expired') {
+        closure.state = 'expired'
+        stored.state = 'expired'
+      } else {
+        closure.state = 'interrupted'
+        closure.reason = !permitted ? 'close_authority_unavailable' : !evidence ? 'close_turn_evidence_unavailable'
+          : evidence.reason !== 'completed' ? evidence.reason : 'close_continuation_unverified'
+        setGrantState(stored, 'paused')
+      }
       return success()
     })
   }
@@ -1164,6 +1284,12 @@ export function applyWorkflow(ctx, config, allowed) {
       let changed = false
       for (const [key, grant] of Object.entries(grants)) {
         const status = stateOf(grant, now)
+        if (grant.state === 'collaboration_closing' && grant.closure?.state === 'pending') {
+          // Recovery can still commit a turn that ended before expiry. A
+          // currently open closing turn has no earlier end to recover.
+          if (status !== 'expired' || turns.get(grant.owner)?.startSeq !== grant.closure.startSeq) continue
+          Object.assign(grant.closure, { state: 'expired', settledAt: now })
+        }
         if (!terminal(status)) continue
         grant.state = status
         archive.grant(key, grant)
@@ -1250,7 +1376,7 @@ export function applyWorkflow(ctx, config, allowed) {
     for (const job of activeJobs) {
       if (job.resume?.continuation?.state === 'started') {
         const observed = turns.get(job.owner)
-        if (observed?.number !== job.resume.continuation.turn) add(job, 'result', finishContinuation, 2)
+        if (observed?.number !== job.resume.continuation.turn) add(job, 'result', finishContinuation, 3)
       }
       for (const kind of ['task', 'result']) {
         const delivery = deliveryOf(job, kind)
@@ -1263,7 +1389,20 @@ export function applyWorkflow(ctx, config, allowed) {
         }
       }
     }
-    await Promise.all([...lanes.values()].map(async ({ job, kind, work }) => {
+    for (const [key, grant] of Object.entries(grants)) {
+      const closure = grant.closure
+      if (grant.state !== 'collaboration_closing' || closure?.state !== 'pending' ||
+          turns.get(grant.owner)?.startSeq === closure.startSeq ||
+          (lanes.get(grant.owner)?.priority ?? -1) >= 2) continue
+      lanes.set(grant.owner, { priority: 2, close: { key, grant } })
+    }
+    await Promise.all([...lanes.values()].map(async ({ job, kind, work, close }) => {
+      if (close) {
+        try { await finishClosure(close.key, close.grant) } catch {
+          if (!signal.aborted) ctx.logger.warn('workflow close evidence could not be recorded')
+        }
+        return
+      }
       try {
         await work(job, kind)
       } catch {

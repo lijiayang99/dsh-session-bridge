@@ -21,10 +21,12 @@ assert.match(candidateVersion, /^0\.5\.0-rc\.[1-9]\d*$/)
 const name = '@local/dsh-session-bridge'
 const namespace = 'dsh-session-bridge-settings'
 const main = 'synth-rollback-main'
+const closeOwner = 'synth-rollback-close-owner'
 const worker = 'synth-rollback-worker'
 const pausedWorker = 'synth-rollback-wait-worker'
 const titles = {
   [main]: '合成回退主控窗口',
+  [closeOwner]: '合成回退收口主控窗口',
   [worker]: '合成回退执行窗口',
   [pausedWorker]: '合成回退待决窗口',
 }
@@ -34,6 +36,7 @@ const restoredTask = 'legacy-after-rollback'
 const closedTask = 'closed-collaboration'
 const activeTask = 'active-collaboration'
 const pausedTask = 'paused-collaboration'
+const closingTask = 'closing-collaboration'
 const off = { enabled: false, workflowEnabled: false }
 const on = { enabled: true, workflowEnabled: true }
 const plans = new Map()
@@ -58,11 +61,17 @@ async function decide(body, context) {
     })
   }
   if (!results.length) return tool('workflow_consume', { id })
+  if (results[0]?.task === closingTask && results[1]?.state === 'closing') {
+    await delay(80_000, undefined, { signal: context.signal })
+  }
   if (results.length !== 1 || results[0].error || results[0].duplicate) return
   const { task } = results[0]
   if (task === oldTask || task === restoredTask) return tool('workflow_close', { task })
   if (task === closedTask) return tool('workflow_close', {
     task, outcome: 'completed', summary: 'Synthetic completion before rollback', finalArtifacts: [artifact],
+  })
+  if (task === closingTask) return tool('workflow_close', {
+    task, outcome: 'completed', summary: 'Synthetic close request held before rollback',
   })
 }
 
@@ -76,14 +85,14 @@ async function drive(host, session, text, plan) {
   }
 }
 
-async function call(host, text, name, args) {
-  const result = await drive(host, main, text, (results) => results.length === 0 ? tool(name, args) : undefined)
+async function call(host, text, name, args, controller = main) {
+  const result = await drive(host, controller, text, (results) => results.length === 0 ? tool(name, args) : undefined)
   assert.equal(result.end.data.reason.kind, 'completed')
   assert.equal(result.results.length, 1)
   return result.results[0]
 }
 
-const status = (host, task) => call(host, '读取合成任务 ' + task, 'workflow_status', { task })
+const status = (host, task, controller) => call(host, '读取合成任务 ' + task, 'workflow_status', { task }, controller)
 const readReceipt = (host, requestId) => call(host, '读取合成回执 ' + requestId,
   'session_message_status', { request_id: requestId })
 const assignment = (task, target = worker, attempt = 1) => ({
@@ -154,9 +163,9 @@ async function replaceStopped(host, bundle, version, label) {
   await requireOff(host, version)
 }
 
-async function propose(host, task, target) {
+async function propose(host, task, target, controller = main) {
   const text = '请分派这项任务：核对合成换包证据和原有回执。'
-  const result = await drive(host, main, text, (results) => {
+  const result = await drive(host, controller, text, (results) => {
     if (!results.length) return tool('workflow_propose', {
       task, goal: 'Verify synthetic replacement evidence', ttlMinutes: 20, budget: 2,
       scopes: [{ name: 'review', windows: [titles[target]], purpose: 'Collect synthetic rollback evidence' }],
@@ -165,11 +174,11 @@ async function propose(host, task, target) {
     return { reply: results[0].preview }
   })
   assert.equal(result.end.data.reason.kind, 'completed')
-  assert(!host.snapshot(main, task).grant, 'Preview must not create a grant')
+  assert(!host.snapshot(controller, task).grant, 'Preview must not create a grant')
 }
 
-async function confirm(host, task, target, afterDispatch) {
-  const result = await drive(host, main, '确认委托', async (results, context) => {
+async function confirm(host, task, target, afterDispatch, controller = main) {
+  const result = await drive(host, controller, '确认委托', async (results, context) => {
     if (!results.length) return tool('workflow_confirm')
     if (results.length === 1) {
       assert.equal(results[0].task, task, JSON.stringify(results[0]))
@@ -210,6 +219,15 @@ async function run(host) {
   assert.equal(newHistory.grant.authorization.kind, 'native-owner-workflow-confirmation')
   assert.deepEqual(newHistory.grant.outcome.finalArtifacts, [artifact])
   assert.equal(newHistory.jobs[0].id, closedId)
+
+  await propose(host, closingTask, worker, closeOwner)
+  const closingId = await confirm(host, closingTask, worker, undefined, closeOwner)
+  const closingGrant = await host.until(() => {
+    const { grant } = host.snapshot(closeOwner, closingTask)
+    return grant?.closure?.state === 'pending' && grant
+  }, 'a controller has requested close but has not ended its result turn')
+  assert.equal(closingGrant.state, 'collaboration_closing')
+  assert.equal(closingGrant.outcome, undefined)
 
   let workerHolding = false
   let releaseWorker = false
@@ -262,6 +280,7 @@ async function run(host) {
   assert.equal(closed.state, 'closed')
   assert.deepEqual(closed.outcome.finalArtifacts, [artifact])
   assert.deepEqual(closed.jobs[0].report.artifacts, [artifact])
+  assert.deepEqual(host.snapshot(closeOwner, closingTask).grant, closingGrant)
   console.log('PASS exact rollback preserves archived collaboration approval, artifact, attempt and both ordinary receipts')
 
   // Disposable negative control. Even after the old operator reopens switches,
@@ -273,6 +292,11 @@ async function run(host) {
     const dispatch = await call(host, '继续委托 ' + task, 'workflow_dispatch', assignment(task, target, 2))
     assert.deepEqual(dispatch, { error: 'main_task_context_required' })
   }
+  const closing = await status(host, closingTask, closeOwner)
+  assert.equal(closing.state, 'collaboration_closing')
+  assert.equal(closing.outcome, undefined)
+  assert.deepEqual(await call(host, '继续委托 ' + closingTask, 'workflow_dispatch',
+    assignment(closingTask, worker, 2), closeOwner), { error: 'main_task_context_required' })
   assert.deepEqual(await call(host, legacyGrant(closedTask), 'workflow_dispatch', assignment(closedTask)),
     { error: 'grant_not_opened' })
   const resumedLegacy = await call(host, legacyGrant(restoredTask), 'workflow_dispatch', assignment(restoredTask))
@@ -287,9 +311,13 @@ async function run(host) {
   assert(!mainWakes.some(({ data }) => data?.source?.bridgeWorkflowId === pausedId))
   assert.deepEqual(host.snapshot(main, activeTask), activeHistory)
   assert.deepEqual(host.snapshot(main, pausedTask), pausedHistory)
+  assert.deepEqual(host.snapshot(closeOwner, closingTask).grant, closingGrant)
+  const closeWakes = (await host.history(closeOwner)).filter(({ data }) =>
+    data?.source?.bridgeWorkflowKind === 'result' && data.source.bridgeWorkflowId === closingId)
+  assert.equal(closeWakes.length, 1)
   await host.save(off)
   await requireOff(host, '0.4.5-rc.2')
-  console.log('PASS old runner rejects active and paused collaboration and leaves queued task/result untouched')
+  console.log('PASS old runner rejects active, paused and closing collaboration and leaves queued task/result untouched')
 }
 
 await withCollaborationHost({ dsh, archive, bootstrap: stable, decide }, run)

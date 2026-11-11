@@ -69,6 +69,17 @@ async function decide(body, { signal }) {
   assert(first.batch, 'Expected a single native batch wake')
   assert.equal(first.batch.items.length, 2)
   assert(first.batch.items.every(({ report }) => report?.status === 'completed' && !report.late))
+  if (test.close) {
+    const request = close(first.task)
+    const calls = test.probeClose ? [request, request,
+      tool('workflow_close', { ...request.input, summary: 'Conflicting synthetic close request.' }),
+      tool('workflow_dispatch', { task: first.task, ...assignment('forbidden-after-close', child) }),
+      tool('workflow_status', { task: first.task })] : [request]
+    if (results.length <= calls.length) return calls[results.length - 1]
+    test.closeResults = results.slice(1)
+    await waitUntil(() => test.releaseClose, signal)
+    return
+  }
   if (test.dispatch && results.length === 1) {
     await waitUntil(() => test.releaseDispatch, signal)
     return tool('workflow_dispatch', { task: first.task, ...assignment('downstream', child) })
@@ -89,7 +100,7 @@ async function authorize(host, test) {
   const proposal = {
     task: test.task,
     goal: 'Validate synthetic restart and recovery boundaries.',
-    ttlMinutes: 10, budget: 6,
+    ttlMinutes: test.ttlMinutes ?? 10, budget: 6,
     scopes: [{ name: 'work', windows: [titles[worker], titles[child]], purpose: 'Produce synthetic recovery reports' }],
   }
   const preview = await runPrompt(host, text, (results) => results.length
@@ -131,6 +142,134 @@ async function nativeWakeIds(host, session, kind, jobId) {
     type === 'user/message' && data.source?.kind === 'agent-message' &&
     data.source.bridgeWorkflowKind === kind && data.source.bridgeWorkflowId === jobId)
     .map(({ data }) => data.id)
+}
+
+async function holdClose(host, task, options) {
+  const test = { task, close: true, releaseReports: true, ...options }
+  await authorize(host, test)
+  const requested = await host.until(() => test.closeResults && host.snapshot(owner, task),
+    'close tool has returned but its native continuation is still running')
+  const anchor = anchorOf(requested)
+  assert.equal(anchor.resume.continuation.state, 'started')
+  assert.equal(requested.grant.outcome, undefined, 'Close cannot record an outcome before the native turn ends')
+  assert.deepEqual(test.closeResults[0], { task, state: 'closing', duplicate: false })
+  assert.equal(requested.grant.closure.state, 'pending')
+  const view = await host.post('/api/dsh-session-bridge/workflow-view', { sessionId: owner, task })
+  assert.equal(view.status, 200)
+  assert.equal(view.body.state, 'closing')
+  assert.equal(view.body.outcome, undefined)
+  return { test, anchor, pending: requested.grant.closure }
+}
+
+async function waitClosed(host, task) {
+  const closed = await host.until(() => {
+    const snapshot = host.snapshot(owner, task)
+    return snapshot.grant?.state === 'closed' && snapshot
+  }, 'closeout committed after the native controller turn ends normally')
+  const { closure } = closed.grant
+  assert.equal(closure.state, 'committed')
+  assert.equal(closure.turnEnd.reason, 'completed')
+  assert.equal(closed.grant.closedAt, closure.turnEnd.time)
+  assert.equal(closed.grant.closedTurn, closure.turn)
+  const end = (await host.history(owner)).find(({ seq }) => seq === closure.turnEnd.sequence)
+  assert.equal(end?.type, 'turn/end')
+  assert.equal(end.data.turn, closure.turn)
+  assert.equal(end.data.reason.kind, 'completed')
+  return closed
+}
+
+async function normalClose(host, recoverAfterEnd) {
+  const task = recoverAfterEnd ? 'synthetic-close-after-normal-restart' : 'synthetic-close-completed'
+  const { test, anchor, pending } = await holdClose(host, task, { probeClose: !recoverAfterEnd })
+  if (recoverAfterEnd) {
+    const name = '@local/dsh-session-bridge'
+    assert.equal((await host.rpc('pluginManager/setBundleEnabled', { name, enabled: false })).application, 'applied')
+    test.releaseClose = true
+    await host.idle(owner)
+    assert((await host.history(owner)).some(({ type, data }) =>
+      type === 'turn/end' && data.turn === pending.turn && data.reason.kind === 'completed'))
+    assert.deepEqual(host.snapshot(owner, task).grant.closure, pending)
+    await restart(host)
+    assert.equal((await host.rpc('pluginManager/setBundleEnabled', { name, enabled: true })).application, 'applied')
+  } else {
+    const [, duplicate, conflict, dispatch, status] = test.closeResults
+    assert.deepEqual(duplicate, { task, state: 'closing', duplicate: true })
+    assert.deepEqual(conflict, { error: 'close_conflict' })
+    assert.deepEqual(dispatch, { error: 'grant_inactive' })
+    assert.equal(status.state, 'closing')
+    assert.equal(status.outcome, undefined)
+    assert.equal(status.closure.requestedAt, pending.requestedAt)
+  }
+  test.releaseClose = true
+  const closed = await waitClosed(host, task)
+  assert.equal(closed.grant.outcome.status, 'completed')
+  assert.equal(closed.grant.closure.startSeq, pending.startSeq)
+  assert.equal(anchorOf(closed).resume.continuation.state, 'verified')
+  assert.equal(closed.jobs.length, 2)
+  await restart(host)
+  assert.deepEqual(host.snapshot(owner, task), closed)
+  assert.deepEqual(await nativeWakeIds(host, owner, 'result', anchor.id), [anchor.resume.id])
+  console.log(recoverAfterEnd
+    ? 'PASS restart automatically commits a pending close whose original native turn ended while the plugin was stopped'
+    : 'PASS close commits once on durable normal end; duplicate, conflicting and later same-turn tools cannot alter it')
+}
+
+async function interruptClose(host, crash) {
+  const task = crash ? 'synthetic-close-crash' : 'synthetic-close-cancelled-turn'
+  const { anchor, pending } = await holdClose(host, task)
+  if (crash) {
+    await host.stop('SIGKILL')
+    await host.start()
+  } else {
+    await host.rpc('session/cancel', { request: { sessionId: owner } })
+    await host.idle(owner)
+    await restart(host)
+  }
+  const recovered = await host.until(() => {
+    const state = host.snapshot(owner, task)
+    return state.grant?.closure?.state === 'interrupted' && state
+  }, 'restart retains the interrupted close without committing it')
+  assert.equal(recovered.grant.state, 'collaboration_paused')
+  assert.equal(recovered.grant.outcome, undefined)
+  assert.equal(recovered.grant.closure.startSeq, pending.startSeq)
+  assert.equal(recovered.grant.closure.turnEnd?.reason, crash ? undefined : 'aborted')
+  assert.equal(anchorOf(recovered).resume.continuation.state, 'interrupted')
+  const blocked = await runPrompt(host, '继续委托 ' + task, (results) => results.length ? undefined : close(task))
+  assert.deepEqual(blocked.results, [{ error: 'successful_attempts_required' }])
+  const reconciliation = await runPrompt(host, '对账委托 ' + task + ' ' + anchor.id + ' result\n合成对账。',
+    (results) => results.length ? undefined : tool('workflow_status', { task }))
+  assert.equal(reconciliation.results[0].batches[0].continuation.reconciliation.decision, 'reviewed_without_replay')
+  const requested = await runPrompt(host, '继续委托 ' + task, (results) => results.length ? undefined : close(task))
+  assert.deepEqual(requested.results, [{ task, state: 'closing', duplicate: false }])
+  const closed = await waitClosed(host, task)
+  assert.equal(closed.grant.closure.turn, requested.end.data.turn)
+  assert.deepEqual(closed.grant.previousClosure, recovered.grant.closure)
+  assert.deepEqual(await nativeWakeIds(host, owner, 'result', anchor.id), [anchor.resume.id])
+  console.log('PASS uncommitted close survives ' + (crash ? 'hard restart without an end event' : 'native turn cancellation') +
+    ' and closes only in a new normal turn after owner reconciliation without replay')
+}
+
+async function stopPendingClose(host, expire) {
+  const task = expire ? 'synthetic-close-expired-grant' : 'synthetic-close-cancelled-grant'
+  const { test, anchor } = await holdClose(host, task, expire ? { ttlMinutes: 1 } : undefined)
+  const state = expire ? 'expired' : 'cancelled'
+  if (!expire) {
+    await host.submit(owner, '取消委托 ' + task, 'steer')
+    test.releaseClose = true
+  }
+  const stopped = await host.until(() => {
+    const snapshot = host.snapshot(owner, task)
+    return snapshot.grant?.state === state && snapshot
+  }, state + ' grant stops its pending close', 70_000)
+  assert.equal(stopped.grant.closure.state, state)
+  assert.equal(stopped.grant.outcome, undefined)
+  test.releaseClose = true
+  await host.idle(owner)
+  await restart(host)
+  assert.equal(host.snapshot(owner, task).grant.state, state)
+  assert.equal(host.snapshot(owner, task).grant.outcome, undefined)
+  assert.deepEqual(await nativeWakeIds(host, owner, 'result', anchor.id), [anchor.resume.id])
+  console.log('PASS ' + state + ' grant cannot commit a pending close after normal native turn end and restart')
 }
 
 async function recoverBatch(host, task, dispatch) {
@@ -224,8 +363,8 @@ async function recoverBatch(host, task, dispatch) {
   if (dispatch) await host.until(() => host.snapshot(owner, task).jobs.find(({ id }) => id === downstream.id)
     ?.resume?.continuation?.state === 'verified', 'the downstream continuation ends normally')
   const finished = await runPrompt(host, '继续委托 ' + task, (results) => results.length ? undefined : close(task))
-  assert.equal(finished.results[0]?.state, 'closed', JSON.stringify(finished.results))
-  const closed = host.snapshot(owner, task)
+  assert.equal(finished.results[0]?.state, 'closing', JSON.stringify(finished.results))
+  const closed = await waitClosed(host, task)
   assert.equal(closed.jobs.length, dispatch ? 3 : 2)
   assert.equal(closed.grant.outcome?.status, 'completed')
   const closedAnchor = anchorOf(closed)
@@ -282,10 +421,16 @@ async function cancelWithLateReport(host) {
   console.log('PASS native cancellation skips queued sibling, records late report once and blocks restart or redispatch')
 }
 
-await withCollaborationHost({ dsh, archive, decide }, async (host) => {
+await withCollaborationHost({ dsh, archive, decide, modelDeadlineMs: 80_000 }, async (host) => {
   await host.createSessions(Object.entries(titles))
   await host.save({ enabled: false, workflowEnabled: true, allowedSessions: [owner, worker, child] })
+  await normalClose(host, false)
+  await normalClose(host, true)
+  await interruptClose(host, false)
+  await interruptClose(host, true)
+  await stopPendingClose(host, false)
   await recoverBatch(host, 'synthetic-consume-recovery', false)
   await recoverBatch(host, 'synthetic-dispatch-recovery', true)
   await cancelWithLateReport(host)
+  await stopPendingClose(host, true)
 })

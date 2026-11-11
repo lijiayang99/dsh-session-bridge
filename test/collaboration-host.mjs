@@ -155,11 +155,11 @@ export async function withCollaborationHost({
     cookie = exchange.headers.getSetCookie()[0].split(';')[0]
   }
 
-  async function stop() {
+  async function stop(signal = 'SIGTERM') {
     if (!host || host.exitCode !== null || host.signalCode !== null) return
     const closed = new Promise((done) => host.once('close', done))
     const timer = setTimeout(() => host.kill('SIGKILL'), 5000)
-    host.kill('SIGTERM')
+    host.kill(signal)
     await closed
     clearTimeout(timer)
   }

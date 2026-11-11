@@ -62,7 +62,7 @@ function decide(body, { signal }) {
         task: result.task, outcome: 'completed', summary: 'Synthetic direct task closed.',
       })
     }
-    assert.equal(results[1]?.state, 'closed')
+    assert.equal(results[1]?.state, 'closing')
     observed.closes++
   }
 }

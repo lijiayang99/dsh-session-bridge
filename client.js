@@ -9,6 +9,7 @@ window.__ModuleLoader__.load({
     const taskBox = { border: '1px solid var(--dsw-alias-border-l3)', borderRadius: 8, padding: 10, overflowWrap: 'anywhere' }
     const workflowStates = {
       active: ['进行中', 'Active'], paused: ['等待主控决定', 'Waiting for the controller'],
+      closing: ['收口待核验', 'Closeout awaiting verification'],
       closed: ['已收口', 'Closed'], cancelled: ['已取消', 'Cancelled'], expired: ['已过期', 'Expired'],
       missing_grant: ['授权记录缺失', 'Grant record missing'], queued: ['排队中', 'Queued'],
       sending: ['等待宿主投递证据', 'Waiting for host delivery evidence'],
@@ -37,6 +38,10 @@ window.__ModuleLoader__.load({
       host_consumed_without_handshake: ['宿主已消费通知，账本缺少确认', 'The host consumed the notice without a ledger confirmation'],
       host_admission_not_proven_pending: ['无法证明通知仍在宿主队列', 'The notice could not be verified in the host queue'],
       recovered_inbox_conflict: ['恢复时宿主队列内容不一致', 'The host queue did not match the recovery record'],
+      close_authority_unavailable: ['收口授权不可用', 'Closeout authority was unavailable'],
+      close_turn_evidence_unavailable: ['无法核实收口轮正常结束', 'Normal completion of the closeout turn could not be verified'],
+      close_continuation_unverified: ['收口轮的结果接续未经核验', 'The closeout turn’s continuation was not verified'],
+      aborted: ['宿主轮已中断', 'Host turn was interrupted'],
     }
     const dictionaries = {
       zh: {
@@ -190,12 +195,13 @@ window.__ModuleLoader__.load({
       function TaskDetail({ task, titles }) {
         const batches = task.batches ?? []
         const attempts = task.jobs ?? []
-        const outcome = task.outcome
+        const { outcome, closure } = task
         return h('article', { style: section },
           h('h4', { style: { margin: 0 } }, task.task),
           facts([
             [t('taskState'), stateLabel(task.state)], [t('taskGoal'), task.goal], [t('taskExpires'), dateLabel(task.expiresAt)],
             [t('taskArchived'), task.archivedJobs],
+            [t('taskReason'), reasons([closure?.reason])],
           ]),
           outcome && h('section', { style: taskBox },
             h('strong', null, t('taskOutcome'), ' · ', stateLabel(outcome.status)),

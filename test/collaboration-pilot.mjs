@@ -63,6 +63,7 @@ async function decide(body, { lab, signal }) {
     'Otherwise choose answer, put {} in inputJson, and put the exact response in text.',
     'If workflow_propose returns preview, copy its complete exact preview string as the entire response, preserving all whitespace.',
     'An ordinary turn may issue tool calls one after another. For a task or result wake, claim or consume before acting.',
+    'When workflow_close returns closing, finish the native turn with a short reply. The host verifies closeout after the turn ends.',
     'A proposal has user-facing exact window titles. Confirmation returns host-resolved IDs, which are used when dispatching.',
     'Use the supplied conversation, actual tool results, and definitions.',
     JSON.stringify({ system: body.system, messages: body.messages, tools: allowed }),
@@ -148,6 +149,8 @@ await withCollaborationHost({ dsh, archive, decide, modelDeadlineMs: 90_000, all
   assert.equal(final.jobs.length, 5)
   assert.deepEqual(final.grant.outcome.finalArtifacts, [repaired.ref])
   assert.equal(final.grant.outcome.status, 'completed')
+  assert.equal(final.grant.closure.state, 'committed')
+  assert.equal(final.grant.closure.turnEnd.reason, 'completed')
   assert(final.jobs.some(({ target, report }) => target === verifier && report.status === 'completed'))
   const checks = final.jobs.filter(({ item }) => item === 'review')
   assert.deepEqual(checks.map(({ target, report }) => [target, report.status, report.reviewedArtifact]), [
