@@ -1,12 +1,20 @@
 # dsh-session-bridge
 
-当前 `main` 提供 `0.4.4-rc.3` 候选，仅支持 DSH Web `0.2.2-rc.1`，需要 Node `24.9+`。DSH 包名为 `@local/dsh-session-bridge`，右栏入口为「开始 → dsh-session-bridge」。侧栏显示宿主兼容状态。宿主身份未知时拒绝新发送与派工。原生验证使用固定 DSH Web 与固定归档，未知身份的拒绝边界使用合成启动器探针验证。
+当前 `main` 提供 `0.4.5-rc.2` 候选，仅支持 DSH Web `0.2.2-rc.1`，需要 Node `24.9+`。DSH 包名为 `@local/dsh-session-bridge`，右栏入口为「开始 → dsh-session-bridge」。侧栏显示宿主兼容状态。宿主身份未知时拒绝新发送与派工。
+
+所有者可在发送窗口输入「给审核窗口发消息：候选已就绪」。助手通过插件工具将明确原文发给白名单内唯一匹配的窗口。请助手拟稿或转发上下文时，先等完整预览及该轮结束，再在同一窗口回复「确认发送」。[自然语句用法](../README.md#普通互传)
+
+隔离复验使用固定 DSH Web、候选归档、浏览器及合成模型，覆盖自然语句发送、预览和确认。预览前接纳的排队确认和插入当前轮次的确认均被拒绝。真实模型能否稳定生成并复述完整预览仍待验证。
 
 一次所有者授权可交办多个子任务。执行窗口领取并提交报告，结果回到原主控。两个功能开关独立，普通互传保留逐条授权。
 
-从旧命名版本换包时，先停发、排空并关闭两个开关，按包 README 停机迁移设置、回执和委托账本。完整重启后，核对历史或已确认的空态，再恢复对应开关。[包 README 的迁移与回退规程](../README.md#迁移与回退)
+## 从 GitHub 换包
 
-复现已验收的 GitHub 原生安装或回退到 0.4.2 时，使用 [0.4.2 固定源码提交 `8fa0a210b3bf8241a5eebdc21794b49da49f447a`](https://github.com/lijiayang99/dsh-session-bridge/tree/8fa0a210b3bf8241a5eebdc21794b49da49f447a)。0.4.2 的右栏入口显示为「窗口互传」。
+DSH Web `0.2.2-rc.1` 的「更新」只处理 npm registry 来源。从 GitHub 换入当前主线时，在「插件 → 添加插件」填入 `github:lijiayang99/dsh-session-bridge#main`。复现固定候选时，使用 `github:lijiayang99/dsh-session-bridge#e6ab3f77684fa578e75188848e2627bad3d3bfd7`。本候选已完成本地归档的原生复验，GitHub 换包仍待实测。
+
+从 0.4.4-rc.3 换入时，沿用原设置 ID、回执和委托账本路径。按包 README 停发、排空、关闭两个开关并备份数据，换包后完整重启，核对版本、设置及历史后再恢复开关。回退到 0.4.4-rc.3 时使用 `github:lijiayang99/dsh-session-bridge#b6b5af3d2f95c00b8b9f50e9a1c6af280d16c1a4`。从旧命名版本换包还须停机迁移。[包 README 的换包与回退规程](../README.md#从-044-rc3-换入或回退) · [旧命名迁移规程](../README.md#迁移与回退)
+
+0.4.2 已验收的 GitHub 原生安装使用固定提交 `8fa0a210b3bf8241a5eebdc21794b49da49f447a`。该版本的右栏入口显示为「窗口互传」。[0.4.2 固定源码](https://github.com/lijiayang99/dsh-session-bridge/tree/8fa0a210b3bf8241a5eebdc21794b49da49f447a)
 
 ## 公开提交隔离试用
 

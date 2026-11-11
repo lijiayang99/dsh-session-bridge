@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-session-bridge",
-  "version": "0.4.4-rc.3",
+  "version": "0.4.5-rc.2",
   "description": "Relay messages and delegate bounded tasks between existing DSH sessions.",
   "private": true,
   "type": "module",
@@ -12,6 +12,7 @@
   },
   "files": [
     "index.js",
+    "natural-message.js",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
