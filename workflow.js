@@ -472,7 +472,7 @@ export function applyWorkflow(ctx, config, allowed) {
   }
 
   register('delegate_direct',
-    'For the owner’s exact one-window request 把『目标原文』委托给『窗口标题』, open and queue the exact goal with the fixed one-assignment scope and 30-minute deadline. Call with no arguments. Ask for clarification if the title is ambiguous; use workflow_propose for broader requests.',
+    'For the owner’s exact one-window request 把『目标原文』委托给『窗口标题』 or 你给合成查询这个窗口问他今天气温怎么样, call with no arguments. Queue one assignment with the exact goal or question and a 30-minute deadline. The result returns to this controller through workflow_consume. Ask for clarification if the title is ambiguous. Use workflow_propose for broader requests.',
     {}, (args, exec, caller) => {
       if (!args || Object.keys(args).length !== 0) return denied('workflow_direct_arguments_not_allowed')
       return authorization.delegateDirect(exec, caller, current, (input, evidence) => {
