@@ -303,23 +303,31 @@ window.__ModuleLoader__.load({
                       row.goal && h('p', { style: { ...muted, marginTop: 4 } }, row.goal)))))
       }
 
-      function DirectResultTail({ turn, sessionId, useChat }) {
-        const report = useChat((snapshot) => {
+      function DirectWorkflowTail({ turn, sessionId, useChat }) {
+        const message = useChat((snapshot) => {
           for (const key of snapshot.locations.getTurn(turn.turn)) {
             const node = snapshot.nodes.get(key)
             if (node?.kind !== 'turn-trigger') continue
             const { source, content } = node.data
-            if (source?.kind === 'agent-message' && source.form === 'relay' &&
-                source.bridgeWorkflowKind === 'result' && source.bridgeWorkflowOwner === sessionId &&
-                typeof source.bridgeWorkflowId === 'string' && workflowId.test(source.bridgeWorkflowId) &&
-                content.length === 1 && content[0]?.type === 'text') return content[0].text
+            if (source?.kind !== 'agent-message' || source.form !== 'relay' ||
+                source.bridgeWorkflowOwner !== sessionId ||
+                content.length !== 1 || content[0]?.type !== 'text') continue
+            if (source.bridgeWorkflowKind === 'direct-notice' && source.senderSessionId === sessionId ||
+                source.bridgeWorkflowKind === 'result' &&
+                typeof source.bridgeWorkflowId === 'string' && workflowId.test(source.bridgeWorkflowId)) return node.data
           }
         })
-        const split = report?.indexOf('\n\n') ?? -1
+        if (!message) return null
+        const [{ text }] = message.content
+        const bodyStyle = { margin: 0, whiteSpace: 'pre-wrap' }
+        if (message.source.bridgeWorkflowKind === 'direct-notice') {
+          return h('p', { 'data-dsh-bridge-direct-notice': '', style: { ...taskBox, ...bodyStyle } }, text)
+        }
+        const split = text.indexOf('\n\n')
         if (split < 0) return null
         return h('section', { 'data-dsh-bridge-direct-result': '', style: { ...taskBox, ...section } },
-          h('strong', null, report.slice(0, split)),
-          h('p', { style: { margin: 0, whiteSpace: 'pre-wrap' } }, report.slice(split + 2)))
+          h('strong', null, text.slice(0, split)),
+          h('p', { style: bodyStyle }, text.slice(split + 2)))
       }
 
       function BridgeIcon(props) {
@@ -448,7 +456,7 @@ window.__ModuleLoader__.load({
       ctx.effect(() => ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register({
         name: 'conversation.chat.turnTail', id: id + '/direct-result',
         inject: (sessionId) => ({ sessionId }),
-      }, DirectResultTail)), 'dsh-session-bridge direct result')
+      }, DirectWorkflowTail)), 'dsh-session-bridge direct turn messages')
       ctx.effect(() => ctx.sidebarRightTabs.register({
         id, kind, title: () => t('title'),
         guide: [{ id: 'settings', order: 45, title: () => t('title'), description: () => t('summary'), icon: BridgeIcon }],

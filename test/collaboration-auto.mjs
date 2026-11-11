@@ -1,14 +1,20 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
 import { latestPrompt, parts, tool, withCollaborationHost } from './collaboration-host.mjs'
 
-const [dsh, archive, playwright, chrome] = process.argv.slice(2)
-assert(dsh && archive && Boolean(playwright) === Boolean(chrome),
-  'Usage: node test/collaboration-auto.mjs <dsh> <candidate.tgz> [playwright-core index.mjs Chrome]')
+const [dsh, archive, playwright, chrome, mode] = process.argv.slice(2)
+const baseline = mode === 'rc9'
+assert(dsh && archive && Boolean(playwright) === Boolean(chrome) && (mode === undefined || baseline && chrome),
+  'Usage: node test/collaboration-auto.mjs <dsh> <candidate.tgz> [playwright-core index.mjs Chrome [rc9]]')
+if (baseline) {
+  assert.equal(createHash('sha256').update(await readFile(archive)).digest('hex'),
+    'ecea031f2012bb13df17116d1a79913607b79f795ba3a624005f1310c57c9ae3')
+}
 
 let owner = 'synthetic-auto-controller'
 const worker = 'synthetic-auto-worker'
@@ -25,6 +31,8 @@ const unrelated = '合成普通对话，请复述这句话。'
 const mixed = '你给你是谁这个窗口问他合成同轮问题'
 const notice = '委托未发送。请在原窗口重试，使用引号写出一个完整且唯一的窗口名。'
 const blocked = '委托未发送。请在右栏的会话白名单确认目标可用，再在原窗口重试。'
+const relayRequest = 'synthetic-auto-copy-clarification'
+const relayPrompt = () => '授权互传 ' + owner + ' ' + relayRequest + '\n' + notice
 let mixedEntered = false
 let releaseMixed = false
 let claims = 0
@@ -33,6 +41,10 @@ let holdReport = false
 let reportStarted = false
 
 async function decide({ messages }, { signal }) {
+  const relay = latestPrompt(messages, (text) => text === relayPrompt())
+  if (relay && !relay.results.length) {
+    return tool('send_session_message', { to: owner, request_id: relayRequest, text: notice })
+  }
   const request = latestPrompt(messages, (text) => text === mixed || taskMarker.test(text) || isReport(text))
   if (!request) return { reply: '合成主控模型只作普通答复。' }
   if (isReport(request.text)) {
@@ -70,9 +82,49 @@ const resultNotices = (events) => events.filter(({ type, data }) =>
   type === 'user/message' && data.source?.bridgeWorkflowKind === 'result')
 
 async function waitNotice(host, after, expected) {
-  return host.until(async () => (await host.history(owner)).find(({ type, data, seq }) =>
+  const event = await host.until(async () => (await host.history(owner)).find(({ type, data, seq }) =>
     seq > after && type === 'user/message' && data.source?.kind === 'agent-message' &&
     data.source.senderSessionId === owner && userText(data) === expected), 'owner clarification message')
+  assert.equal(event.data.source.bridgeWorkflowKind, baseline ? undefined : 'direct-notice')
+  assert.equal(event.data.source.bridgeWorkflowOwner, baseline ? undefined : owner)
+  assert.equal(event.data.source.bridgeWorkflowId, undefined)
+}
+
+async function verifyClarification(page) {
+  const trigger = page.locator('[data-turn-trigger]').getByRole('button', { name: /Task message received/ })
+  const text = page.getByText(notice, { exact: true })
+  await trigger.waitFor()
+  assert.equal(await trigger.getAttribute('aria-expanded'), 'false')
+  if (baseline) {
+    assert.equal(await text.count(), 0)
+    await trigger.click()
+    await text.waitFor()
+    assert.equal(await text.count(), 1)
+    console.log('PASS fixed rc.9 negative control hides the only clarification until the native trigger is expanded')
+    return
+  }
+  await text.waitFor()
+  assert.equal(await text.count(), 1)
+  assert.equal(await page.locator('[data-dsh-bridge-direct-notice]').getByText(notice, { exact: true }).count(), 1)
+  assert.equal(await trigger.getAttribute('aria-expanded'), 'false')
+  console.log('PASS rc.10 shows one clarification in the original chat while the native trigger remains collapsed')
+}
+
+async function verifyRelay(host, page) {
+  const sent = await host.prompt(worker, relayPrompt())
+  assert.equal(sent.results[0]?.delivery, 'delivered')
+  const event = await host.until(async () => (await host.history(owner)).find(({ type, data }) =>
+    type === 'user/message' && data.id === sent.results[0].messageId), 'ordinary relay with copied clarification text')
+  assert.equal(event.data.source.senderSessionId, worker)
+  assert.equal(event.data.source.bridgeWorkflowKind, undefined)
+  assert.equal(event.data.source.bridgeWorkflowOwner, undefined)
+  assert(userText(event.data).endsWith(notice))
+  await host.idle(owner)
+  const triggers = page.locator('[data-turn-trigger]').getByRole('button', { name: /Task message received/ })
+  await triggers.nth(1).waitFor()
+  assert.equal(await triggers.nth(1).getAttribute('aria-expanded'), 'false')
+  assert.equal(await page.getByText(notice, { exact: true }).count(), 1)
+  console.log('PASS ordinary relay delivers copied clarification text without adding a trusted clarification card')
 }
 
 function expireStoppedGrant(host, task, at) {
@@ -237,6 +289,16 @@ async function run(host, { parent, child, prefix }, page) {
   assert.equal(sameName.results.length, 0)
   await waitNotice(host, sameName.end.seq, notice)
   await host.idle(owner)
+  const endpoint = '/api/dsh-session-bridge/workflow-view'
+  assert.deepEqual((await host.post(endpoint, { sessionId: owner })).body.tasks, [])
+  assert.equal(claims, 0)
+  assert.equal(reports, 0)
+  for (const target of [worker, alternate]) {
+    assert(!(await host.history(target)).some(({ data }) => data?.source?.bridgeWorkflowKind === 'task'))
+  }
+  if (page) await verifyClarification(page)
+  if (baseline) return
+  if (page) await verifyRelay(host, page)
   await host.rename(alternate, '合成备用')
 
   const uncertain = await host.prompt(owner, '你给你是谁和合成备用这个窗口问他今天成都天气怎么样')
@@ -278,7 +340,6 @@ async function run(host, { parent, child, prefix }, page) {
   await host.prompt(owner, inputText)
   await host.idle(owner)
   await host.save({ workflowEnabled: true })
-  const endpoint = '/api/dsh-session-bridge/workflow-view'
   assert.deepEqual((await host.post(endpoint, { sessionId: owner })).body.tasks, [])
   assert.equal(claims, 0)
   assert.equal(reports, 0)

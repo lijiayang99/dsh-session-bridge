@@ -582,7 +582,10 @@ export function applyWorkflow(ctx, config, allowed) {
       if (notice && stillCurrent()) {
         agent.followup({
           id: randomUUID(), role: 'user', content: [{ type: 'text', text: notice }],
-          source: { kind: 'agent-message', form: 'relay', senderSessionId: session.id },
+          source: {
+            kind: 'agent-message', form: 'relay', senderSessionId: session.id,
+            bridgeWorkflowKind: 'direct-notice', bridgeWorkflowOwner: session.id,
+          },
         })
       }
     }).catch(() => {
