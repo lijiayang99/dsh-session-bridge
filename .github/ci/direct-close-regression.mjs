@@ -27,16 +27,17 @@ async function lab(t) {
   return { host, active, change, history, key, grant }
 }
 
-async function open(host) {
+async function open(host, endReason = 'completed') {
   host.begin(main, question)
   const opened = await host.call(main, 'workflow_delegate_direct', {})
-  host.end(main)
+  host.end(main, endReason)
   return opened
 }
 
-async function result(host, opened, { status = 'completed', beforeReport } = {}) {
+async function result(host, opened, { status = 'completed', afterAdmission, beforeReport } = {}) {
   assert.equal(opened.state, 'queued', JSON.stringify(opened))
   assert.equal((await host.receive(worker)).source.bridgeWorkflowId, opened.id)
+  if (afterAdmission) await afterAdmission()
   const lease = await host.call(worker, 'workflow_claim', { id: opened.id })
   assert.equal(lease.duplicate, false)
   if (beforeReport) await beforeReport()
@@ -74,8 +75,9 @@ test('a verified one-shot reply releases a slot and retains its history at the 1
   fillGrantSlots(change)
   const opened = await open(host)
   assert.equal(Object.keys(active().grants).length, 128)
-  assert.deepEqual(await open(host), { error: 'grant_not_opened' })
-  await result(host, opened)
+  await result(host, opened, { async afterAdmission() {
+    assert.deepEqual(await open(host, 'aborted'), { error: 'grant_not_opened' })
+  } })
   await consume(host, opened)
   host.reply(main, answer)
   assert.equal(grant(opened).state, 'collaboration_active')
@@ -94,19 +96,19 @@ test('a verified one-shot reply releases a slot and retains its history at the 1
   assert.deepEqual(closed.outcome, { status: 'completed', summary: answer, finalArtifacts: [] })
 })
 
-for (const [name, action, state, continuation, status] of [
+for (const [name, action, state, continuation, status, legacyResult] of [
   ['a reply emitted before consumption', (host, opened) => {
     host.reply(main, answer)
     return consume(host, opened)
-  }, 'collaboration_active', 'verified'],
+  }, 'collaboration_active', 'verified', undefined, true],
   ['a whitespace-only reply', async (host, opened) => {
     await consume(host, opened)
     host.reply(main, ' \n ')
-  }, 'collaboration_active', 'verified'],
+  }, 'collaboration_active', 'verified', undefined, true],
   ['an interrupted assistant message', async (host, opened) => {
     await consume(host, opened)
     host.reply(main, answer, true)
-  }, 'collaboration_active', 'verified'],
+  }, 'collaboration_active', 'verified', undefined, true],
   ['a mixed result turn', async (host, opened) => {
     await consume(host, opened)
     host.reply(main, answer)
@@ -126,10 +128,13 @@ for (const [name, action, state, continuation, status] of [
     host.appendInput(main, '取消委托 ' + opened.task)
   }, 'cancelled', 'interrupted'],
 ]) {
-  test('direct result does not implicitly close with ' + name, async t => {
-    const { host, grant, history } = await lab(t)
+  const label = legacyResult ? 'a historical direct result' : 'a direct result'
+  test(label + ' does not implicitly close with ' + name, async t => {
+    const { host, grant, history, change } = await lab(t)
     const opened = await open(host)
-    await result(host, opened, { status })
+    await result(host, opened, { status, beforeReport() {
+      if (legacyResult) change(({ jobs }) => { delete jobs[opened.id].nativeResult })
+    } })
     await action(host, opened)
     host.end(main)
     const archived = await until(() => history(opened), 'Expected result settlement for ' + name)
@@ -299,3 +304,57 @@ for (const [name, complete, reason] of [
     assert.deepEqual(host.deliveries.map(({ target }) => target), route)
   })
 }
+
+test('a completed exact owner turn delegates and shows the structured native result without controller tools', async t => {
+  const { host, active, grant, history } = await lab(t)
+  host.begin(main, question)
+  assert.deepEqual(active().jobs, {})
+  assert.deepEqual(host.deliveries, [])
+  host.end(main)
+  const notice = await host.receive(worker)
+  const id = notice.source.bridgeWorkflowId
+  const job = active().jobs[id]
+  const task = job.key.slice(main.length + 1)
+  const opened = { id, task }
+  assert.equal(job.instructions, '今天气温怎么样')
+  assert.equal(grant(opened).state, 'collaboration_active')
+  assert.equal(grant(opened).authorization.ownerTurnEnd.reason, 'completed')
+  assert.deepEqual(grant(opened).authorization.targets, [{ id: worker, title: '合成查询' }])
+
+  const lease = await host.call(worker, 'workflow_claim', { id })
+  const report = { id, attempt: lease.attempt, token: lease.token, status: 'completed',
+    summary: answer, evidence: ['synthetic-query'] }
+  assert.equal((await host.call(worker, 'workflow_report', report)).duplicate, false)
+  assert.equal((await host.call(worker, 'workflow_report', report)).duplicate, true)
+  host.end(worker)
+  const reply = await host.receive(main)
+  assert.equal(reply.source.bridgeWorkflowOwner, main)
+  assert.equal(reply.source.bridgeWorkflowId, id)
+  assert.equal(reply.content[0].text, '委托回报 · 已完成\n\n' + answer + '\n\n证据\nsynthetic-query')
+
+  await host.restart(() => host.end(main))
+  const archived = await until(() => history(opened), 'Expected the native report to be archived after restart')
+  assert.equal(archived.resume.id, reply.id)
+  assert.equal(archived.resume.continuation.presentation, 'native-result')
+  assert.equal(archived.resume.continuation.state, 'verified')
+  assert.equal(grant(opened).state, 'closed')
+  assert.deepEqual(host.deliveries.map(({ target }) => target), route)
+})
+
+test('a matching receipt stays idempotent when the target changes before verified owner admission', async t => {
+  const { host, grant, history } = await lab(t)
+  host.begin(main, question)
+  const opened = await host.call(main, 'workflow_delegate_direct', {})
+  assert.equal(opened.state, 'queued')
+  assert.equal(grant(opened).state, 'collaboration_authorizing')
+  host.rename(worker, '合成改名')
+  assert.deepEqual(await host.call(main, 'workflow_delegate_direct', {}), { ...opened, duplicate: true })
+  assert.deepEqual(host.deliveries, [])
+  host.end(main)
+
+  const archived = await until(() => history(opened), 'Expected the mismatched target to be skipped')
+  assert.equal(archived.wake.state, 'skipped')
+  assert.equal(archived.wake.reason, 'owner_turn_not_verified')
+  assert.equal(grant(opened).state, 'collaboration_paused')
+  assert.deepEqual(host.deliveries, [])
+})

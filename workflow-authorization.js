@@ -55,17 +55,17 @@ function delegationIntent(text) {
   )
 }
 
-function directIntent(text) {
+export function directIntent(text) {
   const match = directRequest.exec(text)
   const question = match ? undefined : directQuestion.exec(text.replace(requestLead, ''))
   if (!match && !question) return
   const unquotedTitle = question?.[4]
-  if (unquotedTitle && ambiguousQuestionTitle.test(unquotedTitle)) return
   if (question && !/[\p{L}\p{N}]/u.test(question[5])) return
   const goal = match ? match[1] ?? match[2] ?? match[3] : question[5]
   const title = match ? match[4] ?? match[5] ?? match[6] : question[1] ?? question[2] ?? question[3] ?? question[4]
   if (boundedText(goal, 2000) && !placeholder.test(goal.trim()) && boundedText(title, 160) && title === title.trim()) {
-    return { goal, title }
+    return { goal, title, ...(unquotedTitle && ambiguousQuestionTitle.test(unquotedTitle)
+      ? { error: 'workflow_target_clarification_required' } : {}) }
   }
 }
 
@@ -324,7 +324,8 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
     }
     if (context.directResult) return { ...context.directResult, duplicate: true }
     if (context.delegating) return denied('workflow_direct_in_progress')
-    const { goal, title } = context.direct
+    const { goal, title, error } = context.direct
+    if (error) return denied(error)
     const requestSignal = scopedSignal(exec)
     context.delegating = true
     let target

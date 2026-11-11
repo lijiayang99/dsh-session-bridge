@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { lstatSync } from 'node:fs'
 import { join } from 'node:path'
-import { hostContext, plainText } from './natural-message.js'
+import { hostContext, matchingTitles, plainText } from './natural-message.js'
 import { createWorkflowAuthorization, workflowProposalProperties } from './workflow-authorization.js'
 import { openLedger } from './workflow-ledger.js'
 import { registerWorkflowView } from './workflow-view.js'
@@ -15,6 +15,8 @@ const maxGrants = 128
 const maxJobs = 512
 const maxPerGrant = 32
 const statuses = ['completed', 'approved', 'changes_requested', 'failed', 'needs_owner']
+const reportLabels = { completed: '已完成', failed: '失败', needs_owner: '待主控处理',
+  approved: '审核通过', changes_requested: '要求返修' }
 const control = /^授权委托\r?\n([\s\S]+)$/
 const review = /^对账委托 ([a-zA-Z0-9_-]{1,128}) ([a-f0-9-]{36}) (task|result)\r?\n([\s\S]+)$/
 const action = /^(取消委托|继续委托) ([a-zA-Z0-9_-]{1,128})$/
@@ -22,6 +24,13 @@ const taskKey = (owner, task) => owner + ':' + task
 const success = (value) => ({ changed: true, value })
 const noChange = (value) => ({ changed: false, value })
 const denied = (error) => ({ error })
+const directNotices = {
+  workflow_target_clarification_required: '委托未发送。请在原窗口重试，使用引号写出一个完整且唯一的窗口名。',
+  workflow_target_not_available: '委托未发送。请在右栏的会话白名单确认目标可用，再在原窗口重试。',
+  workflow_target_changed: '委托未发送。目标窗口在核对时发生变化，请确认窗口名后重试。',
+  workflow_targets_unavailable: '委托未发送。暂时无法核对目标窗口，请稍后重试。',
+  grant_not_opened: '无法建立新的委托任务。请检查右栏的原主控任务后重试。',
+}
 const idSchema = { type: 'string', pattern: ID.source, maxLength: 128 }
 const uuidSchema = { type: 'string', pattern: UUID.source }
 const textSchema = (maxLength) => ({ type: 'string', minLength: 1, maxLength })
@@ -80,12 +89,22 @@ function senderOf(job, kind) {
   return kind === 'task' ? job.owner : job.target
 }
 
+function wakeText(job, kind) {
+  const header = 'DSH-WORKFLOW ' + kind.toUpperCase() + ' ' + job.id
+  if (kind !== 'result' || !job.nativeResult || !job.report || job.report.late) return header
+  const { status, summary, evidence } = job.report
+  return '委托回报 · ' + reportLabels[status] + '\n\n' + summary +
+    (evidence.length ? '\n\n证据\n' + evidence.join('\n') : '')
+}
+
 function isWake(job, kind, message) {
   const source = message.source
   return message.id === deliveryOf(job, kind)?.id && message.role === 'user' &&
     source?.kind === 'agent-message' && source.form === 'relay' &&
     source.senderSessionId === senderOf(job, kind) &&
-    source.bridgeWorkflowKind === kind && source.bridgeWorkflowId === job.id
+    source.bridgeWorkflowKind === kind && source.bridgeWorkflowId === job.id &&
+    (kind !== 'result' || !job.nativeResult ||
+      source.bridgeWorkflowOwner === job.owner && plainText(message) === wakeText(job, kind))
 }
 
 function stateOf(grant, now = Date.now()) {
@@ -93,6 +112,7 @@ function stateOf(grant, now = Date.now()) {
   const state = grant.state === 'collaboration_active' ? 'active'
     : grant.state === 'collaboration_paused' ? 'paused'
       : grant.state === 'collaboration_closing' ? 'closing' : grant.state
+  if (state === 'collaboration_authorizing') return now >= grant.expiresAt ? 'expired' : 'authorizing'
   if (state !== 'active' && state !== 'paused' && state !== 'closing') return state
   return now >= grant.expiresAt ? 'expired' : state
 }
@@ -206,6 +226,7 @@ async function hostEvidence(ctx, job, kind, signal) {
   const replyAfterSeq = kind === 'result' ? job.resume.continuation?.replyAfterSeq : undefined
   let replySeen = false
   let replyEndTime
+  let endTime
   for (const { type, data, seq, time } of events) {
     if (type === 'turn/start') {
       turn = data.turn
@@ -236,6 +257,7 @@ async function hostEvidence(ctx, job, kind, signal) {
       if (inMatchedTurn && data.turn === matchedTurn) {
         endReason = data.reason.kind
         mixedTurn = inputs !== 1
+        if (Number.isFinite(time)) endTime = time
         if (replySeen && Number.isFinite(time)) replyEndTime = time
       }
       inMatchedTurn = false
@@ -249,13 +271,14 @@ async function hostEvidence(ctx, job, kind, signal) {
     ...(matchedTurn !== undefined ? { turn: matchedTurn } : {}),
     ...(endReason !== undefined ? { endReason } : {}),
     ...(replyEndTime !== undefined ? { replyEndTime } : {}),
+    ...(endTime !== undefined ? { endTime } : {}),
     ...(mixedTurn ? { mixedTurn } : {}),
   }
 }
 
 function closeTurnEvidence(events, closure, anchor) {
   const [start] = events
-  if (start?.type !== 'turn/start' || start.seq !== closure.startSeq || start.data.turn !== closure.turn) return
+  if (!closure.input || start?.type !== 'turn/start' || start.seq !== closure.startSeq || start.data.turn !== closure.turn) return
   let inputSeen = false
   for (let index = 1; index < events.length; index++) {
     const event = events[index]
@@ -277,14 +300,52 @@ function closeTurnEvidence(events, closure, anchor) {
   }
 }
 
-export function applyWorkflow(ctx, config, allowed) {
+const activityStates = {
+  queued: 'queued', sending: 'sending', admitted: 'delivered', claimed: 'executing',
+  reported: 'reported', consumed: 'delivered', failed: 'failed', uncertain: 'uncertain',
+  skipped: 'stopped', reconciled: 'reconciled',
+}
+
+export function applyWorkflow(ctx, config, allowed, activity) {
   if (lstatSync(join(ctx.profileContext.dir, 'session-bridge-workflow'), { throwIfNoEntry: false })) {
     throw new Error('dsh-session-bridge: migrate the legacy workflow directory with DSH stopped before enabling delegation')
   }
-  const ledger = openLedger(join(ctx.profileContext.dir, 'dsh-session-bridge-workflow'))
+  const ledger = openLedger(join(ctx.profileContext.dir, 'dsh-session-bridge-workflow'),
+    activity ? ({ jobs, grants }, archived) => {
+      for (const job of [...Object.values(jobs), ...archived]) {
+        if (!job?.wake) continue
+        const expiresAt = grants[job.key]?.expiresAt
+        publishDelivery(job, 'task', expiresAt)
+        if (job.resume) publishDelivery(job, 'result', expiresAt)
+      }
+    } : undefined)
+
+  function publishDelivery(job, kind, keepUntil, attempt = false) {
+    if (!activity) return
+    try {
+      const delivery = deliveryOf(job, kind)
+      const continuation = delivery.continuation
+      const reviewedAt = continuation?.state === 'interrupted' &&
+        continuation.reconciliation?.decision === 'reviewed_without_replay' &&
+        Number.isFinite(continuation.reconciliation.at) ? continuation.reconciliation.at : undefined
+      let state = activityStates[delivery.state]
+      if (attempt) state = 'sending'
+      else if (reviewedAt !== undefined) state = 'reconciled'
+      else if ((delivery.state === 'sending' && delivery.reason) || continuation?.state === 'interrupted') state = 'uncertain'
+      else if (delivery.state === 'reported' && job.report?.status === 'failed') state = 'failed'
+      else if (continuation?.state === 'verified') state = 'received'
+      if (state) activity.record({
+        key: delivery.id, from: senderOf(job, kind), to: receiverOf(job, kind), kind, state, keepUntil,
+        at: attempt ? Date.now() : reviewedAt ?? continuation?.settledAt ?? delivery.updatedAt,
+      }, attempt)
+    } catch {
+      ctx.logger.warn('workflow activity could not be projected')
+    }
+  }
   const lifetime = new AbortController()
   const signal = lifetime.signal
   const turns = new Map()
+  const completedOwners = new Map()
   const waking = new Set()
   const claimedHere = new Set()
   let driver
@@ -326,7 +387,7 @@ export function applyWorkflow(ctx, config, allowed) {
       if (command === '取消委托') {
         ledger.change(({ grants }) => {
           const grant = grants[key]
-          if (!grant || !['active', 'paused', 'closing'].includes(stateOf(grant))) return noChange()
+          if (!grant || !['active', 'paused', 'closing', 'authorizing'].includes(stateOf(grant))) return noChange()
           if (grant.closure?.state === 'pending') {
             Object.assign(grant.closure, { state: 'cancelled', settledAt: Date.now() })
           }
@@ -388,7 +449,8 @@ export function applyWorkflow(ctx, config, allowed) {
         openedAt: now, ownerMessageId: messageId, ownerTurn: turn,
       }
       if (evidence) Object.assign(grant, {
-        collaboration: true, state: 'collaboration_active', budget: input.budget, dispatched: directJob ? 1 : 0,
+        collaboration: true, state: directJob?.ownerAdmission ? 'collaboration_authorizing' : 'collaboration_active',
+        budget: input.budget, dispatched: directJob ? 1 : 0,
         authorization: evidence, batches: [],
       })
       grants[key] = grant
@@ -414,6 +476,7 @@ export function applyWorkflow(ctx, config, allowed) {
         return
       }
       if (event.type === 'turn/start') {
+        completedOwners.delete(session.id)
         turns.set(session.id, { number: event.data.turn, startSeq: event.seq, context: null, mixed: false, wakes: [] })
         return
       }
@@ -452,12 +515,14 @@ export function applyWorkflow(ctx, config, allowed) {
       if (event.type !== 'turn/end' || event.data.turn !== turn.number) return
       authorization.end(session, turn, event)
       turns.delete(session.id)
+      finishOwnerInput(session, turn, event)
       ledger.change(({ jobs }) => {
         let changed = false
         for (const wake of turn.wakes) {
           const job = jobs[wake.id]
           if (!job) continue
           const delivery = deliveryOf(job, wake.mode)
+          if (wake.mode === 'result' && job.nativeResult && sent(delivery)) continue
           if (sent(delivery) || (wake.mode === 'task' && delivery.state === 'claimed')) {
             setDelivery(delivery, 'uncertain', wake.mode === 'task' && job.claim
               ? 'execution_ended_without_report' : 'host_turn_ended_without_handshake')
@@ -495,31 +560,86 @@ export function applyWorkflow(ctx, config, allowed) {
     })
   }
 
+  function openDirect(caller, input, evidence, ownerAdmission) {
+    const key = taskKey(caller.id, input.task)
+    const now = Date.now()
+    const target = input.scopes[0].targets[0]
+    const job = {
+      id: randomUUID(), key, owner: caller.id, target, item: 'execute', attempt: 1, scope: 'execute',
+      instructions: input.goal, acceptance: '按所有者原文完成目标并回报实际结果及证据。',
+      after: null, dispatchedTurn: caller.turn.number, createdAt: now, nativeResult: true,
+      ...(ownerAdmission ? { ownerAdmission } : {}),
+      wake: { id: randomUUID(), state: 'queued', updatedAt: now },
+    }
+    compact()
+    const grant = openGrant(input, key, caller.id, evidence.request.messageId,
+      caller.turn.number, now, evidence, job)
+    if (!grant) return denied('grant_not_opened')
+    schedule()
+    const { task, goal, scopes, budget, expiresAt } = grant
+    return {
+      task, goal, scopes, budget, expiresAt, id: job.id,
+      targetTitle: evidence.targets[0].title, state: 'queued', duplicate: false,
+    }
+  }
+
+  const cleanInbox = (agent) => Array.isArray(agent?.inbox?.nextTurn) && Array.isArray(agent?.inbox.nextStep) &&
+    !agent.inbox.nextTurn.length && !agent.inbox.nextStep.length
+
+  function finishOwnerInput(session, turn, event) {
+    if (turn.context?.mode !== 'direct-workflow') return
+    const agent = ctx.agents.get(session.id)
+    const clean = enabled() && !turn.mixed && event.data.reason.kind === 'completed' &&
+      agent?.session === session && cleanInbox(agent) && turn.input &&
+      Number.isSafeInteger(event.seq) && Number.isFinite(event.time)
+    const proof = { startSeq: turn.startSeq, turn: turn.number, input: turn.input, requestedAt: 0 }
+    const previous = turn.context.directResult
+    if (previous) {
+      if (clean) ledger.change(({ jobs }) => {
+        const admission = jobs[previous.id]?.ownerAdmission
+        if (!admission) return noChange()
+        admission.endSeq = event.seq
+        return success()
+      })
+      return
+    }
+    if (!clean) return
+    const caller = { id: session.id, turn, context: turn.context }
+    completedOwners.set(session.id, caller)
+    const stillCurrent = () => enabled() && available(session.id) && completedOwners.get(session.id) === caller &&
+      ctx.agents.get(session.id) === agent && cleanInbox(agent) ? caller : undefined
+    void Promise.resolve().then(async () => {
+      await bounded(() => ctx.sessions.flush(session))
+      const events = await bounded((deadline) => hostEvents(ctx, session.id, proof.startSeq, deadline))
+      const end = closeTurnEvidence(events, proof)
+      if (end?.reason !== 'completed' || end.sequence !== event.seq || !stillCurrent()) return
+      const result = await authorization.delegateDirect({ agent, signal }, caller, stillCurrent,
+        (input, evidence) => openDirect(caller, input, { ...evidence, ownerTurnEnd: end }))
+      const notice = directNotices[result?.error]
+      if (notice && stillCurrent()) {
+        agent.followup({
+          id: randomUUID(), role: 'user', content: [{ type: 'text', text: notice }],
+          source: {
+            kind: 'agent-message', form: 'relay', senderSessionId: session.id,
+            bridgeWorkflowKind: 'direct-notice', bridgeWorkflowOwner: session.id,
+          },
+        })
+      }
+    }).catch(() => {
+      if (!signal.aborted) ctx.logger.warn('workflow automatic owner input could not be verified')
+    }).finally(() => {
+      if (completedOwners.get(session.id) === caller) completedOwners.delete(session.id)
+    })
+  }
+
   register('delegate_direct',
-    'For the owner’s exact one-window request 把『目标原文』委托给『窗口标题』 or 你给合成查询这个窗口问他今天气温怎么样, call once with no arguments. Queue one assignment with the exact goal or question and a 30-minute deadline. When the receipt state is queued, acknowledge the dispatch using its exact targetTitle and end the turn. The result returns to this controller through workflow_consume. Ask for clarification if the title is ambiguous. Use workflow_propose for broader requests.',
+    'A precise one-window owner request is handled by the host at the end of its native turn. If you call this tool, call once without arguments. A queued receipt names the matched targetTitle. The host releases the assignment after verifying the owner turn. Use workflow_propose for broader requests.',
     {}, (args, exec, caller) => {
       if (!args || Object.keys(args).length !== 0) return denied('workflow_direct_arguments_not_allowed')
-      return authorization.delegateDirect(exec, caller, current, (input, evidence) => {
-        const key = taskKey(caller.id, input.task)
-        const now = Date.now()
-        const target = input.scopes[0].targets[0]
-        const job = {
-          id: randomUUID(), key, owner: caller.id, target, item: 'execute', attempt: 1, scope: 'execute',
-          instructions: input.goal, acceptance: '按所有者原文完成目标并回报实际结果及证据。',
-          after: null, dispatchedTurn: caller.turn.number, createdAt: now,
-          wake: { id: randomUUID(), state: 'queued', updatedAt: now },
-        }
-        compact()
-        const grant = openGrant(input, key, caller.id, evidence.request.messageId,
-          caller.turn.number, now, evidence, job)
-        if (!grant) return denied('grant_not_opened')
-        schedule()
-        const { task, goal, scopes, budget, expiresAt } = grant
-        return {
-          task, goal, scopes, budget, expiresAt, id: job.id,
-          targetTitle: evidence.targets[0].title, state: 'queued', duplicate: false,
-        }
-      })
+      return authorization.delegateDirect(exec, caller, current, (input, evidence) =>
+        openDirect(caller, input, evidence, {
+          startSeq: caller.turn.startSeq, turn: caller.turn.number, input: caller.turn.input, requestedAt: Date.now(),
+        }))
     })
 
   register('propose',
@@ -762,7 +882,7 @@ export function applyWorkflow(ctx, config, allowed) {
     }, ['id', 'attempt', 'token', 'status', 'summary', 'evidence'])
 
   register('consume',
-    'When this turn receives DSH-WORKFLOW RESULT <id>, read the result once. A batch result contains all members, including failures and uncertain work. For a successful direct delegation, reply with the result in this turn and the plugin can close the grant on normal turn completion. Other workflows can continue with further dispatch or explicit close.',
+    'When this turn receives DSH-WORKFLOW RESULT <id>, read the result once. A batch result contains all members, including failures and uncertain work. A direct delegation report is already in the native notification. If you need its structured record, use the assignment id from the direct delegation receipt. Other workflows can continue with further dispatch or explicit close.',
     { id: uuidSchema },
     ({ id }, exec, caller) => {
       const { context, turn } = caller
@@ -1060,12 +1180,14 @@ export function applyWorkflow(ctx, config, allowed) {
     const { id } = deliveryOf(job, kind)
     try {
       waking.add(id)
+      publishDelivery(job, kind, undefined, true)
       agent.followup({
         id, role: 'user',
-        content: [{ type: 'text', text: 'DSH-WORKFLOW ' + kind.toUpperCase() + ' ' + job.id }],
+        content: [{ type: 'text', text: wakeText(job, kind) }],
         source: {
           kind: 'agent-message', form: 'relay', senderSessionId: senderOf(job, kind),
           bridgeWorkflowKind: kind, bridgeWorkflowId: job.id,
+          ...(kind === 'result' && job.nativeResult ? { bridgeWorkflowOwner: job.owner } : {}),
         },
       })
       if (await bounded(() => ctx.sessions.flush(agent.session)) && !signal.aborted) {
@@ -1090,8 +1212,19 @@ export function applyWorkflow(ctx, config, allowed) {
     let expected = state
     let failure = 'host_evidence_unavailable'
     try {
+      if (live && kind === 'result' && job.nativeResult) {
+        if (live.status === 'running') return
+        await bounded(() => ctx.sessions.flush(live.session))
+      }
       const evidence = await bounded((deadline) => hostEvidence(ctx, job, kind, deadline))
       if (signal.aborted) return
+      if (kind === 'result' && job.nativeResult && evidence.consumptions) {
+        if (settleNativeResult(job, expected, evidence)) return
+        const reason = evidence.mixedTurn ? 'mixed_turn'
+          : evidence.endReason && evidence.endReason !== 'completed' ? evidence.endReason : 'host_consumed_without_handshake'
+        checkpoint(job, kind, expected, 'uncertain', reason)
+        return
+      }
       if (evidence.admissions !== 1 || evidence.consumptions !== 0 || !evidence.pending) {
         checkpoint(job, kind, expected, 'uncertain', evidence.consumptions
           ? 'host_consumed_without_handshake' : 'host_admission_not_proven_pending')
@@ -1101,7 +1234,13 @@ export function applyWorkflow(ctx, config, allowed) {
         if (!checkpoint(job, kind, expected, 'admitted', 'recovered_native_pending')) return
         expected = 'admitted'
       }
-      if (!canRoute(ledger.read().grants[job.key], job, kind)) return
+      const grant = ledger.read().grants[job.key]
+      if (!canRoute(grant, job, kind)) {
+        if (kind === 'result' && job.nativeResult && stateOf(grant) === 'expired') {
+          checkpoint(job, kind, expected, 'skipped', 'expired')
+        }
+        return
+      }
       failure = 'destination_resolution_failed_after_admission'
       const { agent } = await bounded(() => ctx.sessionController.resolveAgent(to))
       if (signal.aborted) return
@@ -1126,6 +1265,71 @@ export function applyWorkflow(ctx, config, allowed) {
     } catch {
       if (!signal.aborted) checkpoint(job, kind, expected, 'uncertain', failure)
     }
+  }
+
+  function settleNativeResult(job, expected, evidence) {
+    if (evidence.admissions !== 1 || evidence.consumptions !== 1 || evidence.mixedTurn ||
+        evidence.endReason !== 'completed' || !Number.isFinite(evidence.endTime) ||
+        !Number.isSafeInteger(evidence.turn)) return false
+    return updateDelivery(job, 'result', expected, (resume, grant, stored) => {
+      const status = stateOf(grant, evidence.endTime)
+      if (!isDirectGrant(grant) || !stored.report || stored.report.late || !enabled() ||
+          !available(stored.owner) || !available(stored.target) ||
+          (status !== 'active' && !(status === 'paused' && stored.report.status === 'needs_owner'))) return noChange(false)
+      setDelivery(resume, 'consumed')
+      resume.consumedTurn = evidence.turn
+      resume.handoffAt = evidence.endTime
+      resume.continuation = { state: 'verified', turn: evidence.turn, at: evidence.endTime,
+        settledAt: Date.now(), dispatches: [], presentation: 'native-result' }
+      if (stored.report.status === 'completed' && status === 'active') closeDirect(grant, stored, evidence.endTime, evidence.turn)
+      return success(true)
+    })
+  }
+
+  function closeDirect(grant, job, time, turn) {
+    grant.state = 'closed'
+    grant.closedAt = time
+    grant.closedTurn = turn
+    grant.outcome = { status: 'completed', summary: job.report.summary, finalArtifacts: [] }
+  }
+
+  async function finishOwnerAdmission(job) {
+    const proof = job.ownerAdmission
+    if (turns.get(job.owner)?.startSeq === proof.startSeq) return
+    const live = ctx.agents.get(job.owner)
+    let end
+    let targetMatches = false
+    try {
+      if (Number.isSafeInteger(proof.endSeq)) {
+        if (live) await bounded(() => ctx.sessions.flush(live.session))
+        end = closeTurnEvidence(await bounded((deadline) => hostEvents(ctx, job.owner, proof.startSeq, deadline)), proof)
+        if (end?.reason === 'completed' && end.sequence === proof.endSeq) {
+          const grant = ledger.read().grants[job.key]
+          const title = grant?.authorization?.targets?.[0]?.title
+          const { items } = await bounded((deadline) => ctx.sessionController.list({}, deadline))
+          const matches = matchingTitles(items, title, () => true)
+          targetMatches = matches.length === 1 && matches[0].to === job.target && matches[0].title === title &&
+            await bounded((deadline) => existing(job.target, deadline))
+        }
+      }
+    } catch {
+      // Unverified owner or target evidence fails closed before host admission.
+    }
+    if (signal.aborted) return
+    updateDelivery(job, 'task', 'queued', (wake, grant, stored) => {
+      if (stateOf(grant) !== 'authorizing') return noChange()
+      delete stored.ownerAdmission
+      const currentOwner = ctx.agents.get(job.owner)
+      if (targetMatches && enabled() && available(job.owner) && available(job.target) &&
+          !turns.has(job.owner) && (!currentOwner || cleanInbox(currentOwner))) {
+        grant.authorization.ownerTurnEnd = end
+        setGrantState(grant, 'active')
+      } else {
+        setDelivery(wake, 'skipped', 'owner_turn_not_verified')
+        setGrantState(grant, 'paused')
+      }
+      return success()
+    })
   }
 
   async function ownerReconcile(owner, turn, message, task, id, kind, reason) {
@@ -1204,14 +1408,12 @@ export function applyWorkflow(ctx, config, allowed) {
       const exactTurn = evidence?.turn === continuation.turn && evidence.consumptions === 1
       if (exactTurn && evidence.endReason === 'completed' && !evidence.mixedTurn) {
         const grant = grants[stored.key]
+        const endTime = stored.nativeResult ? evidence.endTime : evidence.replyEndTime
         if (pendingDirectCompletion(grant, stored) &&
-            enabled() && available(stored.owner) && evidence.replyEndTime < grant.expiresAt) {
+            enabled() && available(stored.owner) && endTime < grant.expiresAt) {
           // Verify the native reply and close the one-shot grant in the same
           // transaction. Explicit close and historical proofs remain separate.
-          grant.state = 'closed'
-          grant.closedAt = evidence.replyEndTime
-          grant.closedTurn = continuation.turn
-          grant.outcome = { status: 'completed', summary: stored.report.summary, finalArtifacts: [] }
+          closeDirect(grant, stored, endTime, continuation.turn)
         }
         continuation.state = 'verified'
       } else {
@@ -1333,8 +1535,11 @@ export function applyWorkflow(ctx, config, allowed) {
       const pendingDirect = new Set()
       for (const job of Object.values(jobs)) {
         const grant = grants[job?.key]
-        if (stateOf(grant, now) === 'expired' && pendingDirectCompletion(grant, job) &&
-            turns.get(job.owner)?.number !== job.resume.continuation.turn) pendingDirect.add(job.key)
+        if (stateOf(grant, now) !== 'expired') continue
+        if (pendingDirectCompletion(grant, job) && turns.get(job.owner)?.number !== job.resume.continuation.turn ||
+            job.nativeResult && sent(job.resume) && Number.isSafeInteger(job.resume.startSeq) && enabled()) {
+          pendingDirect.add(job.key)
+        }
       }
       let changed = false
       for (const [key, grant] of Object.entries(grants)) {
@@ -1395,7 +1600,9 @@ export function applyWorkflow(ctx, config, allowed) {
           }
           changed = true
         }
-        if (terminal(status)) {
+        const terminalJob = terminal(status) &&
+          !(status === 'expired' && pendingDirect.has(job.key) && job.nativeResult && sent(job.resume))
+        if (terminalJob) {
           for (const delivery of [job.wake, job.resume]) {
             if (delivery && (delivery.state === 'queued' || sent(delivery))) {
               delivery.stoppedFrom = delivery.state
@@ -1412,7 +1619,7 @@ export function applyWorkflow(ctx, config, allowed) {
         const orphanReleased = status === 'missing_grant' &&
           (!job.quarantine.taskHadHostRisk || job.wake.state !== 'uncertain') &&
           (!job.quarantine.resultHadHostRisk || job.resume?.state !== 'uncertain')
-        if (!liveClaim && !liveContinuation && (terminal(status) || (!batchWaiting && taskDone && resultDone) || orphanReleased)) {
+        if (!liveClaim && !liveContinuation && (terminalJob || (!batchWaiting && taskDone && resultDone) || orphanReleased)) {
           archiveJob(job, jobs, archive)
           changed = true
         }
@@ -1432,6 +1639,8 @@ export function applyWorkflow(ctx, config, allowed) {
       lanes.set(recipient, { priority, job, kind, work })
     }
     for (const job of activeJobs) {
+      if (job.ownerAdmission && stateOf(grants[job.key]) === 'authorizing' &&
+          turns.get(job.owner)?.startSeq !== job.ownerAdmission.startSeq) add(job, 'task', finishOwnerAdmission, 4)
       if (job.resume?.continuation?.state === 'started') {
         const observed = turns.get(job.owner)
         if (observed?.number !== job.resume.continuation.turn) add(job, 'result', finishContinuation, 3)

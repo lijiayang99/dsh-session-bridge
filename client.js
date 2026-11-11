@@ -1,14 +1,16 @@
 window.__ModuleLoader__.load({
   id: '@local/dsh-session-bridge',
   factory(require) {
-    const { createElement: h, useEffect, useState } = require('react')
+    const { createElement: h, useCallback, useEffect, useRef, useState, useSyncExternalStore } = require('react')
+    const { IconPaperPlaneOutlineRegular: PaperPlane } = require('@deepseek-ai/dsh-client-ui-primitives')
     const id = '@local/dsh-session-bridge'
     const kind = 'dsh-session-bridge-settings'
     const section = { display: 'grid', gap: 8 }
     const muted = { color: 'var(--dsw-alias-label-secondary)', margin: 0 }
+    const workflowId = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/
     const taskBox = { border: '1px solid var(--dsw-alias-border-l3)', borderRadius: 8, padding: 10, overflowWrap: 'anywhere' }
     const workflowStates = {
-      active: ['进行中', 'Active'], paused: ['等待主控决定', 'Waiting for the controller'],
+      active: ['进行中', 'Active'], authorizing: ['正在核对所有者输入', 'Verifying owner input'], paused: ['等待主控决定', 'Waiting for the controller'],
       closing: ['收口待核验', 'Closeout awaiting verification'],
       closed: ['已收口', 'Closed'], cancelled: ['已取消', 'Cancelled'], expired: ['已过期', 'Expired'],
       missing_grant: ['授权记录缺失', 'Grant record missing'], queued: ['排队中', 'Queued'],
@@ -41,28 +43,28 @@ window.__ModuleLoader__.load({
       close_authority_unavailable: ['收口授权不可用', 'Closeout authority was unavailable'],
       close_turn_evidence_unavailable: ['无法核实收口轮正常结束', 'Normal completion of the closeout turn could not be verified'],
       close_continuation_unverified: ['收口轮的结果接续未经核验', 'The closeout turn’s continuation was not verified'],
-      aborted: ['宿主轮已中断', 'Host turn was interrupted'],
+      aborted: ['宿主轮已取消', 'Host turn was cancelled'],
+      error: ['宿主轮运行出错', 'Host turn ended with an error'],
+      blocked: ['宿主轮被阻断', 'Host turn was blocked'],
+      interrupted: ['宿主重启后补记中断', 'Host recorded an interruption after restart'],
+      'max-tokens': ['宿主轮达到输出上限', 'Host turn reached its output limit'],
+      owner_turn_not_verified: ['所有者轮或目标未通过核对', 'Owner turn or destination could not be verified'],
       mixed_turn: ['宿主轮收到其他用户或中继输入', 'The host turn received another user or relay input'],
     }
     const dictionaries = {
       zh: {
-        title: 'dsh-session-bridge', summary: '管理哪些独立会话可以互发消息。',
-        features: '功能开关', enabled: '启用会话消息',
-        workflow: '启用跨窗口任务委托', workflowHelp: '在原主控窗口交办任务并核对委托方案。也可发送「授权委托」和任务 JSON。',
-        allowlist: '会话白名单', allowed: '勾选的会话可以相互发送，至少需要两个。',
-        authorization: '每条新消息由所有者在发送会话中提交授权。首行写「授权互传 目标会话ID 请求号」，下一行开始写准确正文。',
+        title: 'dsh-session-bridge', summary: '管理哪些会话可以互发消息和委托任务。',
+        master: '启用会话互传和任务委托', mixedSettings: '当前沿用旧配置，部分功能已启用。', ungrouped: '未分组', workspace: '工作区', unavailableGroup: '不可用的已选会话',
+        allowlist: '会话白名单',
         empty: '没有可选会话。', unnamed: '未命名会话', unavailable: '会话当前不可用，可从白名单移除。',
         save: '保存设置', saving: '正在保存…', saved: '设置已保存并生效。',
         refresh: '重新读取', loading: '正在读取设置…', readError: '无法读取插件配置或宿主兼容状态，请重试。',
-        hostSupported: '宿主版本受支持（DSH 0.2.2-rc.1）。',
         hostUnsupported: '当前宿主不受支持。新消息和任务委托需要 DSH 0.2.2-rc.1。',
-        messagingOn: '会话消息已开启。', messagingOff: '会话消息已关闭。',
-        workflowOn: '任务委托已开启。', workflowOff: '任务委托已关闭。',
         saveError: '保存失败，请重新读取后再试。', readOnly: '当前配置为只读。',
         limit: '白名单最多选择 32 个会话。',
         tasks: '原主控任务', taskBack: '返回任务列表', taskEmpty: '当前窗口没有主控任务。',
         taskReadError: '无法读取当前主控窗口的任务。', taskMissing: '当前窗口中找不到这个任务。',
-        taskState: '任务状态', taskGoal: '目标', taskExpires: '授权到期', taskOutcome: '收口结果',
+        taskState: '任务状态', taskAuthorization: '直派授权', taskOwnerVerified: '所有者轮已核验', taskOwnerPending: '等待核验所有者轮', taskGoal: '目标', taskExpires: '授权到期', taskOutcome: '收口结果',
         taskBatches: '批次', taskAttempts: '分派与尝试', taskAttempt: '第 {attempt} 次尝试',
         taskTarget: '执行窗口', taskScope: '用途范围', taskDelivery: '任务投递', taskResult: '结果接续',
         taskReport: '回报', taskLate: '迟到回报', taskReason: '原因', taskTurn: '宿主轮次',
@@ -72,23 +74,18 @@ window.__ModuleLoader__.load({
         taskExecutionUnknown: '该尝试已进入宿主投递边界，实际执行状态仍待核对。',
       },
       en: {
-        title: 'dsh-session-bridge', summary: 'Choose which independent sessions may exchange messages.',
-        features: 'Features', enabled: 'Enable session messaging',
-        workflow: 'Enable cross-session delegation', workflowHelp: 'Assign the task and review its delegation plan in the original controller. You can also send 授权委托 with the task JSON.',
-        allowlist: 'Session allowlist', allowed: 'Selected sessions can message each other. Select at least two.',
-        authorization: 'For each new message, the owner enters “授权互传 <destination ID> <request ID>” in the sending session, then the exact text on the next line.',
+        title: 'dsh-session-bridge', summary: 'Choose which sessions can exchange messages and delegate tasks.',
+        master: 'Enable messaging and delegation', mixedSettings: 'Some features are enabled by the saved settings.', ungrouped: 'Ungrouped', workspace: 'Workspace', unavailableGroup: 'Unavailable selected sessions',
+        allowlist: 'Session allowlist',
         empty: 'No eligible sessions.', unnamed: 'Untitled session', unavailable: 'Unavailable session. You can remove it from the allowlist.',
         save: 'Save settings', saving: 'Saving…', saved: 'Settings saved and applied.',
         refresh: 'Reload', loading: 'Loading settings…', readError: 'Unable to read plugin settings or host compatibility. Try again.',
-        hostSupported: 'Host version supported (DSH 0.2.2-rc.1).',
         hostUnsupported: 'This host is unsupported. New messages and delegation require DSH 0.2.2-rc.1.',
-        messagingOn: 'Session messaging is on.', messagingOff: 'Session messaging is off.',
-        workflowOn: 'Task delegation is on.', workflowOff: 'Task delegation is off.',
         saveError: 'Unable to save. Reload before trying again.', readOnly: 'This configuration is read-only.',
         limit: 'Select at most 32 sessions.',
         tasks: 'Controller tasks', taskBack: 'Back to task list', taskEmpty: 'This window has no controller tasks.',
         taskReadError: 'Unable to read tasks for this controller window.', taskMissing: 'This task was not found in this window.',
-        taskState: 'Task state', taskGoal: 'Goal', taskExpires: 'Authorization expires', taskOutcome: 'Closeout',
+        taskState: 'Task state', taskAuthorization: 'Direct authorization', taskOwnerVerified: 'Verified owner turn', taskOwnerPending: 'Waiting for owner turn verification', taskGoal: 'Goal', taskExpires: 'Authorization expires', taskOutcome: 'Closeout',
         taskBatches: 'Batches', taskAttempts: 'Assignments and attempts', taskAttempt: 'Attempt {attempt}',
         taskTarget: 'Worker window', taskScope: 'Scope', taskDelivery: 'Task delivery', taskResult: 'Result continuation',
         taskReport: 'Report', taskLate: 'Late report', taskReason: 'Reason', taskTurn: 'Host turn',
@@ -106,6 +103,264 @@ window.__ModuleLoader__.load({
       dictionaries.zh['wf_reason_' + reason] = zh
       dictionaries.en['wf_reason_' + reason] = en
     }
+    const transferLabels = {
+      message: ['会话消息', 'Session message'],
+      task: ['委托派工', 'Delegated assignment'],
+      result: ['结果回传', 'Returned result'],
+      outgoing: ['发出', 'Outgoing'], incoming: ['接收', 'Incoming'],
+      queued: ['排队中', 'Queued'], sending: ['传递中', 'Sending'],
+      delivered: ['已投递', 'Delivered'], executing: ['处理中', 'Processing'],
+      working: ['执行中', 'Executing'],
+      processed: ['已处理', 'Processed'], reported: ['已回报', 'Reported'],
+      received: ['已接续', 'Received'], failed: ['失败', 'Failed'],
+      uncertain: ['待核对', 'Needs reconciliation'], stopped: ['已停止', 'Stopped'],
+      reconciled: ['已对账', 'Reconciled'],
+    }
+    for (const [key, [zh, en]] of Object.entries(transferLabels)) {
+      dictionaries.zh['transfer_' + key] = zh
+      dictionaries.en['transfer_' + key] = en
+    }
+
+    const rowsReordering = Symbol()
+    const reorderWaitMs = 350
+
+    function rowPoint(row) {
+      if (!row?.isConnected || document.hidden) return
+      const { left, right, top, width, height } = row.getBoundingClientRect()
+      if (width < 30 || height < 12) return
+      const y = top + height / 2
+      let overlap = false
+      for (const x of [right - 18, left + width / 2, left + 16]) {
+        const hit = document.elementFromPoint(x, y)
+        if (hit && row.contains(hit)) return { x, y }
+        if (!overlap && hit) {
+          // The native workspace reorders rows with overlapping wrappers. Wait
+          // briefly only while a sibling row covers an otherwise visible row.
+          const other = hit.closest('[role="treeitem"]') ?? hit.querySelector(':scope > [role="treeitem"]')
+          if (other && other !== row && other.closest('[role="tree"]') === row.closest('[role="tree"]') &&
+              document.elementsFromPoint(x, y).some((element) => row.contains(element))) overlap = true
+        }
+      }
+      if (overlap) return rowsReordering
+    }
+
+    function transferColors(state) {
+      if (state === 'failed' || state === 'uncertain') return 'var(--dsw-alias-state-error, currentColor)'
+      if (['queued', 'stopped', 'reconciled'].includes(state)) return 'var(--dsw-alias-label-secondary)'
+      return 'var(--dsw-alias-state-business-primary, currentColor)'
+    }
+
+    function createTransferView(t) {
+      const anchors = new Map()
+      const listeners = new Set()
+      let rowStates = new Map()
+      const subscribe = (listener) => {
+        listeners.add(listener)
+        return () => listeners.delete(listener)
+      }
+
+      function updateRows(rows) {
+        const next = new Map()
+        for (const row of rows) {
+          for (const id of [row.from, row.to]) {
+            if (next.has(id)) continue
+            const last = rowStates.get(id)
+            next.set(id, last?.id === row.id && last.state === row.state ? last : row)
+          }
+        }
+        rowStates = next
+        for (const listener of listeners) listener()
+      }
+
+      function findAnchor(id) {
+        let overlap
+        for (const anchor of anchors.get(id) ?? []) {
+          const point = rowPoint(anchor.closest('[role="treeitem"]'))
+          if (point === rowsReordering) overlap = point
+          else if (point) return point
+        }
+        return overlap
+      }
+
+      const visibleState = (row) => row.kind === 'task' && row.state === 'executing' ? 'working' : row.state
+
+      function label(row, sessionId) {
+        return [row.kind, row.from === sessionId ? 'outgoing' : 'incoming', visibleState(row)]
+          .map((key) => t('transfer_' + key)).join(' · ')
+      }
+
+      function RowStatus({ sessionId }) {
+        const row = useSyncExternalStore(subscribe, () => rowStates.get(sessionId))
+        const current = useRef()
+        const bind = useCallback((node) => {
+          if (current.current) {
+            const members = anchors.get(sessionId)
+            members?.delete(current.current)
+            if (members?.size === 0) anchors.delete(sessionId)
+          }
+          current.current = node
+          if (!current.current) return
+          if (!anchors.has(sessionId)) anchors.set(sessionId, new Set())
+          anchors.get(sessionId).add(current.current)
+        }, [sessionId])
+        return h('span', { ref: bind, style: row ? {
+          display: 'inline-flex', alignItems: 'center', gap: 3, whiteSpace: 'nowrap',
+          fontSize: 10, color: transferColors(row.state),
+        } : { display: 'none' },
+        ...(row ? { role: 'img', 'aria-label': label(row, sessionId), title: label(row, sessionId),
+          'data-dsh-bridge-status': row.state } : {}),
+        }, row && h(PaperPlane, { size: 12, 'aria-hidden': true }),
+        row && h('span', { 'aria-hidden': true }, t('transfer_' + visibleState(row))))
+      }
+
+      function HoverStatus({ sessionId }) {
+        const row = useSyncExternalStore(subscribe, () => rowStates.get(sessionId))
+        return row ? h('span', { style: { color: transferColors(row.state) } }, label(row, sessionId)) : null
+      }
+
+      function PlaneFlight({ route, finish }) {
+        const node = useRef()
+        useEffect(() => {
+          const { from, to, motion, id } = route
+          const angle = (dx, dy) => Math.atan2(dy, dx) * 180 / Math.PI + 45
+          const move = (x, y, rotate, opacity) => ({
+            transform: 'translate(' + x + 'px, ' + y + 'px) translate(-50%, -50%) rotate(' + rotate + 'deg)',
+            opacity,
+          })
+          const path = ({ x: x1, y: y1 }, { x: x2, y: y2 }) => {
+            const midX = (x1 + x2) / 2 - Math.min(28, 9 + Math.abs(y2 - y1) / 4)
+            const midY = (y1 + y2) / 2
+            return [
+              move(x1, y1, angle(midX - x1, midY - y1), 0.9),
+              move(midX, midY, angle(x2 - x1, y2 - y1), 1),
+              move(x2, y2, angle(x2 - midX, y2 - midY), 0.45),
+            ]
+          }
+          const moved = (a, b) => Math.abs(a.x - b.x) >= 3 || Math.abs(a.y - b.y) >= 3
+          let frame
+          let animation
+          let start
+          let end
+          const check = () => {
+            const nextStart = findAnchor(from)
+            const nextEnd = findAnchor(to)
+            if (motion.matches || !nextStart || !nextEnd) {
+              finish(id)
+              return
+            }
+            if (nextStart === rowsReordering || nextEnd === rowsReordering) {
+              if (!animation && performance.now() < route.deadline) frame = requestAnimationFrame(check)
+              else finish(id)
+              return
+            }
+            if (!animation) {
+              start = nextStart
+              end = nextEnd
+              animation = node.current.animate(path(start, end), { duration: 820, easing: 'ease-in-out', fill: 'both' })
+              animation.onfinish = () => finish(id)
+            } else if (moved(start, nextStart) || moved(end, nextEnd)) {
+              start = nextStart
+              end = nextEnd
+              animation.effect.setKeyframes(path(start, end))
+            }
+            frame = requestAnimationFrame(check)
+          }
+          frame = requestAnimationFrame(check)
+          return () => {
+            cancelAnimationFrame(frame)
+            animation?.cancel()
+          }
+        }, [route, finish])
+        return h('span', {
+          ref: node, 'data-dsh-bridge-flight': route.kind,
+          style: { position: 'absolute', top: 0, left: 0, opacity: 0, display: 'inline-flex', color: transferColors('sending') },
+        }, h(PaperPlane, { size: 19, 'aria-hidden': true }))
+      }
+
+      function Overlay() {
+        const [flights, setFlights] = useState([])
+        const finish = useCallback((id) => setFlights((current) => current.filter((route) => route.id !== id)), [])
+        useEffect(() => {
+          const source = new EventSource('/api/dsh-session-bridge/activity')
+          const motion = window.matchMedia('(prefers-reduced-motion: reduce)')
+          let cursor
+          let frame
+          const pending = []
+          const launch = () => {
+            frame = undefined
+            if (motion.matches || document.hidden) {
+              pending.length = 0
+              return
+            }
+            const started = []
+            for (const route of pending.splice(0)) {
+              const from = findAnchor(route.from)
+              const to = findAnchor(route.to)
+              if (!from || !to) continue
+              if (from === rowsReordering || to === rowsReordering) {
+                if (performance.now() < route.deadline) pending.push(route)
+              } else started.push(route)
+            }
+            if (pending.length) frame = requestAnimationFrame(launch)
+            if (started.length) {
+              setFlights((current) => [...current, ...started.slice(0, Math.max(0, 4 - current.length))])
+            }
+          }
+          const cancelPending = () => {
+            cancelAnimationFrame(frame)
+            frame = undefined
+            pending.length = 0
+          }
+          const receive = (event) => {
+            const { sequence, rows } = JSON.parse(event.data)
+            updateRows(rows)
+            if (event.type === 'baseline') {
+              cancelPending()
+              cursor = sequence
+              return
+            }
+            const after = cursor
+            cursor = sequence
+            if (after === undefined || motion.matches || document.hidden) return
+            for (const row of rows) {
+              if (pending.length >= 8) break
+              if (row.flight > after) pending.push({
+                id: row.flight, kind: row.kind, from: row.from, to: row.to, motion,
+                deadline: performance.now() + reorderWaitMs,
+              })
+            }
+            if (pending.length && frame === undefined) frame = requestAnimationFrame(launch)
+          }
+          const clear = () => {
+            cancelPending()
+            cursor = undefined
+            updateRows([])
+            setFlights([])
+          }
+          const onVisibility = () => {
+            if (!document.hidden) return
+            cancelPending()
+            setFlights([])
+          }
+          document.addEventListener('visibilitychange', onVisibility)
+          source.addEventListener('baseline', receive)
+          source.onmessage = receive
+          source.onerror = clear
+          return () => {
+            document.removeEventListener('visibilitychange', onVisibility)
+            cancelPending()
+            source.close()
+            updateRows([])
+          }
+        }, [])
+        return h('div', { 'aria-hidden': true, 'data-dsh-bridge-overlay': '',
+          style: { position: 'fixed', inset: 0, pointerEvents: 'none', zIndex: 100 },
+        }, flights.map((route) => h(PlaneFlight, { key: route.id, route, finish })))
+      }
+
+      return { RowStatus, HoverStatus, Overlay }
+    }
+
     const values = (entry) => ({
       enabled: entry.value.enabled === true,
       workflowEnabled: entry.value.workflowEnabled === true,
@@ -127,8 +382,38 @@ window.__ModuleLoader__.load({
         entry.value.allowedSessions.every((id) => typeof id === 'string')
     }
 
+    function projectGroups(workspaces, rows) {
+      const remaining = new Map(rows.filter((row) => !row.unavailable).map((row) => [row.id, row]))
+      const groups = workspaces.map(({ workspaceId, title, path, sessionIds }) => ({
+        id: workspaceId, title, path: typeof path === 'string'
+          ? (/^[A-Za-z]:[/\\]/.test(path) || path.startsWith('\\\\') ? path.replaceAll('\\', '/') : path).replace(/\/+$/, '')
+          : undefined,
+        rows: sessionIds.flatMap((id) => {
+          const row = remaining.get(id)
+          remaining.delete(id)
+          return row ? [row] : []
+        }), children: [],
+      }))
+      const roots = []
+      for (const group of groups) {
+        const parent = groups.reduce((nearest, candidate) => group.path !== undefined && candidate.path !== undefined &&
+          group.path !== candidate.path && group.path.startsWith(candidate.path + '/') &&
+          (!nearest || candidate.path.length > nearest.path.length) ? candidate : nearest, undefined)
+        if (parent) parent.children.push(group)
+        else roots.push(group)
+      }
+      const hasRows = (group) => group.rows.length || group.children.some(hasRows)
+      return [...roots.filter(hasRows),
+        { id: 'ungrouped', label: 'ungrouped', rows: [...remaining.values()], children: [] },
+        { id: 'unavailable', label: 'unavailableGroup', rows: rows.filter((row) => row.unavailable), children: [] },
+      ].filter(hasRows)
+    }
+
     function apply(ctx) {
       const t = ctx.locale.bind('dsh-session-bridge')
+      const workspaceStore = ctx.workspaces.list
+      const subscribeWorkspaces = (listener) => workspaceStore.subscribe(listener)
+      const readWorkspaces = () => workspaceStore.getSnapshot()
       const stateLabel = (value) => {
         if (typeof value !== 'string') return
         return Object.hasOwn(workflowStates, value) ? t('wf_' + value) : value
@@ -196,12 +481,14 @@ window.__ModuleLoader__.load({
       function TaskDetail({ task, titles }) {
         const batches = task.batches ?? []
         const attempts = task.jobs ?? []
-        const { outcome, closure } = task
+        const { outcome, closure, authorization } = task
         return h('article', { style: section },
           h('h4', { style: { margin: 0 } }, task.task),
           facts([
             [t('taskState'), stateLabel(task.state)], [t('taskGoal'), task.goal], [t('taskExpires'), dateLabel(task.expiresAt)],
             [t('taskArchived'), task.archivedJobs],
+            [t('taskAuthorization'), authorization?.ownerTurnEnd ? t('taskOwnerVerified')
+              : task.state === 'authorizing' ? t('taskOwnerPending') : undefined],
             [t('taskReason'), reasons([closure?.reason])],
           ]),
           outcome && h('section', { style: taskBox },
@@ -275,6 +562,33 @@ window.__ModuleLoader__.load({
                       row.goal && h('p', { style: { ...muted, marginTop: 4 } }, row.goal)))))
       }
 
+      function DirectWorkflowTail({ turn, sessionId, useChat }) {
+        const message = useChat((snapshot) => {
+          for (const key of snapshot.locations.getTurn(turn.turn)) {
+            const node = snapshot.nodes.get(key)
+            if (node?.kind !== 'turn-trigger') continue
+            const { source, content } = node.data
+            if (source?.kind !== 'agent-message' || source.form !== 'relay' ||
+                source.bridgeWorkflowOwner !== sessionId ||
+                content.length !== 1 || content[0]?.type !== 'text') continue
+            if (source.bridgeWorkflowKind === 'direct-notice' && source.senderSessionId === sessionId ||
+                source.bridgeWorkflowKind === 'result' &&
+                typeof source.bridgeWorkflowId === 'string' && workflowId.test(source.bridgeWorkflowId)) return node.data
+          }
+        })
+        if (!message) return null
+        const [{ text }] = message.content
+        const bodyStyle = { margin: 0, whiteSpace: 'pre-wrap' }
+        if (message.source.bridgeWorkflowKind === 'direct-notice') {
+          return h('p', { 'data-dsh-bridge-direct-notice': '', style: { ...taskBox, ...bodyStyle } }, text)
+        }
+        const split = text.indexOf('\n\n')
+        if (split < 0) return null
+        return h('section', { 'data-dsh-bridge-direct-result': '', style: { ...taskBox, ...section } },
+          h('strong', null, text.slice(0, split)),
+          h('p', { style: bodyStyle }, text.slice(split + 2)))
+      }
+
       function BridgeIcon(props) {
         return h('svg', { ...props, viewBox: '0 0 24 24', fill: 'none', 'aria-hidden': true },
           h('path', { d: 'M3 8h17m-5-5 5 5-5 5M21 16H4m5-5-5 5 5 5', stroke: 'currentColor',
@@ -286,6 +600,7 @@ window.__ModuleLoader__.load({
         const [state, setState] = useState('loading')
         const [generation, reload] = useState(0)
         const [tasksOpen, setTasksOpen] = useState(false)
+        const workspaces = useSyncExternalStore(subscribeWorkspaces, readWorkspaces)
 
         useEffect(() => {
           let active = true
@@ -304,9 +619,8 @@ window.__ModuleLoader__.load({
             const sessions = await ctx.remote.session.list({})
             if (!active) return
             if (!sessions.ok) throw new Error('Sessions unavailable')
-            const archived = new Set(ctx.workspaces.list.getSnapshot().archivedSessionIds)
             const rows = sessions.value.items
-              .filter((row) => !row.blank && !row.parentSessionId && row.origin !== 'subagent' && !archived.has(row.sessionId))
+              .filter((row) => !row.blank && !row.parentSessionId && row.origin !== 'subagent')
               .map((row) => ({ id: row.sessionId, title: row.projections?.values?.title }))
             setView({ entry, rows, writable: settings.value.writable })
             setDraft(values(entry))
@@ -320,7 +634,11 @@ window.__ModuleLoader__.load({
           event.preventDefault()
           setState('saving')
           try {
-            const result = await ctx.remote.settings.update(kind, draft, view.entry.revision)
+            const patch = { allowedSessions: draft.allowedSessions }
+            if (draft.enabled !== view.entry.value.enabled || draft.workflowEnabled !== view.entry.value.workflowEnabled) {
+              Object.assign(patch, { enabled: draft.enabled, workflowEnabled: draft.workflowEnabled })
+            }
+            const result = await ctx.remote.settings.update(kind, patch, view.entry.revision)
             if (!result.ok) throw new Error('Settings write rejected')
             if (!readable(result.value)) {
               setView(null)
@@ -335,9 +653,13 @@ window.__ModuleLoader__.load({
           }
         }
 
-        const rows = view ? [...view.rows, ...draft.allowedSessions
-          .filter((key) => !view.rows.some((row) => row.id === key))
+        const archived = new Set(workspaces.archivedSessionIds)
+        const liveRows = view?.rows.filter((row) => !archived.has(row.id)) ?? []
+        const rows = view ? [...liveRows, ...draft.allowedSessions
+          .filter((key) => !liveRows.some((row) => row.id === key))
           .map((key) => ({ id: key, unavailable: true }))] : []
+        const groups = projectGroups(workspaces.items ?? [], rows)
+        const settingsSection = { ...section, margin: 0, padding: 0, border: 0, minWidth: 0 }
         const disabled = !view?.writable || state === 'saving' || state === 'saveError'
         const changed = view && JSON.stringify(draft) !== JSON.stringify(values(view.entry))
         function select(key, checked) {
@@ -346,43 +668,41 @@ window.__ModuleLoader__.load({
           setState('ready')
         }
 
+        function renderGroup(group) {
+          if (!group.rows.length && !group.children.length) return null
+          return h('details', { key: group.id, style: { marginBlock: 4 } },
+            h('summary', { style: { cursor: 'pointer', padding: '4px 0', overflowWrap: 'anywhere' } },
+              group.title || t(group.label ?? 'workspace')),
+            h('div', { style: { ...section, paddingInlineStart: 16 } },
+              group.rows.map((row) => {
+                const checked = draft.allowedSessions.includes(row.id)
+                return h('label', { key: row.id, ...(row.unavailable ? { title: row.id } : {}),
+                  style: { display: 'flex', alignItems: 'flex-start', gap: 8, overflowWrap: 'anywhere' } },
+                h('input', { type: 'checkbox', checked, disabled: !checked && draft.allowedSessions.length >= 32,
+                  onChange: (event) => select(row.id, event.target.checked) }),
+                h('span', null, row.title || t(row.unavailable ? 'unavailable' : 'unnamed')))
+              }), group.children.map(renderGroup)))
+        }
+
         return h('div', { style: { padding: '20px', height: '100%', boxSizing: 'border-box', overflow: 'auto' } },
           h('h2', { style: { margin: '0 0 6px', fontSize: 18 } }, t('title')),
-          h('p', { style: muted }, t('summary')),
           view && sessionId && h('details', {
             style: { ...taskBox, marginTop: 12 }, onToggle: (event) => setTasksOpen(event.currentTarget.open),
-          }, h('summary', null, t('tasks')), tasksOpen && h(TaskView, { key: sessionId, sessionId, rows: view.rows })),
+          }, h('summary', null, t('tasks')), tasksOpen && h(TaskView, { key: sessionId, sessionId, rows: liveRows })),
           !view ? h('p', { role: 'status' }, t(state)) : h('form', { onSubmit: save, style: { ...section, gap: 18, marginTop: 18 } },
-            h('div', { role: 'status', style: section },
-              h('p', { style: muted }, t('hostSupported')),
-              h('p', { style: muted }, t(view.entry.value.enabled ? 'messagingOn' : 'messagingOff')),
-              h('p', { style: muted }, t(view.entry.value.workflowEnabled ? 'workflowOn' : 'workflowOff'))),
-            h('fieldset', { disabled, style: section },
-              h('legend', null, t('features')),
-              h('label', null, h('input', { type: 'checkbox', checked: draft.enabled, onChange: (event) => {
-                setDraft({ ...draft, enabled: event.target.checked })
-                setState('ready')
-              } }), ' ', t('enabled')),
-              h('label', null, h('input', { type: 'checkbox', checked: draft.workflowEnabled, onChange: (event) => {
-                setDraft({ ...draft, workflowEnabled: event.target.checked })
-                setState('ready')
-              } }), ' ', t('workflow')),
-              h('p', { style: muted }, t('workflowHelp'))),
-            h('fieldset', { disabled, style: section },
+            h('fieldset', { disabled, style: settingsSection },
+              h('label', null, h('input', { type: 'checkbox', checked: draft.enabled && draft.workflowEnabled,
+                ref: (node) => { if (node) node.indeterminate = draft.enabled !== draft.workflowEnabled },
+                onChange: (event) => {
+                  setDraft({ ...draft, enabled: event.target.checked, workflowEnabled: event.target.checked })
+                  setState('ready')
+                },
+              }), ' ', t('master')),
+              draft.enabled !== draft.workflowEnabled && h('p', { style: muted }, t('mixedSettings'))),
+            h('fieldset', { disabled, style: settingsSection },
               h('legend', null, t('allowlist')),
-              h('p', { style: muted }, t('allowed')),
-              h('p', { style: muted }, t('authorization')),
               rows.length === 0 && h('p', { style: muted }, t('empty')),
-              rows.map((row) => {
-                const checked = draft.allowedSessions.includes(row.id)
-                return h('label', { key: row.id, title: row.id,
-                  style: { display: 'flex', alignItems: 'flex-start', gap: 8, overflowWrap: 'anywhere' } },
-                h('input', { type: 'checkbox', checked,
-                  disabled: !checked && draft.allowedSessions.length >= 32,
-                  onChange: (event) => select(row.id, event.target.checked) }),
-                h('span', null, row.title || (row.unavailable ? t('unavailable') : t('unnamed')),
-                  h('small', { style: { ...muted, display: 'block' } }, row.id)))
-              }),
+              groups.map(renderGroup),
               draft.allowedSessions.length >= 32 && h('small', { style: muted }, t('limit'))),
             h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8 } },
               h('button', { type: 'submit', disabled: disabled || !changed }, t(state === 'saving' ? 'saving' : 'save')),
@@ -391,7 +711,20 @@ window.__ModuleLoader__.load({
             (state === 'saved' || state === 'saveError') && h('p', { role: 'status', style: muted }, t(state))),
           (state === 'readError' || state === 'hostUnsupported') && h('button', { type: 'button', onClick: () => reload(generation + 1) }, t('refresh')))
       }
+      const transfers = createTransferView(t)
+      for (const [name, component] of [
+        ['sidebar.session.row.trailing', transfers.RowStatus],
+        ['sidebar.session.row.hover', transfers.HoverStatus],
+        ['shell.overlay', transfers.Overlay],
+      ]) {
+        ctx.effect(() => ctx.slots.inject(name, () => ctx.slots.register({ name, id: id + '/activity' }, component)),
+          'dsh-session-bridge activity ' + name)
+      }
       ctx.effect(() => ctx.locale.register('dsh-session-bridge', dictionaries), 'dsh-session-bridge copy')
+      ctx.effect(() => ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register({
+        name: 'conversation.chat.turnTail', id: id + '/direct-result',
+        inject: (sessionId) => ({ sessionId }),
+      }, DirectWorkflowTail)), 'dsh-session-bridge direct turn messages')
       ctx.effect(() => ctx.sidebarRightTabs.register({
         id, kind, title: () => t('title'),
         guide: [{ id: 'settings', order: 45, title: () => t('title'), description: () => t('summary'), icon: BridgeIcon }],

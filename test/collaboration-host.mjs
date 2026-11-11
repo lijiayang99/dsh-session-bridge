@@ -303,8 +303,9 @@ export async function withCollaborationHost({
     return turn(sessionId, await submit(sessionId, text))
   }
 
-  async function createWorkspace() {
-    const { workspace } = await rpc('workspace/create', { request: { path: work } })
+  async function createWorkspace(path = work) {
+    await mkdir(path, { recursive: true })
+    const { workspace } = await rpc('workspace/create', { request: { path } })
     return workspace.workspaceId
   }
 
