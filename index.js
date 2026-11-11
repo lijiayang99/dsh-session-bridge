@@ -6,6 +6,7 @@ import {
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { draftPreview, matchingTitles, naturalIntent } from './natural-message.js'
 import { applyWorkflow } from './workflow.js'
 
 // Local DSH bundles are linked, so resolve the schema from the running DSH CLI.
@@ -33,6 +34,7 @@ export const inject = ['agents', 'sessions', 'sessionController', 'tools', 'work
 
 const ID = /^[a-zA-Z0-9_-]{1,128}$/
 const KEY = /^[a-f0-9]{64}$/
+const DRAFT_LIFETIME_MS = 120_000
 const sha = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const now = () => new Date().toISOString()
 const validId = (value) => typeof value === 'string' && ID.test(value)
@@ -42,13 +44,17 @@ const authorizationCommand = /^授权互传 ([a-zA-Z0-9_-]{1,128}) ([a-zA-Z0-9_-
 
 // In DSH 0.2.2-rc.1, the Host omits the owner principal and records non-owner
 // principals explicitly. rpcId is supplied by the native prompt admission.
-function ownerAuthorization(message) {
+function ownerText(message) {
   const { source, content, id } = message
   if (message.role !== 'user' || source?.kind !== 'user' ||
       source.principal !== undefined || !validId(source.rpcId) || !validId(id) ||
       !Array.isArray(content) || content.length !== 1 || content[0]?.type !== 'text' ||
       typeof content[0].text !== 'string' || content[0].text.length > 2300) return undefined
-  const match = authorizationCommand.exec(content[0].text)
+  return content[0].text
+}
+
+function ownerAuthorization(input, id) {
+  const match = authorizationCommand.exec(input)
   if (!match || !validText(match[3])) return undefined
   const [, to, requestId, text] = match
   return { to, requestId, payloadHash: sha([to, text]), userMessageId: id, used: false }
@@ -118,9 +124,12 @@ export function apply(ctx, config) {
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   const allowed = (id) => typeof id === 'string' && config.allowedSessions.get().includes(id)
     && !ctx.workspaceRegistry.archivedSessionIds.includes(id)
+  let web = false
   if (supportsOwnerPrompt) {
     ctx.inject(['profileContext', 'sessionPersistence'], (workflowCtx) => {
-      if (workflowCtx.profileContext.name === 'web') applyWorkflow(workflowCtx, config, allowed)
+      if (workflowCtx.profileContext.name !== 'web') return
+      web = true
+      applyWorkflow(workflowCtx, config, allowed)
     })
   }
   const receiptPath = (key) => join(dir, key + '.json')
@@ -128,22 +137,41 @@ export function apply(ctx, config) {
 
   // Only native turn events tied to our exact message ID can settle processing.
   const turns = new Map()
+  const drafts = new Map()
+  const clearNatural = (active) => {
+    if (!active?.natural) return
+    active.natural.controller.abort()
+    active.natural = undefined
+  }
   ctx.on('session/event', (session, event) => {
+    const active = turns.get(session.id)
     if (!allowed(session.id)) {
+      clearNatural(active)
       turns.delete(session.id)
+      drafts.delete(session.id)
       return
     }
     if (event.type === 'turn/start') {
+      clearNatural(active)
       turns.set(session.id, { turn: event.data.turn, message: null, replied: false, hasRelay: false })
       return
     }
-    const active = turns.get(session.id)
     if (!active) return
     if (event.type === 'user/message') {
+      clearNatural(active)
+      const draft = drafts.get(session.id)
+      drafts.delete(session.id)
       const source = event.data.source
       if (source?.kind === 'user') {
-        active.authorization = !active.hasRelay && config.enabled.get()
-          ? ownerAuthorization(event.data) : undefined
+        const input = !active.hasRelay && config.enabled.get() ? ownerText(event.data) : undefined
+        active.authorization = input === undefined ? undefined : ownerAuthorization(input, event.data.id)
+        if (web && input !== undefined) {
+          const confirmed = input.trim() === '确认发送' && draft?.expiresAt > performance.now() ? draft : undefined
+          const intent = confirmed ? { kind: 'confirmed' } : naturalIntent(input)
+          if (intent) {
+            active.natural = { intent, confirmed, userMessageId: event.data.id, controller: new AbortController() }
+          }
+        }
         return
       }
       if (source?.kind === 'agent-message') {
@@ -159,16 +187,30 @@ export function apply(ctx, config) {
       }
       return
     }
-    if (event.type === 'assistant/message' && active.message &&
-        event.data.turn === active.turn && !event.data.interrupted) {
-      active.replied = true
+    if (event.type === 'assistant/message' && event.data.turn === active.turn) {
+      if (active.message && !event.data.interrupted) active.replied = true
+      const input = active.natural
+      if (input?.draft) {
+        const content = event.data.message.content.filter(({ type }) => type !== 'reasoning')
+        input.previewShown = !event.data.interrupted && content.length === 1 &&
+          content[0].type === 'text' && content[0].text === input.draft.preview
+      }
       return
     }
     if (event.type !== 'turn/end' || event.data.turn !== active.turn) return
+    const reason = event.data.reason.kind
+    const draft = active.natural?.draft
+    if (reason === 'completed' && active.natural?.previewShown && draft.expiresAt > performance.now() &&
+        config.enabled.get() && allowed(draft.payload.to)) {
+      drafts.set(session.id, draft)
+      setTimeout(() => {
+        if (drafts.get(session.id) === draft) drafts.delete(session.id)
+      }, draft.expiresAt - performance.now()).unref()
+    }
+    clearNatural(active)
     turns.delete(session.id)
     if (!active.message) return
     const { key, id } = active.message
-    const reason = event.data.reason.kind
     const processing = reason === 'completed' && active.replied ? 'processed' : 'not_completed'
     void Promise.resolve().then(async () => {
       if (await ctx.sessions.flush(session)) {
@@ -200,6 +242,94 @@ export function apply(ctx, config) {
     record?.from === from && record.payloadHash === payloadHash
       ? result(key, record, true) : { error: 'request_id_conflict' }
 
+  const destinations = async (from, query, signal) => {
+    const { items } = await ctx.sessionController.list({}, signal)
+    return matchingTitles(items, query, (id) => id !== from && allowed(id))
+  }
+
+  async function deliver({ to, requestId, text }, exec, natural) {
+    const from = senderId(exec)
+    if (!from || from === to || !allowed(to)) return { error: 'route_not_allowed' }
+    if (!config.enabled.get()) return { error: 'bridge_disabled' }
+    if (!validId(requestId) || !validText(text)) {
+      return { error: 'invalid_message' }
+    }
+    exec.signal.throwIfAborted()
+    const key = sha([from, requestId])
+    const path = receiptPath(key)
+    const payloadHash = sha([to, text])
+    const existing = read(path)
+    if (existing) return existingResult(key, existing, from, payloadHash)
+    if (!supportsOwnerPrompt) return { error: 'unsupported_dsh_authorization_source' }
+    if (natural?.expiresAt <= performance.now()) return { error: 'message_authorization_required' }
+
+    const active = turns.get(from)
+    const approval = active?.authorization
+    if (!approval || approval.used || approval.natural !== natural ||
+        approval.to !== to || approval.requestId !== requestId ||
+        approval.payloadHash !== payloadHash) return { error: 'message_authorization_required' }
+    approval.used = true
+    const record = {
+      from, to, requestId, payloadHash, messageId: randomUUID(), delivery: 'reserved', at: now(),
+      authorization: {
+        kind: natural?.kind ?? 'native-owner-command', userMessageId: approval.userMessageId, turn: active.turn,
+        ...(natural?.draftMessageId ? { draftMessageId: natural.draftMessageId } : {}),
+      },
+    }
+    if (!write(dir, path, record, true)) {
+      return existingResult(key, read(path), from, payloadHash)
+    }
+
+    let attempted = false
+    try {
+      const resolved = await ctx.sessionController.resolveAgent(to)
+      if (natural) {
+        const matches = await destinations(from, natural.query, exec.signal)
+        if (matches.length !== 1 || matches[0].to !== to || matches[0].title !== natural.title ||
+            turns.get(from)?.natural !== natural.input ||
+            (natural.expiresAt !== undefined && natural.expiresAt <= performance.now())) {
+          throw new Error('message authorization changed')
+        }
+      }
+      exec.signal.throwIfAborted()
+      const target = resolved.agent
+      if (!target || target.session.id !== to || !config.enabled.get() || senderId(exec) !== from ||
+          !allowed(to) || turns.get(from)?.authorization !== approval) {
+        throw new Error('destination unavailable')
+      }
+      attempted = true
+      target.followup({
+        id: record.messageId, role: 'user',
+        content: [{
+          type: 'text',
+          text: `[DSH 会话消息｜发送方 ${from}]\n${text}`,
+        }],
+        source: { kind: 'agent-message', form: 'relay', senderSessionId: from, bridgeReceiptKey: key },
+      })
+      record.delivery = await ctx.sessions.flush(target.session) ? 'delivered' : 'unknown'
+    } catch {
+      record.delivery = attempted ? 'unknown' : 'not_delivered'
+    }
+    write(dir, path, record, false)
+    return result(key, record)
+  }
+
+  function sendNatural(active, input, frozen, exec) {
+    const { payload, title, query, expiresAt, draftMessageId } = frozen
+    const { to, requestId, text } = payload
+    if (!input.authorization) {
+      input.authorization = Object.freeze({
+        input, title, query, expiresAt, draftMessageId,
+        kind: draftMessageId ? 'native-owner-confirmation' : 'native-owner-text',
+      })
+      active.authorization = {
+        to, requestId, payloadHash: sha([to, text]), userMessageId: input.userMessageId, used: false,
+        natural: input.authorization,
+      }
+    }
+    return deliver(payload, exec, input.authorization)
+  }
+
   ctx.tools.register({
     name: 'send_session_message',
     description: 'Send the exact payload approved in this turn by the DSH owner command "授权互传 <to> <request_id>" followed by a newline and the message text. Relayed and ordinary messages do not grant approval. Reuse request_id to read an existing matching receipt.',
@@ -212,58 +342,67 @@ export function apply(ctx, config) {
       },
     },
     output,
-    async execute({ to, request_id: requestId, text }, exec) {
+    execute({ to, request_id: requestId, text }, exec) {
+      return deliver({ to, requestId, text }, exec)
+    },
+  })
+
+  ctx.tools.register({
+    name: 'send_natural_session_message',
+    description: 'Handle an explicit send request in the current DSH owner prompt, e.g. “给审核窗口发消息：候选已就绪” or “把『候选已就绪』发给审核窗口”. Call with no arguments for exact owner text or the owner reply “确认发送”. Supply draft only when the owner asked to compose, edit or forward contextual text. When the result contains preview, copy its exact text as your entire final reply, preserving spaces and newlines, and wait for the owner. Ask the owner to restate any ambiguous request with a unique session title and the desired content.',
+    parameters: {
+      type: 'object', additionalProperties: false,
+      properties: { draft: { type: 'string', minLength: 1, maxLength: 2000 } },
+    },
+    output,
+    async execute({ draft }, exec) {
       const from = senderId(exec)
-      if (!from || from === to || !allowed(to)) return { error: 'route_not_allowed' }
+      if (!from) return { error: 'route_not_allowed' }
       if (!config.enabled.get()) return { error: 'bridge_disabled' }
-      if (!validId(requestId) || !validText(text)) {
-        return { error: 'invalid_message' }
-      }
-      exec.signal.throwIfAborted()
-      const key = sha([from, requestId])
-      const path = receiptPath(key)
-      const payloadHash = sha([to, text])
-      const existing = read(path)
-      if (existing) return existingResult(key, existing, from, payloadHash)
-      if (!supportsOwnerPrompt) return { error: 'unsupported_dsh_authorization_source' }
-
+      if (!web) return { error: 'unsupported_dsh_authorization_source' }
       const active = turns.get(from)
-      const approval = active?.authorization
-      if (!approval || approval.used || approval.to !== to || approval.requestId !== requestId ||
-          approval.payloadHash !== payloadHash) return { error: 'message_authorization_required' }
-      approval.used = true
-      const record = {
-        from, to, requestId, payloadHash, messageId: randomUUID(), delivery: 'reserved', at: now(),
-        authorization: { kind: 'native-owner-command', userMessageId: approval.userMessageId, turn: active.turn },
+      const input = active?.natural
+      if (!input) return { error: 'message_authorization_required' }
+      const { intent } = input
+      const signal = AbortSignal.any([exec.signal, input.controller.signal])
+      const current = () => !signal.aborted && config.enabled.get() &&
+        senderId(exec) === from && turns.get(from)?.natural === input
+      if (!current()) return { error: 'message_authorization_required' }
+      if (intent.kind === 'confirmed') {
+        if (draft !== undefined) return { error: 'owner_text_cannot_be_replaced' }
+        return sendNatural(active, input, input.confirmed, exec)
       }
-      if (!write(dir, path, record, true)) {
-        return existingResult(key, read(path), from, payloadHash)
+      if (intent.kind === 'missing_body') return { error: 'message_body_required' }
+      const literal = intent.kind === 'literal'
+      if (literal && draft !== undefined) return { error: 'owner_text_cannot_be_replaced' }
+      const text = literal ? intent.text : draft
+      if (!validText(text)) return { error: literal ? 'invalid_message' : 'message_draft_required' }
+      const existing = input.frozen
+      if (existing) {
+        if (existing.payload.text !== text) return { error: 'request_id_conflict' }
+        if (input.draft) return { confirmation: 'owner_reply_required', preview: input.draft.preview }
+        return sendNatural(active, input, existing, exec)
       }
 
-      let attempted = false
-      try {
-        const resolved = await ctx.sessionController.resolveAgent(to)
-        exec.signal.throwIfAborted()
-        const target = resolved.agent
-        if (!target || target.session.id !== to || !config.enabled.get() || senderId(exec) !== from ||
-            !allowed(to) || turns.get(from)?.authorization !== approval) {
-          throw new Error('destination unavailable')
-        }
-        attempted = true
-        target.followup({
-          id: record.messageId, role: 'user',
-          content: [{
-            type: 'text',
-            text: `[DSH 会话消息｜发送方 ${from}]\n${text}`,
-          }],
-          source: { kind: 'agent-message', form: 'relay', senderSessionId: from, bridgeReceiptKey: key },
-        })
-        record.delivery = await ctx.sessions.flush(target.session) ? 'delivered' : 'unknown'
-      } catch {
-        record.delivery = attempted ? 'unknown' : 'not_delivered'
+      const matches = await destinations(from, intent.title, signal).catch(() => undefined)
+      if (!current()) return { error: 'message_authorization_required' }
+      if (!matches) return { error: 'session_titles_unavailable' }
+      if (matches.length !== 1) {
+        return { error: matches.length ? 'ambiguous_session_title' : 'session_title_required', title: intent.title }
       }
-      write(dir, path, record, false)
-      return result(key, record)
+      if (input.frozen) return { error: 'message_request_in_progress' }
+      const [{ to, title }] = matches
+      if (!allowed(to)) return { error: 'route_not_allowed' }
+      const requestId = 'natural-' + sha([from, input.userMessageId])
+      const payload = Object.freeze({ to, requestId, text })
+      const destination = { payload, title, query: intent.title }
+      input.frozen = Object.freeze(destination)
+      if (literal) return sendNatural(active, input, input.frozen, exec)
+      input.draft = Object.freeze({
+        ...destination, preview: draftPreview(title, text),
+        expiresAt: performance.now() + DRAFT_LIFETIME_MS, draftMessageId: input.userMessageId,
+      })
+      return { confirmation: 'owner_reply_required', preview: input.draft.preview }
     },
   })
 

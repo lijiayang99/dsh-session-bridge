@@ -1,4 +1,4 @@
-# dsh-session-bridge 0.4.4-rc.3
+# dsh-session-bridge 0.4.5-rc.1
 
 适用于 DeepSeek Harness Web 0.2.2-rc.1。全新安装可通过「插件 → 添加插件」输入宿主机可读的包绝对路径并启用。已有版本请先按下文迁移。
 
@@ -63,11 +63,36 @@
 
 ## 普通互传
 
+在发送窗口直接输入 `给审核窗口发消息：候选已就绪，请开始复核` 或 `把『候选已就绪，请开始复核』发给审核窗口`。助手调用普通发送工具，插件从本轮所有者消息取得原文，从宿主读取会话标题，并在白名单内解析唯一的收件窗口。插件生成请求号，精确重复调用返回同一回执。
+
+标题缺失、同名或正文缺失时，助手会请你用唯一标题和正文重新说明。标题 `审核` 也可用 `审核窗口` 指代。若两种标题在白名单内都存在，先用唯一标题消歧。普通互传每次处理一个收件窗口。
+
+输入 `请拟一条消息发给审核窗口` 或 `把刚才的摘要发给审核窗口` 时，助手在原窗口展示完整草稿。预览包含收件标题和正文，换行与控制字符以可见转义表示。所有者在同一窗口回复 `确认发送` 后，插件按冻结的标题和正文投递。回复 `取消发送`、转入其他话题或超过两分钟未确认都会结束草稿。发送前再次核对窗口标题、白名单和当前轮次。
+
 在发送会话由 DSH 所有者输入 `授权互传 目标会话ID 请求号`，下一行开始写准确正文。助手用 `send_session_message` 按原样发送，从原发送会话用 `session_message_status` 查投递和处理。精确重试只返回已有回执。迁移保留回执内容和去重键。目标轮次正常回复并落盘仅证明处理，项目验收仍要看结构化结果和产物。
+
+### 从 0.4.4-rc.3 换入或回退
+
+排空在途消息和委托，保存两个开关与白名单的当前值，关闭两个开关并停用插件。备份当前配置、回执和委托账本，换入固定包后完整重启。两版共用相同设置 ID、回执与账本路径，无需搬移。核对安装版本、白名单、开关及已有回执和委托记录，再按原授权恢复开关。回退时按同一步骤换回固定的 0.4.4-rc.3。
+
+### 自然语句隔离复验
+
+使用固定 DSH Web 0.2.2-rc.1、Node 24.22.2、Chrome 和 Playwright Core 1.65.0。在源码目录运行下列命令。测试在仅有 loopback 的网络命名空间内启动 Web、浏览器和合成模型，并使用一次性配置与会话。
+
+```sh
+lab="$(mktemp -d)"
+npm pack --offline --pack-destination "$lab"
+npm install --prefix "$lab/tools" playwright-core@1.65.0
+unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+  "$(command -v node)" ./test/natural-send.mjs "$(command -v dsh)" \
+  "$lab/local-dsh-session-bridge-0.4.5-rc.1.tgz" \
+  "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
+bash .github/ci/run.sh
+```
 
 ## 迁移与回退隔离复验
 
-用固定 DSH Web `0.2.2-rc.1`、Node `24.22.2` 和 pnpm `12.18.0`，在源码目录执行。基线从固定 `0.4.2` 源码提交打包。测试在临时 HOME、XDG、DSH_HOME 和仅有 loopback 的网络命名空间内，使用合成会话及模型。
+用固定 DSH Web `0.2.2-rc.1`、Node `24.22.2` 和 pnpm `12.18.0`，在 0.4.4-rc.3 源码目录（`b6b5af3`）执行。基线从固定 `0.4.2` 源码提交打包。测试在临时 HOME、XDG、DSH_HOME 和仅有 loopback 的网络命名空间内，使用合成会话及模型。
 
 ```sh
 lab="$(mktemp -d)"
@@ -85,7 +110,7 @@ unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
 
 ## 宿主兼容诊断复验
 
-下列 smoke 在 Linux 的 loopback 网络命名空间启动临时 DSH Web 和本地合成模型。用 Node `24.22.2`、pnpm `12.18.0`、DSH Web `0.2.2-rc.1`、Chrome 与 Playwright Core `1.65.0` 可复跑。
+下列 smoke 在 Linux 的 loopback 网络命名空间启动临时 DSH Web 和本地合成模型。在 0.4.4-rc.3 源码目录（`b6b5af3`）用 Node `24.22.2`、pnpm `12.18.0`、DSH Web `0.2.2-rc.1`、Chrome 与 Playwright Core `1.65.0` 可复跑。
 
 ```sh
 lab="$(mktemp -d)"
