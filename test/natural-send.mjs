@@ -12,7 +12,7 @@ assert.equal(process.argv.length, 6, 'Usage: node test/natural-send.mjs <dsh> <t
 assert(Object.values(networkInterfaces()).flat().every(({ internal }) => internal), 'Use a loopback-only network namespace')
 const [dsh, archive, playwright, chrome] = process.argv.slice(2).map((path) => resolve(path))
 const pkg = JSON.parse(execFileSync('tar', ['-xOf', archive, 'package/package.json'], { encoding: 'utf8' }))
-assert.equal(pkg.version, '0.4.5-rc.1')
+assert.equal(pkg.version, '0.4.5-rc.2')
 assert.equal(pkg.engines.dsh, '0.2.2-rc.1')
 
 const lab = await mkdtemp(join(tmpdir(), 'bridge-natural-send-'))
@@ -55,7 +55,7 @@ const model = createServer(async (req, res) => {
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
     const input = JSON.parse(Buffer.concat(chunks))
-    const decision = decide(input)
+    const decision = await decide(input)
     const call = decision?.name ? decision : undefined
     if (call) assert(input.tools.some(({ name }) => name === call.name), 'Missing tool ' + call.name)
     const block = call
@@ -215,18 +215,18 @@ try {
   const relay = async (sessionId) => (await history(sessionId)).filter(({ type, data }) =>
     type === 'user/message' && data.source?.kind === 'agent-message' && data.source?.form === 'relay')
 
-  async function startPrompt(sessionId, text, plan, submit) {
+  async function nativePrompt(sessionId, text, mode = 'queue') {
+    const requestId = randomUUID()
+    const admitted = await rpc('session/prompt', {
+      request: { requestId, sessionId, mode, content: [{ type: 'text', text }] },
+    })
+    assert.equal(admitted.accepted, true)
+    return requestId
+  }
+
+  async function startPrompt(sessionId, text, plan, submit = (text) => nativePrompt(sessionId, text)) {
     if (plan) plans.set(text, plan)
-    let requestId
-    if (submit) {
-      requestId = await submit(text)
-    } else {
-      requestId = randomUUID()
-      const admitted = await rpc('session/prompt', {
-        request: { requestId, sessionId, mode: 'queue', content: [{ type: 'text', text }] },
-      })
-      assert.equal(admitted.accepted, true)
-    }
+    const requestId = await submit(text)
     return async () => {
       try {
         await wait(sessionId)
@@ -335,6 +335,46 @@ try {
     return result
   }
 
+  const required = { error: 'message_authorization_required' }
+  async function earlyConfirmation(mode) {
+    const releasePreview = Promise.withResolvers()
+    let awaitingPreview = false
+    const finishDraft = await startPrompt(from, draftRequest, async (results) => {
+      if (!results.length) return natural({ draft })
+      awaitingPreview = true
+      await releasePreview.promise
+      return { reply: preview }
+    }, browserPrompt)
+    try {
+      await until(() => awaitingPreview, 'draft preview model request')
+      const finishConfirmation = await startPrompt(from, '确认发送', once(natural()), (text) =>
+        nativePrompt(from, text, mode))
+      releasePreview.resolve()
+      const proposed = await finishDraft()
+      const confirmation = await finishConfirmation()
+      const admission = proposed.inTurn.find(({ type, data }) => type === 'agent/inbox/spliced' &&
+        data.inserted.some(({ id }) => id === confirmation.input.data.id))
+      const displayed = proposed.inTurn.find(({ type, data }) => type === 'assistant/message' &&
+        data.message.content.some(({ type, text }) => type === 'text' && text === preview))
+      const draftEnd = proposed.inTurn.at(-1)
+      assert.equal(admission?.data.target, mode === 'queue' ? 'next-turn' : 'next-step')
+      assert(admission.seq < displayed?.seq && displayed.seq < confirmation.input.seq)
+      assert.equal(draftEnd.type, 'turn/end')
+      assert.equal(draftEnd.data.reason.kind, 'completed')
+      assert.equal(confirmation.input.seq > draftEnd.seq, mode === 'queue')
+      assert.deepEqual(proposed.results[0], { confirmation: 'owner_reply_required', preview })
+      assert.deepEqual(confirmation.results, [required], 'Early ' + mode + ' confirmation must never authorize delivery')
+      assert.equal((await relay(to)).length, 2)
+      assert.equal((await relay(other)).length, 0)
+    } finally {
+      releasePreview.resolve()
+    }
+  }
+
+  await earlyConfirmation('queue')
+  await earlyConfirmation('steer')
+  console.log('PASS owner confirmations admitted before preview via queue and steer produced zero deliveries')
+
   const proposed = await startDraft()
   const previewCode = page.locator('pre').filter({ hasText: '收件窗口 "审核窗口"' }).last()
   await previewCode.waitFor()
@@ -375,7 +415,6 @@ try {
   await wait(to)
   assert.equal((await relay(to)).at(-1).data.content[0].text, '[DSH 会话消息｜发送方 ' + from + ']\n' + draft)
 
-  const required = { error: 'message_authorization_required' }
   assert.deepEqual((await browserSender('确认发送', once(natural()))).results, [required])
   await startDraft()
   assert.deepEqual((await prompt(other, '确认发送', once(natural()))).results, [required])

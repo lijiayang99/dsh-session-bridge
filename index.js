@@ -135,6 +135,18 @@ export function apply(ctx, config) {
   const receiptPath = (key) => join(dir, key + '.json')
   const processingPath = (key) => join(dir, key + '.turn.json')
 
+  function hasEmptyInbox(session) {
+    try {
+      const agent = ctx.agents.get(session.id)
+      if (agent?.session !== session) return false
+      const { nextTurn, nextStep } = agent.inbox ?? {}
+      return Array.isArray(nextTurn) && nextTurn.length === 0 &&
+        Array.isArray(nextStep) && nextStep.length === 0
+    } catch {
+      return false
+    }
+  }
+
   // Only native turn events tied to our exact message ID can settle processing.
   const turns = new Map()
   const drafts = new Map()
@@ -200,8 +212,10 @@ export function apply(ctx, config) {
     if (event.type !== 'turn/end' || event.data.turn !== active.turn) return
     const reason = event.data.reason.kind
     const draft = active.natural?.draft
+    // The host publishes turn/end synchronously before claiming the next turn.
+    // A queued reply can otherwise appear after the preview despite earlier admission.
     if (reason === 'completed' && active.natural?.previewShown && draft.expiresAt > performance.now() &&
-        config.enabled.get() && allowed(draft.payload.to)) {
+        config.enabled.get() && allowed(draft.payload.to) && hasEmptyInbox(session)) {
       drafts.set(session.id, draft)
       setTimeout(() => {
         if (drafts.get(session.id) === draft) drafts.delete(session.id)

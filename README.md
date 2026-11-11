@@ -1,4 +1,4 @@
-# dsh-session-bridge 0.4.5-rc.1
+# dsh-session-bridge 0.4.5-rc.2
 
 适用于 DeepSeek Harness Web 0.2.2-rc.1。全新安装可通过「插件 → 添加插件」输入宿主机可读的包绝对路径并启用。已有版本请先按下文迁移。
 
@@ -67,7 +67,7 @@
 
 标题缺失、同名或正文缺失时，助手会请你用唯一标题和正文重新说明。标题 `审核` 也可用 `审核窗口` 指代。若两种标题在白名单内都存在，先用唯一标题消歧。普通互传每次处理一个收件窗口。
 
-输入 `请拟一条消息发给审核窗口` 或 `把刚才的摘要发给审核窗口` 时，助手在原窗口展示完整草稿。预览包含收件标题和正文，换行与控制字符以可见转义表示。所有者在同一窗口回复 `确认发送` 后，插件按冻结的标题和正文投递。回复 `取消发送`、转入其他话题或超过两分钟未确认都会结束草稿。发送前再次核对窗口标题、白名单和当前轮次。
+输入 `请拟一条消息发给审核窗口` 或 `把刚才的摘要发给审核窗口` 时，助手在原窗口展示完整草稿。预览包含收件标题和正文，换行与控制字符以可见转义表示。预览轮结束且宿主确认没有待处理输入后，草稿才接受确认。所有者等这一轮结束，在同一窗口回复 `确认发送` 即可投递冻结的标题和正文。若预览轮结束时仍有排队输入，需重新提出发送请求。回复 `取消发送`、转入其他话题或超过两分钟未确认都会结束草稿。发送前再次核对窗口标题、白名单和当前轮次。
 
 在发送会话由 DSH 所有者输入 `授权互传 目标会话ID 请求号`，下一行开始写准确正文。助手用 `send_session_message` 按原样发送，从原发送会话用 `session_message_status` 查投递和处理。精确重试只返回已有回执。迁移保留回执内容和去重键。目标轮次正常回复并落盘仅证明处理，项目验收仍要看结构化结果和产物。
 
@@ -85,10 +85,12 @@ npm pack --offline --pack-destination "$lab"
 npm install --prefix "$lab/tools" playwright-core@1.65.0
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/natural-send.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.4.5-rc.1.tgz" \
+  "$lab/local-dsh-session-bridge-0.4.5-rc.2.tgz" \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 bash .github/ci/run.sh
 ```
+
+测试会在模型输出预览前通过原生 `session/prompt` 提交 `queue` 与 `steer` 两种确认，核对入队、预览、确认处理和轮结束的顺序，并验证零投递。正常路径在浏览器显示完整预览且该轮结束后提交确认。
 
 ## 迁移与回退隔离复验
 
