@@ -364,7 +364,7 @@ export function apply(ctx, config) {
 
   ctx.tools.register({
     name: 'send_natural_session_message',
-    description: 'Handle an explicit send request in the current DSH owner prompt, e.g. “给审核窗口发消息：候选已就绪” or “把『候选已就绪』发给审核窗口”. Call with no arguments for exact owner text or the owner reply “确认发送”. Supply draft only when the owner asked to compose, edit or forward contextual text. When the result contains preview, copy its exact text as your entire final reply, preserving spaces and newlines, and wait for the owner. Ask the owner to restate any ambiguous request with a unique session title and the desired content.',
+    description: 'Handle an explicit one-way send in the current DSH owner prompt, e.g. “给审核窗口发消息：候选已就绪” or “把『候选已就绪』发给『合成查询』窗口”. Call with no arguments for exact owner text or the owner reply “确认发送”. Supply draft only when the owner asked to compose, edit or forward contextual text. When the result contains preview, copy its exact text as your entire final reply, preserving spaces and newlines, and wait for the owner. Ask the owner to restate any ambiguous request with a unique session title and the desired content.',
     parameters: {
       type: 'object', additionalProperties: false,
       properties: { draft: { type: 'string', minLength: 1, maxLength: 2000 } },
