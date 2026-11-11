@@ -42,6 +42,7 @@ window.__ModuleLoader__.load({
       close_turn_evidence_unavailable: ['无法核实收口轮正常结束', 'Normal completion of the closeout turn could not be verified'],
       close_continuation_unverified: ['收口轮的结果接续未经核验', 'The closeout turn’s continuation was not verified'],
       aborted: ['宿主轮已中断', 'Host turn was interrupted'],
+      mixed_turn: ['宿主轮收到其他用户或中继输入', 'The host turn received another user or relay input'],
     }
     const dictionaries = {
       zh: {

@@ -70,6 +70,8 @@
 
 待核验的收口请求会冻结新派工，原主控仍可查看状态。同轮精确重试返回原请求，冲突请求会被拒绝。收口轮中断或缺少结束证据时，任务暂停并保留请求记录。原主控所有者核对未决接续后，可用 `继续委托 <任务>` 在新的原生轮请求收口。
 
+固定宿主在轮次内追加的原生时间快照不会改变任务上下文。所有者或中继在同一轮提交额外输入时，暂停该轮的工作流操作，结果接续和收口会保留待核对状态。
+
 ### 原结构化授权
 
 在原主控会话以 DSH 所有者发送一条消息。首行写 `授权委托`，随后写 JSON。以下会话 ID 为合成示例。
@@ -111,22 +113,22 @@ npm pack --offline --pack-destination "$lab"
 npm install --prefix "$lab/tools" playwright-core@1.65.0
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.2.tgz" full \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.3.tgz" full \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.2.tgz" stress
+  "$lab/local-dsh-session-bridge-0.5.0-rc.3.tgz" stress
 for test in collaboration-direct collaboration-recovery collaboration-expiry; do
   unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
     "$(command -v node)" "./test/$test.mjs" "$(command -v dsh)" \
-    "$lab/local-dsh-session-bridge-0.5.0-rc.2.tgz"
+    "$lab/local-dsh-session-bridge-0.5.0-rc.3.tgz"
 done
 bash .github/ci/run.sh
 ```
 
 同布局换包用 `test/collaboration-rollback.mjs <dsh> <固定 0.4.5-rc.2 tgz> <候选 tgz>`，同样在 loopback 命名空间运行。基线包从 `87b06bf9fc8f9b3fc523d0ab227edd9d284c8609` 打包，SHA-256 为 `fb5de752634093c23be783fdf507b86e23ca362250ea787756de09f1e6ff6a91`。
 
-真实模型闭环用 `node ./test/collaboration-pilot.mjs "$(command -v dsh)" "$lab/local-dsh-session-bridge-0.5.0-rc.2.tgz" gpt-6.1-sol`。该脚本使用一次性宿主、合成窗口和文件、loopback 模型适配器，以及已授权的 Codex 模型访问。适配器只传合成任务，并把模型选择交给宿主真实执行的委托工具。
+恢复和真实模型闭环测试在一次性宿主启用逐步时间快照，复验派工、接续重启和收口。真实模型闭环用 `node ./test/collaboration-pilot.mjs "$(command -v dsh)" "$lab/local-dsh-session-bridge-0.5.0-rc.3.tgz" gpt-6.1-sol`。该脚本使用合成窗口和文件、loopback 模型适配器，以及已授权的 Codex 模型访问。适配器只传合成任务，并把模型选择交给宿主真实执行的委托工具。
 
 ### 自然语句隔离复验
 

@@ -63,6 +63,7 @@ async function decide(body, { lab, signal }) {
     'Otherwise choose answer, put {} in inputJson, and put the exact response in text.',
     'If workflow_propose returns preview, copy its complete exact preview string as the entire response, preserving all whitespace.',
     'An ordinary turn may issue tool calls one after another. For a task or result wake, claim or consume before acting.',
+    'The DSH host can attach a time snapshot between steps. Continue using the same owner message or workflow notification and its tool results.',
     'When workflow_close returns closing, finish the native turn with a short reply. The host verifies closeout after the turn ends.',
     'A proposal has user-facing exact window titles. Confirmation returns host-resolved IDs, which are used when dispatching.',
     'Use the supplied conversation, actual tool results, and definitions.',
@@ -111,7 +112,9 @@ async function decide(body, { lab, signal }) {
   }
 }
 
-await withCollaborationHost({ dsh, archive, decide, modelDeadlineMs: 90_000, allowNetwork: true }, async (host) => {
+await withCollaborationHost({
+  dsh, archive, decide, modelDeadlineMs: 150_000, allowNetwork: true, timeRefreshIntervalMs: 0,
+}, async (host) => {
   const started = Date.now()
   await host.createSessions(windows)
   assert.equal(initialized, windows.length)
@@ -123,14 +126,14 @@ await withCollaborationHost({ dsh, archive, decide, modelDeadlineMs: 90_000, all
   }))
   const [initial, repaired] = artifacts
   const request = [
-    '请分派这项任务：让试验开发窗口做候选，试验核查窗口并行核查，试验审核窗口复核。任务用 synthetic-pilot，20 分钟，预算 10 次。',
+    '请分派这项任务：让试验开发窗口做候选，试验核查窗口并行核查，试验审核窗口复核。任务用 synthetic-pilot，40 分钟，预算 10 次。',
     '这是一项合成演练。请把试验审核窗口列入正式审核范围，再展示冻结的委托方案，我确认一次以后继续推进。',
     '确认后请用一个批次并行派两个任务，条目分别叫 produce 和 verify。合成初稿引用 ' + initial.ref + '。核查只回报独立检查。',
     '批次结果齐全后派 review，必须用产出尝试 ID 及其固定引用绑定审核。首次审核结论指定退回。',
     '收到退回后，让试验开发窗口以 produce 第二次尝试交付合成返修稿 ' + repaired.ref + '，再用新的产出 ID 和引用派 review 第二次尝试。',
     '第二次审核指定通过。工作窗口直接用结构化工具回报对应引用。所有结果经过消费后，以通过复审的固定产物收口。不要在中间重复问用户。',
   ].join('\n')
-  const proposal = await host.turn(main, await host.submit(main, request), 180_000)
+  const proposal = await host.turn(main, await host.submit(main, request), 330_000)
   const drafted = proposal.results.find(({ confirmation }) => confirmation === 'owner_reply_required')
   assert(drafted?.preview, 'Real model did not prepare a native workflow plan: ' +
     JSON.stringify({ toolCounts, results: proposal.results }))
@@ -139,18 +142,22 @@ await withCollaborationHost({ dsh, archive, decide, modelDeadlineMs: 90_000, all
   assert(previewShown, 'Real model did not reproduce the exact native preview')
   assert(!host.snapshot(main, task).grant)
   console.log('PASS real model prepared and rendered the exact owner preview')
-  const confirmed = await host.turn(main, await host.submit(main, '确认委托'), 180_000)
+  const confirmed = await host.turn(main, await host.submit(main, '确认委托'), 480_000)
   assert(confirmed.results.some(({ task: named, duplicate }) => named === task && duplicate === false))
   console.log('PASS native owner confirmation enabled the real-model controller')
   const final = await host.until(() => {
     const state = host.snapshot(main, task)
     return state.grant?.state === 'closed' && state
-  }, 'real model completes batch, review, repair and verified closure', 540_000)
+  }, 'real model completes batch, review, repair and verified closure', 1_800_000)
   assert.equal(final.jobs.length, 5)
   assert.deepEqual(final.grant.outcome.finalArtifacts, [repaired.ref])
   assert.equal(final.grant.outcome.status, 'completed')
   assert.equal(final.grant.closure.state, 'committed')
   assert.equal(final.grant.closure.turnEnd.reason, 'completed')
+  const { input, turnEnd } = final.grant.closure
+  const timeSnapshots = (await host.history(main)).filter(({ type, seq, data }) => type === 'user/message' &&
+    seq > input.sequence && seq < turnEnd.sequence && data.source?.kind === 'time-context' && data.source.form === 'snapshot')
+  assert(timeSnapshots.length > 0, 'Expected real host time snapshots within the verified closeout turn')
   assert(final.jobs.some(({ target, report }) => target === verifier && report.status === 'completed'))
   const checks = final.jobs.filter(({ item }) => item === 'review')
   assert.deepEqual(checks.map(({ target, report }) => [target, report.status, report.reviewedArtifact]), [
@@ -163,5 +170,6 @@ await withCollaborationHost({ dsh, archive, decide, modelDeadlineMs: 90_000, all
       item === 'produce' && attempt === index + 1 && report.artifacts.includes(file.ref)))
   }
   console.log('PASS real model isolated DSH natural plan, two-worker batch, review, repair and exact artifact closure',
-    JSON.stringify({ model: modelName, durationMs: Date.now() - started, requests: timings.length, toolCounts }))
+    JSON.stringify({ model: modelName, durationMs: Date.now() - started, requests: timings.length,
+      closeoutTimeSnapshots: timeSnapshots.length, toolCounts }))
 })

@@ -72,6 +72,17 @@ function plainText(message) {
     ? message.content[0].text : undefined
 }
 
+function hostContext(message) {
+  const { source } = message
+  if (source?.kind === 'runtime-context') return true
+  // The fixed Web host's time-context plugin appends a source-attributed
+  // snapshot between steps. Prompt and relay APIs cannot set this source.
+  const section = source?.sections?.[0]
+  return message.role === 'user' && source?.kind === 'time-context' && source.form === 'snapshot' &&
+    Array.isArray(source.sections) && source.sections.length === 1 && section?.name === 'time-context' &&
+    typeof section.text === 'string' && section.text === plainText(message)
+}
+
 function deliveryOf(job, kind) {
   return kind === 'task' ? job.wake : job.resume
 }
@@ -191,25 +202,34 @@ async function hostEvidence(ctx, job, kind, signal) {
   let turn
   let matchedTurn
   let inMatchedTurn = false
+  let inputs = 0
+  let mixedTurn = false
   let endReason
   for (const { type, data } of events) {
     if (type === 'turn/start') {
       turn = data.turn
       inMatchedTurn = false
+      inputs = 0
     }
     if (type === 'agent/inbox/spliced') {
       queues[data.target].splice(data.start, data.removedCount ?? 0, ...data.inserted)
       admissions += data.inserted.filter((message) => isWake(job, kind, message)).length
     }
-    if (type === 'user/message' && isWake(job, kind, data)) {
-      consumptions++
-      if (consumptions === 1) {
-        matchedTurn = turn
-        inMatchedTurn = turn !== undefined
+    if (type === 'user/message' && !hostContext(data)) {
+      inputs++
+      if (isWake(job, kind, data)) {
+        consumptions++
+        if (consumptions === 1) {
+          matchedTurn = turn
+          inMatchedTurn = turn !== undefined
+        }
       }
     }
     if (type === 'turn/end') {
-      if (inMatchedTurn && data.turn === matchedTurn) endReason = data.reason.kind
+      if (inMatchedTurn && data.turn === matchedTurn) {
+        endReason = data.reason.kind
+        mixedTurn = inputs !== 1
+      }
       inMatchedTurn = false
       turn = undefined
     }
@@ -220,6 +240,7 @@ async function hostEvidence(ctx, job, kind, signal) {
     consumptions,
     ...(matchedTurn !== undefined ? { turn: matchedTurn } : {}),
     ...(endReason !== undefined ? { endReason } : {}),
+    ...(mixedTurn ? { mixedTurn } : {}),
   }
 }
 
@@ -230,7 +251,7 @@ function closeTurnEvidence(events, closure, anchor) {
   for (let index = 1; index < events.length; index++) {
     const event = events[index]
     if (event.type === 'turn/start') return
-    if (event.type === 'user/message' && event.data.source?.kind !== 'runtime-context') {
+    if (event.type === 'user/message' && !hostContext(event.data)) {
       const { data, seq } = event
       const matchesSource = anchor ? isWake(anchor, 'result', data)
         : nativeOwner(data) && data.source.rpcId === closure.input.rpcId
@@ -391,7 +412,7 @@ export function applyWorkflow(ctx, config, allowed) {
       if (!turn) return
       if (event.type === 'user/message') {
         const source = event.data.source
-        if (source?.kind === 'runtime-context') return
+        if (hostContext(event.data)) return
         const wake = source?.kind === 'agent-message' ? workflowInput(session, event.data) : undefined
         if (wake) {
           turn.wakes.push(wake)
@@ -1165,12 +1186,14 @@ export function applyWorkflow(ctx, config, allowed) {
       const continuation = stored.resume?.continuation
       if (continuation?.state !== 'started' || continuation.turn !== started.turn) return noChange()
       const exactTurn = evidence?.turn === continuation.turn && evidence.consumptions === 1
-      if (exactTurn && evidence.endReason === 'completed') {
+      if (exactTurn && evidence.endReason === 'completed' && !evidence.mixedTurn) {
         continuation.state = 'verified'
       } else {
         continuation.state = 'interrupted'
         continuation.phase = continuation.dispatches.length ? 'after_dispatch' : 'before_dispatch'
-        continuation.reason = exactTurn ? evidence.endReason ?? 'turn_end_not_proven' : 'turn_evidence_unavailable'
+        continuation.reason = !exactTurn ? 'turn_evidence_unavailable'
+          : evidence.endReason === 'completed' && evidence.mixedTurn ? 'mixed_turn'
+            : evidence.endReason ?? 'turn_end_not_proven'
       }
       continuation.settledAt = Date.now()
       return success()

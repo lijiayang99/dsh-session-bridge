@@ -31,12 +31,13 @@ export function latestPrompt(messages, matches) {
         results: following.filter(({ type }) => type === 'tool_result').map(({ content }) => unpack(content)),
       }
     }
-    if (content.some(({ type, text }) => type === 'text' && !text.startsWith('Current runtime context') && !text.startsWith('<'))) return
+    if (content.some(({ type, text }) => type === 'text' && !text.startsWith('Current runtime context') &&
+      !text.startsWith('Time sampled while preparing turn ') && !text.startsWith('<'))) return
   }
 }
 
 export async function withCollaborationHost({
-  dsh, archive, bootstrap = archive, decide, modelDeadlineMs = 15_000, allowNetwork = false,
+  dsh, archive, bootstrap = archive, decide, modelDeadlineMs = 15_000, allowNetwork = false, timeRefreshIntervalMs,
 }, run) {
   if (!allowNetwork) {
     assert(Object.values(networkInterfaces()).flat().every(({ internal }) => internal),
@@ -113,7 +114,13 @@ export async function withCollaborationHost({
     while (Date.now() < deadline) {
       if (modelError) throw modelError
       if (host && (host.exitCode !== null || host.signalCode !== null)) throw new Error('Isolated DSH stopped: ' + description)
-      const result = await read()
+      let result
+      try {
+        result = await read()
+      } catch (error) {
+        // After a crash, a read-only probe can race recovery of the SQLite journal.
+        if (error.code !== 'ERR_SQLITE_ERROR' || ![5, 6].includes(error.errcode)) throw error
+      }
       if (result) return result
       await delay(100)
     }
@@ -136,7 +143,21 @@ export async function withCollaborationHost({
       }
     }
     await mkdir(work, { recursive: true, mode: 0o700 })
-    await writeFile(join(dshHome, 'cordis.patch.yml'), '- id: session-title-llm\n  disabled: true\n')
+    const patch = ['- id: session-title-llm', '  disabled: true']
+    if (timeRefreshIntervalMs !== undefined) patch.push(
+      '- insert:',
+      '    - id: preset-synthetic-frequent-time',
+      "      name: '@deepseek-ai/dsh-agent-preset'",
+      '      config:',
+      '        id: synthetic-frequent-time',
+      '        order: 99',
+      '        plugins:',
+      '          - id: time-context',
+      "            name: '@deepseek-ai/dsh-time-context'",
+      '            config:',
+      '              refreshIntervalMs: ' + timeRefreshIntervalMs,
+    )
+    await writeFile(join(dshHome, 'cordis.patch.yml'), patch.join('\n') + '\n')
     host = spawn(process.execPath, [cli, '--profile', 'web', '--no-open', '--host', '127.0.0.1', '--port', '0'],
       { env, cwd: work, stdio: ['ignore', 'pipe', 'pipe'] })
     let output = ''
@@ -259,6 +280,10 @@ export async function withCollaborationHost({
     for (const [sessionId, title] of rows) {
       const created = await rpc('session/create', { request: { sessionId, workspaceId: workspace } })
       assert.equal(created.sessionId, sessionId)
+      if (timeRefreshIntervalMs !== undefined) {
+        const agentPreset = 'synthetic-frequent-time'
+        assert.equal(await rpc('agentPresets/select', { agentId: sessionId, agentPreset }), agentPreset)
+      }
       await prompt(sessionId, '初始化合成窗口 ' + title)
       const renamed = await rename(sessionId, title)
       assert.equal(renamed.title, title)

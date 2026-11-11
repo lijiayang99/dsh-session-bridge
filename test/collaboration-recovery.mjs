@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { latestPrompt, tool, withCollaborationHost } from './collaboration-host.mjs'
 
@@ -89,9 +91,9 @@ async function decide(body, { signal }) {
   await waitUntil(() => false, signal)
 }
 
-async function runPrompt(host, text, plan) {
+async function runPrompt(host, text, plan, session = owner) {
   ownerPlans.set(text, plan)
-  try { return await host.prompt(owner, text) } finally { ownerPlans.delete(text) }
+  try { return await host.prompt(session, text) } finally { ownerPlans.delete(text) }
 }
 
 async function authorize(host, test) {
@@ -171,10 +173,14 @@ async function waitClosed(host, task) {
   assert.equal(closure.turnEnd.reason, 'completed')
   assert.equal(closed.grant.closedAt, closure.turnEnd.time)
   assert.equal(closed.grant.closedTurn, closure.turn)
-  const end = (await host.history(owner)).find(({ seq }) => seq === closure.turnEnd.sequence)
+  const events = await host.history(owner)
+  const end = events.find(({ seq }) => seq === closure.turnEnd.sequence)
   assert.equal(end?.type, 'turn/end')
   assert.equal(end.data.turn, closure.turn)
   assert.equal(end.data.reason.kind, 'completed')
+  assert(events.some(({ type, seq, data }) => type === 'user/message' &&
+    seq > closure.input.sequence && seq < end.seq && data.source?.kind === 'time-context' &&
+    data.source.form === 'snapshot'), 'Native time snapshots must be present between closeout steps')
   return closed
 }
 
@@ -270,6 +276,85 @@ async function stopPendingClose(host, expire) {
   assert.equal(host.snapshot(owner, task).grant.outcome, undefined)
   assert.deepEqual(await nativeWakeIds(host, owner, 'result', anchor.id), [anchor.resume.id])
   console.log('PASS ' + state + ' grant cannot commit a pending close after normal native turn end and restart')
+}
+
+async function installRelayFixture(host) {
+  const folder = join(host.lab, 'synthetic-closeout-relay')
+  const name = '@local/dsh-bridge-closeout-relay-fixture'
+  await mkdir(folder)
+  await writeFile(join(folder, 'package.json'), JSON.stringify({
+    name, version: '0.0.0', private: true, type: 'module', exports: { '.': './index.js' },
+    dsh: { bundle: { patch: './cordis.patch.yml' } }, engines: { dsh: '0.2.2-rc.1' },
+  }))
+  await writeFile(join(folder, 'cordis.patch.yml'),
+    '- insert:\n    - id: bridge-closeout-relay-fixture\n      name: ' + JSON.stringify(name) + '\n')
+  await writeFile(join(folder, 'index.js'), `
+    import { randomUUID } from 'node:crypto'
+    export const inject = ['agents', 'tools']
+    export function apply(ctx) {
+      ctx.tools.register({
+        name: 'collaboration_fixture_steer_relay',
+        description: 'Place synthetic relay text into the next step of an active native turn.',
+        parameters: { type: 'object', required: ['target', 'text'],
+          properties: { target: { type: 'string' }, text: { type: 'string' } } },
+        output: { schema: { type: 'object', additionalProperties: true },
+          render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+        execute({ target, text }, exec) {
+          const id = randomUUID()
+          ctx.agents.get(target).steer({
+            id, role: 'user', content: [{ type: 'text', text }],
+            source: { kind: 'agent-message', form: 'relay', senderSessionId: exec.agent.session.id },
+          })
+          return { id }
+        },
+      })
+    }
+  `)
+  await host.install(folder, name)
+}
+
+async function rejectLookalikeTimeInput(host, relay) {
+  const task = 'synthetic-close-counterfeit-time-' + (relay ? 'relay' : 'owner')
+  const { test, anchor, pending } = await holdClose(host, task)
+  const snapshot = (await host.history(owner)).find(({ seq, type, data }) => seq > pending.input.sequence &&
+    type === 'user/message' && data.source?.kind === 'time-context' && data.source.form === 'snapshot')
+  assert(snapshot, 'Need native text to use as a counterfeit owner input')
+  const text = snapshot.data.content[0].text
+  let sourceKind
+  if (relay) {
+    const sent = await runPrompt(host, '在下一步注入合成中继。', (results) => results.length ? undefined
+      : tool('collaboration_fixture_steer_relay', { target: owner, text }), worker)
+    const id = sent.results[0]?.id
+    assert(id)
+    test.releaseClose = true
+    await host.idle(owner)
+    const events = await host.history(owner)
+    const received = events.find(({ type, data }) => type === 'user/message' && data.id === id)
+    const end = events.find(({ type, data }) => type === 'turn/end' && data.turn === pending.turn)
+    assert(received?.seq > pending.input.sequence && received.seq < end.seq)
+    assert.equal(received.data.source.senderSessionId, worker)
+    assert.equal(end.data.reason.kind, 'completed')
+    sourceKind = received.data.source.kind
+  } else {
+    const message = await host.submit(owner, text, 'steer')
+    test.releaseClose = true
+    const turn = await host.turn(owner, message)
+    assert.equal(turn.end.data.turn, pending.turn)
+    assert.equal(turn.end.data.reason.kind, 'completed')
+    sourceKind = turn.input.data.source.kind
+  }
+  assert.equal(sourceKind, relay ? 'agent-message' : 'user')
+  const mixed = await host.until(() => {
+    const state = host.snapshot(owner, task)
+    return state.grant?.closure?.state === 'interrupted' && state
+  }, 'a source-attributed owner message with identical text blocks mixed closeout')
+  assert.equal(mixed.grant.outcome, undefined)
+  assert.equal(anchorOf(mixed).resume.continuation.reason, 'mixed_turn')
+  await restart(host)
+  assert.deepEqual(host.snapshot(owner, task), mixed)
+  assert.deepEqual(await nativeWakeIds(host, owner, 'result', anchor.id), [anchor.resume.id])
+  console.log('PASS native time snapshots permit closeout; identical text from ' +
+    (relay ? 'a relay' : 'an owner') + ' still interrupts mixed closeout')
 }
 
 async function recoverBatch(host, task, dispatch) {
@@ -421,13 +506,16 @@ async function cancelWithLateReport(host) {
   console.log('PASS native cancellation skips queued sibling, records late report once and blocks restart or redispatch')
 }
 
-await withCollaborationHost({ dsh, archive, decide, modelDeadlineMs: 80_000 }, async (host) => {
+await withCollaborationHost({ dsh, archive, decide, modelDeadlineMs: 80_000, timeRefreshIntervalMs: 0 }, async (host) => {
   await host.createSessions(Object.entries(titles))
   await host.save({ enabled: false, workflowEnabled: true, allowedSessions: [owner, worker, child] })
+  await installRelayFixture(host)
   await normalClose(host, false)
   await normalClose(host, true)
   await interruptClose(host, false)
   await interruptClose(host, true)
+  await rejectLookalikeTimeInput(host, false)
+  await rejectLookalikeTimeInput(host, true)
   await stopPendingClose(host, false)
   await recoverBatch(host, 'synthetic-consume-recovery', false)
   await recoverBatch(host, 'synthetic-dispatch-recovery', true)
