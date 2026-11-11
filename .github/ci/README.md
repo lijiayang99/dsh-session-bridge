@@ -17,3 +17,5 @@ The launcher clears the environment and creates temporary HOME and XDG directori
 Native Web installation, browser UI, actual host authentication and durable queues, version migration, rollback and real model behavior have separate integration evidence.
 
 The 0.5.0 collaboration cases run against the product and CI combination tree. They drive the registered tools with exact and modified previews, queued and non-owner confirmations, same-window claims, batch retries, and mismatched artifact references. The interrupted-close case verifies that a result turn without completion or reconciliation cannot leave a completed task in the durable ledger. Run the full suite with the launcher above.
+
+The closeout cases cover dispatch and duplicate requests while closeout is pending, cancellation and expiry before turn completion, and restart with or without durable turn completion. They check the first closeout payload, preserve the committed downstream attempt, and exercise explicit owner reconciliation before success.

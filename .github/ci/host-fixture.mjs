@@ -57,7 +57,7 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
   const records = new Map()
   const turns = new Map()
   const emit = (agent, type, data) => {
-    const event = { type, data, seq: ++agent.session.seq }
+    const event = { type, data, seq: ++agent.session.seq, time: Date.now() }
     records.get(agent.session.id).push(event)
     for (const listen of listeners) listen(agent.session, event)
   }
@@ -109,7 +109,7 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
       open: async id => ({
         read: async (from, limit) => {
           await faults.read?.(id)
-          return { events: records.get(id).filter(event => event.seq > from).slice(0, limit) }
+          return { events: records.get(id).filter(event => event.seq >= from).slice(0, limit) }
         },
         close: async () => {},
       }),

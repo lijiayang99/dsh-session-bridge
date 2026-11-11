@@ -28,12 +28,14 @@ async function collaborationHost(t) {
   return host
 }
 
-async function prepare(host) {
-  host.begin(main, proposalInput)
-  const result = await host.call(main, 'workflow_propose', proposal)
+async function prepare(host, plan = proposal, input = proposalInput) {
+  host.begin(main, input)
+  const result = await host.call(main, 'workflow_propose', plan)
   assert.equal(result.confirmation, 'owner_reply_required', JSON.stringify(result))
-  assert(result.preview.includes('任务预算 3 次派工'))
-  for (const title of [workerTitle, reviewerTitle, auditorTitle]) assert(result.preview.includes(title))
+  assert(result.preview.includes('任务预算 ' + plan.budget + ' 次派工'))
+  for (const { windows } of plan.scopes) {
+    for (const title of windows) assert(result.preview.includes(title))
+  }
   return result.preview
 }
 
@@ -44,6 +46,18 @@ const completed = (host, name = task, refs) => host.call(main, 'workflow_close',
   ...(refs ? { finalArtifacts: refs } : {}),
 })
 const consume = (host, id) => host.call(main, 'workflow_consume', { id })
+
+const closeRequest = (name, duplicate = false) => ({ task: name, state: 'closing', duplicate })
+const waitForClosure = (host, state, name = task) => until(async () => {
+  const current = await status(host, name)
+  return current.closure?.state === state && current
+}, 'Expected ' + state + ' closeout')
+
+async function waitClosed(host, name = task) {
+  const snapshot = await waitForClosure(host, 'committed', name)
+  assert.equal(snapshot.state, 'closed')
+  return snapshot
+}
 
 async function waitForContinuation(host, name, id, state) {
   return until(async () => {
@@ -226,9 +240,11 @@ test('batch waits once, preserves membership and budget, and closes only with it
   host.begin(main, '继续委托 ' + task)
   await waitForContinuation(host, task, reviewJob.id, 'verified')
   assert.equal((await completed(host, task, [wrongArtifact])).error, 'artifact_binding_required')
-  const closed = await completed(host, task, [artifact])
-  assert.equal(closed.state, 'closed')
-  assert.deepEqual(closed.outcome.finalArtifacts, [artifact])
+  assert.deepEqual(await completed(host, task, [artifact]), closeRequest(task))
+  assert.equal((await status(host)).outcome, undefined)
+  host.end(main)
+  host.begin(main, 'Read the audited synthetic closeout.')
+  assert.deepEqual((await waitClosed(host)).outcome.finalArtifacts, [artifact])
   assert.equal(host.deliveries.filter(({ target }) => target === main).length, 2)
   host.end(main)
 })
@@ -249,7 +265,7 @@ for (const interrupted of [false, true]) {
     assert.equal((await host.receive(main)).source.bridgeWorkflowId, opened.id)
     assert.equal((await consume(host, opened.id)).duplicate, false)
 
-    await completed(host, opened.task)
+    const requested = await completed(host, opened.task)
     // Interrupt before the controller can finish its result turn.
     host.end(main, interrupted ? 'aborted' : 'completed')
     await host.restart()
@@ -262,12 +278,207 @@ for (const interrupted of [false, true]) {
       assert.notEqual(snapshot.state, 'closed', 'An interrupted and unreconciled result was marked closed')
       assert.notEqual(snapshot.outcome?.status, 'completed')
     } else {
-      const closed = await until(async () => {
-        const current = await status(host, opened.task)
-        return current.state === 'closed' && current
-      }, 'Expected closeout after the original result turn completed')
-      assert.equal(closed.outcome?.status, 'completed')
+      assert.equal((await waitClosed(host, opened.task)).outcome?.status, 'completed')
     }
+    assert.deepEqual(requested, closeRequest(opened.task))
     host.end(main)
   })
 }
+
+const firstAssignment = assignment('initial', worker)
+const downstreamAssignment = assignment('downstream', reviewer)
+const dispatchForClose = (host, input) => host.call(main, 'workflow_dispatch', { task, ...input })
+
+async function openCloseout(host, ttlMinutes = 5) {
+  const plan = { ...proposal, ttlMinutes, scopes: [proposal.scopes[0]] }
+  const input = '请分派任务：让合成开发窗口制作候选，再让合成核查窗口核查。'
+  host.reply(main, await prepare(host, plan, input))
+  host.end(main)
+  assert.deepEqual(host.deliveries, [])
+  host.begin(main, '确认委托')
+  assert.equal((await confirm(host)).duplicate, false)
+  const first = await dispatchForClose(host, firstAssignment)
+  assert.equal(first.duplicate, false, JSON.stringify(first))
+  host.end(main)
+  await reportAndConsume(host, worker, first.id)
+  return first.id
+}
+
+async function reportAndConsume(host, target, id) {
+  const lease = await claim(host, target, id)
+  assert.equal((await report(host, target, lease)).recorded, true)
+  host.end(target)
+  assert.equal((await host.receive(main)).source.bridgeWorkflowId, id)
+  assert.equal((await consume(host, id)).duplicate, false)
+}
+
+const wakeIds = host => host.deliveries.map(({ message }) => message.id)
+
+function assertUnclosed(snapshot) {
+  assert.equal(snapshot.error, undefined, JSON.stringify(snapshot))
+  assert.notEqual(snapshot.state, 'closed', 'Closeout must wait for the required result evidence')
+  assert.notEqual(snapshot.outcome?.status, 'completed')
+}
+
+test('a pending closeout freezes new work and duplicate requests, then settles once on completed turn evidence', async t => {
+  const host = await collaborationHost(t)
+  const id = await openCloseout(host)
+  const originalWakes = wakeIds(host)
+
+  const accepted = await completed(host)
+  const pending = await status(host)
+  assertUnclosed(pending)
+  assert.deepEqual(accepted, closeRequest(task))
+  assert.equal(pending.state, 'closing')
+  assert.equal(pending.closure.state, 'pending')
+  assert.deepEqual(await completed(host), closeRequest(task, true))
+  assert.deepEqual(await host.call(main, 'workflow_close', {
+    task, outcome: 'failed', summary: 'Conflicting synthetic closeout.',
+  }), { error: 'close_conflict' })
+  const single = await dispatchForClose(host, downstreamAssignment)
+  assert.equal(typeof single.error, 'string', 'A closeout in progress must fence single dispatch')
+  const batch = await host.call(main, 'workflow_dispatch_batch', {
+    task, batch: 'while-closing', completion: 'A synthetic assignment while closing.',
+    assignments: [downstreamAssignment],
+  })
+  assert.equal(typeof batch.error, 'string', 'A closeout in progress must fence batch dispatch')
+  const unchanged = await status(host)
+  assertUnclosed(unchanged)
+  assert.deepEqual(unchanged.closure, pending.closure)
+  assert.deepEqual(wakeIds(host), originalWakes)
+
+  host.end(main)
+  await host.restart()
+  host.begin(main, 'Read the successful closeout.')
+  const closed = await waitClosed(host)
+  assert.equal(closed.closure.state, 'committed')
+  assert.equal(closed.closure.turnEnd.reason, 'completed')
+  assert.equal(closed.closedAt, closed.closure.turnEnd.time)
+  assert.equal(closed.outcome?.status, 'completed')
+  assert.equal(closed.outcome?.summary, 'Verified the synthetic result.')
+  assert.deepEqual(closed.jobs.map(job => job.id), [id])
+  const closedAt = closed.closedAt
+  assert(Number.isFinite(closedAt))
+  host.end(main)
+
+  await host.restart()
+  host.begin(main, '继续委托 ' + task)
+  await completed(host)
+  const readback = await status(host)
+  assert.equal(readback.state, 'closed')
+  assert.equal(readback.closedAt, closedAt)
+  assert.deepEqual(readback.outcome, closed.outcome)
+  assert.deepEqual(wakeIds(host), originalWakes)
+  host.end(main)
+})
+
+for (const terminalState of ['cancelled', 'expired']) {
+  test('pending closeout cannot report success after ' + terminalState + ' even if the result turn completes', async t => {
+    const host = await collaborationHost(t)
+    const now = Date.now
+    let elapsed = 0
+    t.mock.method(Date, 'now', () => now() + elapsed)
+    const id = await openCloseout(host, 1)
+    const originalWakes = wakeIds(host)
+
+    const accepted = await completed(host)
+    if (terminalState === 'cancelled') host.appendInput(main, '取消委托 ' + task)
+    else elapsed = 61_000
+    host.end(main)
+
+    await host.restart()
+    host.begin(main, 'Inspect the stopped synthetic closeout.')
+    await waitForContinuation(host, task, id, 'verified')
+    const snapshot = await waitForClosure(host, terminalState)
+    assert.equal(snapshot.state, terminalState)
+    assertUnclosed(snapshot)
+    assert.deepEqual(accepted, closeRequest(task))
+    assert.equal(snapshot.closure.state, terminalState)
+    assert.deepEqual(wakeIds(host), originalWakes)
+    host.end(main)
+  })
+}
+
+test('restart without turn end preserves closeout uncertainty and the exact committed downstream attempt', async t => {
+  const host = await collaborationHost(t)
+  const first = await openCloseout(host)
+  const downstream = await dispatchForClose(host, downstreamAssignment)
+  assert.equal(downstream.duplicate, false, JSON.stringify(downstream))
+  host.end(main)
+  await reportAndConsume(host, reviewer, downstream.id)
+  await waitForContinuation(host, task, first, 'verified')
+  const accepted = await completed(host)
+  const originalWakes = wakeIds(host)
+
+  // The durable result was consumed, but the host did not record turn/end.
+  await host.restart()
+  host.begin(main, '继续委托 ' + task)
+  const { snapshot, continuation } = await waitForContinuation(host, task, downstream.id, 'interrupted')
+  assert.equal(continuation.reconciliation, undefined)
+  assertUnclosed(snapshot)
+  assert.deepEqual(accepted, closeRequest(task))
+  const interrupted = await waitForClosure(host, 'interrupted')
+  assert.equal(interrupted.closure.turnEnd, undefined)
+  const original = snapshot.jobs.find(job => job.id === first)
+  assert.deepEqual(original.continuation.continuation.dispatches, [downstream.id])
+  host.end(main)
+  host.begin(main, '继续委托 ' + task)
+  assert.deepEqual(await dispatchForClose(host, downstreamAssignment), { id: downstream.id, duplicate: true })
+  assert.deepEqual(await completed(host), { error: 'successful_attempts_required' })
+  host.end(main)
+
+  host.begin(main, '对账委托 ' + task + ' ' + downstream.id + ' result\n已核对合成结果和派工记录。')
+  const reconciled = await status(host)
+  const record = reconciled.jobs.find(job => job.id === downstream.id).continuation.continuation
+  assert.equal(record.reconciliation?.decision, 'reviewed_without_replay')
+  assert.equal(record.reconciliation?.owner, main)
+  host.end(main)
+
+  host.begin(main, '继续委托 ' + task)
+  assert.deepEqual(await completed(host), closeRequest(task))
+  host.end(main)
+  host.begin(main, 'Read the reconciled synthetic closeout.')
+  const closed = await waitClosed(host)
+  assert.equal(closed.outcome.status, 'completed')
+  assert.deepEqual(closed.previousClosure, interrupted.closure)
+  assert.deepEqual(wakeIds(host), originalWakes)
+  host.end(main)
+})
+
+test('restart can recover a durably completed closeout whose exact turn ended before expiry', async t => {
+  const host = await collaborationHost(t)
+  const now = Date.now
+  let elapsed = 0
+  t.mock.method(Date, 'now', () => now() + elapsed)
+  await openCloseout(host, 1)
+  assert.deepEqual(await completed(host), closeRequest(task))
+  const pending = await status(host)
+  host.end(main)
+  elapsed = 61_000
+  await host.restart()
+
+  host.begin(main, 'Read the timely completed synthetic closeout.')
+  const closed = await waitClosed(host)
+  assert(Date.now() > pending.expiresAt)
+  assert(closed.closure.turnEnd.time < pending.expiresAt)
+  assert.deepEqual(closed.outcome, pending.closure.requestedOutcome)
+  assert.equal(host.deliveries.length, 2)
+  host.end(main)
+})
+
+test('a different input in the pending closeout turn prevents automatic success', async t => {
+  const host = await collaborationHost(t)
+  const id = await openCloseout(host)
+  assert.deepEqual(await completed(host), closeRequest(task))
+  host.appendInput(main, 'Handle a different synthetic request in this turn.')
+  host.end(main)
+  await host.restart()
+  host.begin(main, 'Read the synthetic mixed closeout.')
+  await waitForContinuation(host, task, id, 'verified')
+  const snapshot = await waitForClosure(host, 'interrupted')
+  assertUnclosed(snapshot)
+  assert.equal(snapshot.state, 'paused')
+  assert.equal(snapshot.closure.reason, 'close_turn_evidence_unavailable')
+  assert.equal(host.deliveries.length, 2)
+  host.end(main)
+})
