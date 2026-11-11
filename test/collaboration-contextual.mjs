@@ -20,6 +20,9 @@ const goal = '今天干了啥'
 const none = '你想问哪个窗口、问什么？'
 const multiple = '当前会话组里有多个窗口使用这个短号。你指哪个？请回完整标题。'
 const noGoal = '窗口已找到。你想问什么？'
+const naturalReply = '你今天为什么没完成审核？'
+const mixedAction = '帮我问问02窗口，插件还有哪些坑？把结果发给03窗口。今天能处理吗？'
+const withdrawn = '你给「02-合成查询」窗口问他今天干了啥，算了。'
 const changed = '窗口或工作区发生了变化。现在想问哪个窗口？请回完整标题。'
 const resultText = '合成查询已回报今天的进展。'
 const marker = /^DSH-WORKFLOW TASK ([a-f0-9-]+)$/
@@ -198,7 +201,7 @@ await withCollaborationHost({ dsh, archive, decide, timeRefreshIntervalMs: 0 }, 
 
     const partial = await host.prompt(owner, '问一下02')
     await waitNotice(host, partial, noGoal)
-    await verifyDispatch(host, '插件还有哪些坑？', '插件还有哪些坑？', [partial])
+    await verifyDispatch(host, naturalReply, naturalReply, [partial])
     const isolated = await host.prompt(owner, followup)
     await waitNotice(host, isolated, none)
     const named = await host.prompt(owner, '是「' + title + '」')
@@ -208,6 +211,9 @@ await withCollaborationHost({ dsh, archive, decide, timeRefreshIntervalMs: 0 }, 
   })
 
   const before = (await tasks(host)).length
+  const withdrawnTool = await withPlan(host, owner, withdrawn, 'workflow_delegate_direct', {})
+  assert.deepEqual(withdrawnTool.results, [{ error: 'workflow_direct_owner_request_required' }])
+  assert.equal((await tasks(host)).length, before)
   const toolProbe = await withPlan(host, owner, topic, 'workflow_delegate_direct', {})
   assert.deepEqual(toolProbe.results, [{ state: 'waiting_for_owner_request' }])
   assert.equal((await tasks(host)).length, before)
@@ -227,7 +233,9 @@ await withCollaborationHost({ dsh, archive, decide, timeRefreshIntervalMs: 0 }, 
   }
   for (const example of ['示例：' + combined, '「' + combined + '」', '他说：' + combined,
     '别' + combined, combined + '，再发给03', '帮我问问02窗口，插件还有哪些坑？然后发给03？',
-    '帮我问问02窗口，插件还有哪些坑，先别问了？', '你给02这个窗口问他插件还有哪些坑，算了。']) {
+    '帮我问问02窗口，插件还有哪些坑，先别问了？', '你给02这个窗口问他插件还有哪些坑，算了。',
+    withdrawn, mixedAction, '帮我问问02窗口，插件还有哪些坑？先别问了。你给我看看日志行吗？',
+    '你给「02-合成查询」窗口问他插件还有哪些坑？把结果发给03窗口。']) {
     await host.prompt(owner, example)
   }
 
@@ -262,12 +270,17 @@ await withCollaborationHost({ dsh, archive, decide, timeRefreshIntervalMs: 0 }, 
   await waitNotice(host, await host.prompt(owner, followup), none)
   assert.equal((await tasks(host)).length, before)
 
-  const send = '给「' + title + '」窗口发消息：' + combined
+  const send = '给「' + title + '」窗口发消息：' + mixedAction
   const ordinary = await withPlan(host, owner, send, 'send_natural_session_message', {})
   assert.equal(ordinary.results[0]?.delivery, 'delivered')
   await host.idle(worker)
+  assert((await host.history(worker)).some(({ type, data }) => type === 'user/message' &&
+    data.id === ordinary.results[0].messageId && textOf(data).endsWith(mixedAction)))
   assert.equal((await tasks(host)).length, before)
 
-  await verifyDispatch(host, '把『核对合成数据』委托给『' + title + '』', '核对合成数据', [], null)
+  await verifyDispatch(host, '你给「' + title + '」窗口问他插件为什么会把结果发给03窗口？',
+    '插件为什么会把结果发给03窗口？', [], null)
+  const literal = '逐字核对合成示例：今天干了啥，算了。'
+  await verifyDispatch(host, '把『' + literal + '』委托给『' + title + '』', literal, [], null)
   console.log('PASS restart discards context and explicit ordinary messaging and old direct delegation keep their native routes')
 })

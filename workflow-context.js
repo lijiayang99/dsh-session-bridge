@@ -14,19 +14,85 @@ const referenceQuestion = new RegExp('^' + askPerson + '[ \\t]*(' + status + ')'
 const directed = new RegExp('^' + ask + '[ \\t]*(' + title + ')(?:[ \\t]*[：:]?[ \\t]*(' + status + '))?' + ending, 'u')
 const reference = new RegExp('^' + askPerson + ending, 'u')
 const replyTitle = new RegExp('^(?:(?:是|就是|窗口是)[ \\t]*[：:]?[ \\t]*)?(' + title + ')' + ending, 'u')
-const replyQuestion = new RegExp('^(?:' + askPerson + '[ \\t]*[：:]?[ \\t]*)?(' + status + ')' + ending, 'u')
+const replyQuestion = new RegExp('^' + askPerson + '[ \\t]*[：:]?[ \\t]*(' + status + ')' + ending, 'u')
+const bareQuestion = new RegExp('^(?:你(?:们)?[ \\t]*)?' + status + ending, 'u')
 const statedQuestion = /^(?:问题是[ \t]*[：:]?[ \t]*|问(?:他|她|它|对方)[ \t]*[：:][ \t]*)([^\r\n]{1,2000})$/u
 const quotedTitle = /^(?:「([^」]+)」|『([^』]+)』|“([^”]+)”)$/u
 const numeric = /^([0-9]{1,3})(?:号)?(?:窗口)?$/u
 const unsafeTitle = /[和与及或跟]|^(?:我|你|他|她|它|对方|那边|另一个|其他|取消|算了|不用问了|先别问了?|取消委托)$/u
-const withdrawal = /(?:^|[，,。；;？！!?])[ \t]*(?:算了|取消(?:委托)?|(?:先)?(?:别|不用|不要|不)问(?:他|她|它|对方)?(?:了)?)[ \t]*[。？！!?]*$/u
+const withdrawal = /^(?:算了|取消(?:委托)?|(?:先)?(?:别|不用|不要|不)问(?:他|她|它|对方)?(?:了)?)$/u
+const requestCourtesy = /^(?:请你|请|麻烦你|麻烦|帮我|你)[ \t]*/u
+const continuationLead = /^(?:再|然后|顺便|顺手|另外|同时|并且|接着|随后|接下来|最后|完成后|结束后|拿到(?:结果|回报|回复)后|记得)[ \t]*[：:]?[ \t]*/u
+const routed = '(?:发(?:送)?(?:给|到)|转(?:发|交|给)|交(?:给|由)|递给|委托给|派(?:给|发给)|(?:分配|分发|安排|指派|交办)给|回(?:传|复|报)给)'
+const followupTarget = '(?:' + title + '(?:窗口|会话)|[0-9]{1,3}(?:号)?|「[^」]{1,160}」|『[^』]{1,160}』|“[^”]{1,160}”)'
+const routingAction = new RegExp('^(?:' +
+  '(?:把|将).{1,160}?' + routed +
+  '|(?:(?:结果|答案|回报|报告|摘要|结论|资料|消息|回复|产物)[ \\t]*)?(?:' + routed +
+  '|发送|委托|派工|派发|指派|分派|分配|分发|交办|安排|告诉)' +
+  '|给.{1,160}?(?:发(?:送)?(?:消息)?|说|留言)' +
+  '|(?:让|' + ask + ')[ \\t]*' + followupTarget +
+  ')[ \\t]*\\S', 'u')
+const quotedEnd = new Map([['「', '」'], ['『', '』'], ['“', '”'], ['‘', '’'], ['"', '"'], ['`', '`']])
+const separators = new Set('，,。；;？！!?\r\n')
 
-export const withdrawsQuestion = (text) => withdrawal.test(text)
+function independentClauses(text) {
+  const clauses = []
+  const quotes = []
+  let start = 0
+  const add = (end) => {
+    const clause = text.slice(start, end).trim()
+    if (clause) clauses.push(clause)
+  }
+  for (let i = 0; i < text.length; i++) {
+    const character = text[i]
+    const closing = quotes.at(-1)
+    if (closing === '"' || closing === '`') {
+      if (character === '\\') i++
+      else if (character === closing) quotes.pop()
+    } else if (character === closing) {
+      quotes.pop()
+    } else if (quotedEnd.has(character)) {
+      quotes.push(quotedEnd.get(character))
+    } else if (!closing && (separators.has(character) || character === '.' &&
+        (i === text.length - 1 || /\s/u.test(text[i + 1])))) {
+      add(i)
+      start = i + 1
+    }
+  }
+  if (quotes.length) return
+  add(text.length)
+  return clauses
+}
+
+function additionalAction(clause) {
+  let action = clause
+  let continued = false
+  for (;;) {
+    const continuation = continuationLead.exec(action)
+    const prefix = continuation ?? requestCourtesy.exec(action)
+    if (!prefix) break
+    continued ||= Boolean(continuation)
+    action = action.slice(prefix[0].length)
+  }
+  return routingAction.test(action) || continued && /^(?:发|转|问|派|委托|让|给|告诉)/u.test(action)
+}
+
+function withdrawsQuestion(text) {
+  return independentClauses(text)?.some((clause) => withdrawal.test(clause))
+}
+
+export function directQuestionInScope(text) {
+  const clauses = independentClauses(text)
+  return Boolean(clauses?.length) && !clauses.some((clause) => withdrawal.test(clause)) &&
+    (clauses.length === 1 || !clauses.some(additionalAction))
+}
 
 function clearQuestion(value) {
-  return typeof value === 'string' && value.length <= 2000 && /[\p{L}\p{N}]/u.test(value) &&
-    !/[「」『』“”`\r\n]/u.test(value) && !/^(?:['"]|例如|比如|示例|引用|转述|转发|他[说问]|她[说问]|对方说)/u.test(value) && !withdrawsQuestion(value) &&
-    !/(?:^|[，,。；;？！!?])[ \t]*(?:再|然后|顺便|另外|同时)(?:发|转|问|派|委托|让|给|告诉)/u.test(value)
+  if (typeof value !== 'string' || value.length > 2000 || !/[\p{L}\p{N}]/u.test(value)) return false
+  const question = value.trim()
+  return !/[「」『』“”`\r\n]/u.test(question) &&
+    !/^(?:['"]|例如|比如|示例|引用|转述|转发|他[说问]|她[说问]|对方说)/u.test(question) &&
+    directQuestionInScope(question)
 }
 
 function selector(value) {
@@ -39,7 +105,8 @@ function selector(value) {
 }
 
 export function contextualRequest(text, prior) {
-  const request = text.trim().replace(lead, '')
+  const original = text.trim()
+  const request = original.replace(lead, '')
   if (withdrawsQuestion(request)) return
   const discussed = topic.exec(request)
   if (discussed) return {
@@ -63,7 +130,7 @@ export function contextualRequest(text, prior) {
   }
   if (prior?.missing === 'goal' || prior?.missing === 'both') {
     const question = replyQuestion.exec(request)?.[1] ?? statedQuestion.exec(request)?.[1] ??
-      (/[？?]$/u.test(request) ? request : undefined)
+      (/[？?]$/u.test(original) || bareQuestion.test(original) ? text : undefined)
     if (clearQuestion(question)) {
       return { action: 'ask', selector: prior.selector, goal: question, prior, inheritedTarget: Boolean(prior.selector) }
     }

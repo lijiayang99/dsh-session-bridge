@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { matchingTitles, naturalIntent, plainText } from './natural-message.js'
-import { contextualRequest, withdrawsQuestion } from './workflow-context.js'
+import { contextualRequest, directQuestionInScope } from './workflow-context.js'
 
 const ID = /^[a-zA-Z0-9_-]{1,128}$/
 const confirmationText = '确认委托'
@@ -66,7 +66,7 @@ export function directIntent(text) {
   const goal = match ? match[1] ?? match[2] ?? match[3] : question[5]
   const title = match ? match[4] ?? match[5] ?? match[6] : question[1] ?? question[2] ?? question[3] ?? question[4]
   if (boundedText(goal, 2000) && !placeholder.test(goal.trim()) && boundedText(title, 160) && title === title.trim()) {
-    return { goal, title, ...(unquotedTitle && ambiguousQuestionTitle.test(unquotedTitle)
+    return { goal, title, question: Boolean(question), ...(unquotedTitle && ambiguousQuestionTitle.test(unquotedTitle)
       ? { error: 'workflow_target_clarification_required' } : {}),
       ...(/^[0-9]{1,3}$/u.test(unquotedTitle ?? '') ? { alias: unquotedTitle } : {}) }
   }
@@ -243,8 +243,10 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
       return { mode: 'confirm-workflow', identity, draft }
     }
     const direct = directIntent(text)
+    // Explicit quoted delegation keeps its literal body. Automatic questions
+    // must keep an independent follow-up action outside the one-window path.
+    if (direct?.question && !directQuestionInScope(direct.goal)) return
     if (direct && !direct.alias) return { mode: 'direct-workflow', identity, text, direct }
-    if (direct?.alias && withdrawsQuestion(direct.goal)) return
     const request = direct?.alias ? {
       action: 'ask', selector: { kind: 'alias', value: direct.alias }, goal: direct.goal,
     } : !naturalIntent(text) && contextualRequest(text, adjacent?.notice ? undefined : adjacent)
