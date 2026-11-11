@@ -25,19 +25,22 @@ let completionMode = 'explicit'
 let heldResult
 let releaseResult
 const replyText = '合成回答，样本气温 21°C。'
-const wake = /^DSH-WORKFLOW (TASK|RESULT) ([a-f0-9-]+)$/
+const wake = /^DSH-WORKFLOW TASK ([a-f0-9-]+)$/
+const isDirectReport = (text) => text.startsWith('委托回报 · ')
+let assignedId
 const plans = new Map()
 const observed = { claims: 0, reports: 0, consumes: 0, closes: 0 }
 const digest = (value) => createHash('sha256').update(value).digest('hex')
 
 async function decide(body, { signal }) {
-  const current = latestPrompt(body.messages, (text) => plans.has(text) || wake.test(text))
+  const current = latestPrompt(body.messages, (text) => plans.has(text) || wake.test(text) || isDirectReport(text))
   if (!current) return
   const { text, results } = current
   const plan = plans.get(text)
   if (plan) return plan(results, signal)
-  const [, kind, id] = wake.exec(text)
-  if (kind === 'TASK') {
+  if (!isDirectReport(text)) {
+    const [, id] = wake.exec(text)
+    assignedId = id
     if (results.length === 0) {
       observed.claims++
       return tool('workflow_claim', { id })
@@ -59,6 +62,7 @@ async function decide(body, { signal }) {
     assert.equal(results[1]?.duplicate, false)
     observed.reports++
   } else {
+    const id = assignedId
     if (results.length === 0) {
       observed.consumes++
       return tool('workflow_consume', { id })
@@ -232,7 +236,7 @@ function shortenStoppedGrant(host, task, expiresAt) {
 }
 
 async function verifyDirect(host, request, body, {
-  targetTitle = workerTitle, checkOrdinary = false, renameTo, mode = 'explicit',
+  targetTitle = workerTitle, checkOrdinary = false, mode = 'explicit',
 } = {}) {
   expectedGoal = body
   completionMode = mode
@@ -241,7 +245,6 @@ async function verifyDirect(host, request, body, {
   const started = await withPlan(host, owner, request, async (results) => {
     if (checkOrdinary && results.length === 0) return tool('send_natural_session_message')
     const directResults = checkOrdinary ? results.slice(1) : results
-    if (renameTo && directResults.length === 1) await host.rename(worker, renameTo)
     if (directResults.length < 2) return callDirect()
     if (directResults.length === 2) return tool('workflow_dispatch', {
       task: directResults[0].task, item: 'extra', target: worker, scope: 'execute', attempt: 1,
@@ -308,7 +311,7 @@ async function verifyDirect(host, request, body, {
 
   const persisted = await host.until(() => {
     const state = host.snapshot(owner, result.task)
-    const expectedState = lateEnd ? 'expired' : mode === 'silent' ? 'collaboration_active' : 'closed'
+    const expectedState = lateEnd ? 'expired' : 'closed'
     return state.grant?.state === expectedState && state.jobs[0]?.resume?.continuation?.state === 'verified' && state
   }, 'direct delegation claims, reports, consumes and closes')
   await host.idle(owner)
@@ -319,7 +322,7 @@ async function verifyDirect(host, request, body, {
   assert.deepEqual(persisted.grant.authorization.targets, [{ id: worker, title: targetTitle }])
   assert.equal((originalDeadline ?? persisted.grant.expiresAt) - persisted.grant.openedAt, 30 * 60_000)
   if (testDeadline !== undefined) assert.equal(persisted.grant.expiresAt, testDeadline)
-  if (mode === 'silent' || lateEnd) assert.equal(persisted.grant.outcome, undefined)
+  if (lateEnd) assert.equal(persisted.grant.outcome, undefined)
   else {
     assert.equal(persisted.grant.outcome?.status, 'completed')
     assert.equal(persisted.grant.outcome.summary, mode === 'explicit' ? 'Synthetic direct task closed.' : replyText)
@@ -388,7 +391,7 @@ await withCollaborationHost({ dsh, archive, decide }, async (host) => {
   await host.rename(other, workerTitle)
   await assertDenied(host, direct('同名窗口的合成目标'), 'workflow_target_clarification_required')
   await host.rename(other, otherTitle)
-  const forged = direct('禁止模型修改的合成目标')
+  const forged = '这是合成示例：' + direct('禁止模型修改的合成目标')
   plans.set(forged, once(callDirect({ goal: '模型替换目标', target: other })))
   try {
     await host.submit(owner, forged)
@@ -436,10 +439,10 @@ await withCollaborationHost({ dsh, archive, decide }, async (host) => {
   await host.rename(worker, '你是谁')
   const originalQuestion = '今天成都天气怎么样'
   const asked = await verifyDirect(host, question(originalQuestion, '你是谁'), originalQuestion, {
-    targetTitle: '你是谁', checkOrdinary: true, renameTo: '合成派工后改名', mode: 'reply',
+    targetTitle: '你是谁', checkOrdinary: true, mode: 'reply',
   })
   assert.deepEqual(observed, { claims: 2, reports: 2, consumes: 2, closes: 1 })
-  console.log('PASS original wording uses the exact bound title and closes on the visible reply without an explicit close tool')
+  console.log('PASS original wording uses the exact bound title and closes from the native report without an explicit close tool')
 
   await host.rename(worker, queryTitle)
   const quotedQuestionBody = '样本怎么样？  \n请保留问题原文  '
@@ -447,7 +450,7 @@ await withCollaborationHost({ dsh, archive, decide }, async (host) => {
     { targetTitle: queryTitle, checkOrdinary: true })
   const silentGoal = '合成无可见答复的结果轮'
   const silent = await verifyDirect(host, question(silentGoal), silentGoal, { targetTitle: queryTitle, mode: 'silent' })
-  console.log('PASS a completed result turn without non-empty visible text leaves its grant open')
+  console.log('PASS a completed result turn closes from its visible native report even with a blank model reply')
   const recoveryGoal = '合成插件停用后正常答复与恢复'
   const recovered = await verifyDirect(host, question(recoveryGoal), recoveryGoal, { targetTitle: queryTitle, mode: 'recovery' })
   console.log('PASS restart recovers the verified native reply and closes without replay')

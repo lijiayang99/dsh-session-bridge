@@ -1,8 +1,10 @@
-# dsh-session-bridge 0.5.0-rc.1
+# dsh-session-bridge 0.5.0-rc.16
 
 适用于 DeepSeek Harness Web 0.2.2-rc.1。全新安装可通过「插件 → 添加插件」输入宿主机可读的包绝对路径并启用。已有版本请先按下文迁移。
 
-右栏「开始 → dsh-session-bridge」有「启用会话消息」和「启用跨窗口任务委托」两个独立开关，共用会话白名单。先创建并使用主控、开发和审核会话，将它们加到白名单。
+右栏「开始 → dsh-session-bridge」的总开关同时控制会话互传和任务委托。旧版两个开关的值会分别保留，旧值不一致时总开关显示部分启用。只保存白名单会保留这两个值，显式操作总开关并保存时才会将两项设为同一状态。
+
+白名单使用 DSH 工作区标题、工作区顺序和成员顺序。已注册工作区若有父目录工作区，按最近的已注册父目录嵌套。每组可独立折叠，未归属的会话和已选但当前不可用的会话各有单独分组。普通会话显示标题，最多选择 32 个。
 
 ## 宿主兼容诊断
 
@@ -10,7 +12,7 @@
 
 | 侧栏或安装状态 | 含义 |
 | --- | --- |
-| 宿主版本受支持 | 宿主通过固定的 DSH `0.2.2-rc.1` 版本检查。会话消息和任务委托分别显示保存后的开关状态。 |
+| 设置可读取 | 宿主通过固定的 DSH `0.2.2-rc.1` 版本检查。右栏显示保存后的总开关状态。 |
 | 当前宿主不受支持 | 插件已加载，但宿主身份或版本未通过授权门禁。侧栏不提供编辑，新会话消息和任务委托不开放。已有会话消息的回执查询和符合原条件的精确重复查询仍可用。 |
 | 无法读取插件配置或宿主兼容状态 | 配置请求失败、配置条目或兼容标记缺失、设置数据无法读取，或读取所需的会话列表失败。可在右栏重新读取。 |
 | 添加插件提示版本不兼容 | 插件管理器可能先按 `engines.dsh` 拒绝，侧栏此时尚未加载。在支持结构化错误的管理器里，`incompatible-version` 会显示运行的 DSH 版本与包的宿主要求。以添加对话框为准。 |
@@ -50,18 +52,40 @@
 
 一项任务只交给一个明确窗口时，可直接输入「把『核对合成文件的摘要』委托给『开发窗口』」。插件从本轮所有者原文取目标和唯一白名单窗口，自动开立并入队一次。期限固定为 30 分钟，用途为执行原文目标，预算为一次尝试。需要其他窗口、返修预算或不同期限时，使用下述方案确认。
 
-要请固定窗口回答并把结果带回原主控，可以输入 `你给合成查询这个窗口问他今天气温怎么样`，也可写 `请你给『合成查询』窗口问它今天气温怎么样`。主控调用 `workflow_delegate_direct`，按窗口的准确标题和问题原文派工。窗口成功回报后，原主控在同一结果轮读取并显示答复。宿主持久化确认该轮正常结束后，单次授权自动收口并保留历史。标题含并列词时请用引号明确标题，窗口同名时先澄清。
+要请固定窗口回答并把结果带回原主控，可以输入 `你给你是谁这个窗口问他今天成都天气怎么样`，也可写 `请你给『你是谁』窗口问它今天成都天气怎么样`。宿主等这条原生所有者输入所在轮正常结束，核对持久事件、两条输入队列、唯一窗口标题和白名单，再按问题原文派工。主控模型可以正常回复，无需调用桥接工具。取消、超时、错误、混合输入或仍有待处理输入时，这次请求不会派工。目标同名或不明确时，原主控聊天正文会直接显示澄清提示。按提示改用一个完整的唯一标题。
+
+执行窗口领取后提交结构化回报。原主控的结果轮结束后，聊天正文直接显示回报状态、正文和所报证据。宿主保留该轮的原生任务通知作投递凭据。右栏「原主控任务」显示所有者轮核验、任务投递和收口状态。成功回报在有效期内随原主控结果轮正常结束并经持久记录核验后，授权自动收口。中断或证据不足的结果需对账，宿主不会重放已投递的通知。
 
 在原主控窗口输入「请把合成候选的实现交给开发窗口，把独立核查交给核查窗口，等两项都返回后交给审核窗口。审核退回就安排返修并复审」。主控生成方案，列出任务、目标、窗口标题、用途、有效期和总派工预算。看到完整预览且该轮结束后，在原主控回复「确认委托」。原主控 DSH 所有者的这条原生输入开立方案。窗口同名、目标或范围含糊时先澄清。回复「取消委托」可作废待确认方案。
 
 主控在批准范围内并行派工、等齐汇总、按原任务返修和收口。共用执行窗口逐项领取。批次等待每项回报、失败或进入待核对，只返回一次结果通知。主控可查看部分失败并按剩余预算返修。遇到待核对或明确要求所有者决定的回报，主控从原窗口继续处理，确认后可输入 `继续委托 <任务>`。右栏「开始 → dsh-session-bridge → 原主控任务」可查看批次、尝试、执行窗口、回报、失败和接续状态。
+
+### 原生子代理
+
+如果任务可在主控窗口下另起子代理，直接请主控派一个本地子代理。固定 Web 的 Standard preset 提供宿主的 `subagent` 和 `send_message`。父子双方可以追加指示、提问和报告进展，子代理结束后宿主向父窗口回报。模型误选 `send_session_message` 时，插件核对原生直系血缘，复用宿主送达并保留去重回执。对启用了任务委托且在白名单内的父窗口，插件只补上宿主因同轮主动发消息而省略的不同结束正文。已主动发过的相同正文只出现一次。
+
+原生本地子代理带有宿主记录的父子血缘、父窗口的 sandbox 和 preset。宿主把子代理的审批策略设置为 `never`。遇到权限阻塞时，子代理把阻塞、所需动作及原因回给主控，由主控用 DSH 原生权限和审批继续处理。
+
+### 同一任务持续往返
+
+明确点名已存在的独立窗口时，可以说「请让99窗口核对合成候选并回报结果」。宿主核对原生所有者轮、当前工作区短号和白名单后，按目标正文建立一项任务。复合或不清楚的要求先由主控拟定具体窗口、目标、用途、期限和预算。看到启用往返的完整预览后，在原窗口说「好」或「可以」。单窗口、一次派工的方案在确认轮结束后自动派工。多窗口方案沿用正式派工和审核流程。
+
+执行窗口领取后可把进展、证据、问题或阻塞直接发给原主控，主控也可以补充指示。同一收件窗口有多项活动任务时，主控可引用「原主控任务」里的任务号或尝试 ID。插件用任务 ID、宿主身份及回执绑定每次消息，正文原样带到收件窗口。执行窗口用 `workflow_report` 提交最终回报，单窗口任务会自动回到原主控。普通进展和等待主控补充可继续用任务消息。
+
+每次消息只在发送轮正常结束且核实原生来源后入宿主收件队列，使用任务内稳定请求号去重。混合输入、撤销、到期或收口会阻止继续发送。原主控已入宿主队列的同任务撤回也会挡住待发送消息。启动后可核对保留的回执，未投递或投递不明的消息不会自动重发。第三窗口须处于已批准的派工范围并领取自己的任务。独立窗口继续使用各自的宿主权限和审批。
+
+### 用相邻对话问一个窗口
+
+在原主控输入「你看一下02窗口今天干了啥，你问一下他」，或者先说「你看一下02窗口今天干了啥」，等该轮结束后再说「你问一下他」。前一句建立本轮话题，实际查问由带「问」的原生所有者输入触发。也可以直接说「帮我问问02窗口，插件还有哪些坑？」。派工按原话里的问题发送。独立分句撤回或追加外发、派工时，这句不走自动查问。多个窗口的任务可走方案预览和确认。
+
+数字短号按标题开头的独立数字匹配，例如 `02-合成查询`。短号只在原主控所属工作区内匹配，未分组时只查未分组会话。集合内多个候选时，请回一个完整且唯一的标题，例如「是『02-合成查询』」。如果系统问要问什么，直接回复完整问题即可。相邻话题绑定前轮已解析的窗口和原文，目标变化时重新询问。上下文最长保留两分钟，取消、无关输入、中继、提前排队或宿主重启后请重新给出窗口和问题。
 
 ### 工具与验收接口
 
 | 工具 | 参数与约束 |
 | --- | --- |
 | `workflow_delegate_direct` | 无参数。只接受原主控所有者本轮明确引用的单窗口和目标原文。开立与一次派工写入同一笔账本事务。收到 `state: queued` 后，用回执中的 `targetTitle` 确认已派工。同轮精确重试返回原入队回执及原匹配标题。 |
-| `workflow_propose` | `task`、`goal`、`ttlMinutes`、`budget`、`scopes`。每个范围用 `name`、`windows`（宿主窗口标题）和 `purpose`。用户要求正式审核时，审核范围加 `review: true`，成功收口须有通过的固定产物。预算为整个任务可新建的尝试数，最多 32，包含返修。返回 `preview` 时主控须原样作为整条最终回复展示。 |
+| `workflow_propose` | `task`、`goal`、`ttlMinutes`、`budget`、`scopes`。用 `conversation: true` 生成可持续往返的可见方案。每个范围用 `name`、`windows`（宿主窗口标题）和 `purpose`。用户要求正式审核时，审核范围加 `review: true`，成功收口须有通过的固定产物。预算为整个任务可新建的尝试数，最多 32，包含返修。返回 `preview` 时主控须原样作为整条最终回复展示。 |
 | `workflow_confirm` | 所有者在原窗口新回复「确认委托」后，无参数调用。成功返回冻结的任务、范围、已解析窗口 ID、预算和到期时间，可在该轮继续派工。 |
 | `workflow_dispatch_batch` | `task`、`batch`、`completion`、`assignments`。每项填写 `item`、`attempt`、`target`、`scope`、`instructions`、`acceptance`。一次原子入账，成员固定，最多 16 项。等齐后原主控调用 `workflow_consume` 得到 `batch.items`。单项仍用 `workflow_dispatch`。 |
 | `workflow_claim`、`workflow_report` | 执行窗口领取到本次尝试及用途后再执行。产出固定产物时，回报 `artifacts`，支持 `git:<40 位小写十六进制>` 或 `sha256:<64 位小写十六进制>`。 |
@@ -103,11 +127,17 @@
 
 在发送会话由 DSH 所有者输入 `授权互传 目标会话ID 请求号`，下一行开始写准确正文。助手用 `send_session_message` 按原样发送，从原发送会话用 `session_message_status` 查投递和处理。精确重试只返回已有回执。迁移保留回执内容和去重键。目标轮次正常回复并落盘仅证明处理，项目验收仍要看结构化结果和产物。
 
-### 从 0.4.4-rc.3 或 0.4.5-rc.2 换入或回退
+### 左栏传递状态
+
+普通互传、委托派工和结果回传在左侧会话行显示短期状态。宿主实际尝试投递时，两行均在视口内才出现从发送行到接收行的小飞机。结果回传沿相反方向飞。排队、已投递、执行、回传以及失败或待核对各有独立文字。已投递表示宿主接收了消息，任务验收以右栏的原主控任务记录为准。原主控完成归档对账后，左栏显示已对账。
+
+会话行折叠、滚出或隐藏，以及启用系统减少动态效果时，状态仍可在可见行上读取。重新展开或打开页面不会补播。每个页面只建立一条所有者活动订阅，同时最多显示四架飞机。活动数据仅保存在内存，限 128 条。委托活动保留至授权期限，普通互传的活动状态最多保留 15 分钟，终态保留 18 秒。活动流只返回当前白名单中双方的方向、类型和状态。
+
+### 停机换包与回退
 
 排空在途消息和委托，保存两个开关与白名单的当前值，关闭两个开关并停用插件。完整停止宿主后备份当前配置、回执和委托账本，再换入固定包并完整重启。各版共用相同设置 ID、回执和账本路径。核对安装版本、白名单、开关和已有回执及委托记录，再按原授权恢复开关。
 
-回退前在 0.5.0 核对并收口或取消其活动协作任务，等待读回已提交的收口状态，保全宿主未决的尝试及账本，保持两个开关关闭，再换回已核对的固定旧包。旧版能读回历史，活动、暂停和收口待核验的新版协作授权在旧版保持不可派发。若候选无法启动，完整保存升级后的数据后再执行回退，未能读回的协作任务按待对账处理。
+回退前在候选版核对并收口或取消其活动协作任务，等待读回已提交的收口状态，保全宿主未决的尝试及账本，保持两个开关关闭，再换回已核对的固定旧包。固定 rc.8 可读回 rc.9 已收口任务。回到 0.4.x 时，旧版可读回历史，活动、暂停和收口待核验的新版协作授权保持不可派发。若候选无法启动，完整保存升级后的数据后再执行回退，未能读回的协作任务按待对账处理。
 
 ### 协作任务隔离复验
 
@@ -119,22 +149,36 @@ npm pack --offline --pack-destination "$lab"
 npm install --prefix "$lab/tools" playwright-core@1.65.0
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.8.tgz" full \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.16.tgz" full \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/collaboration.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.8.tgz" stress
-for test in collaboration-direct collaboration-recovery collaboration-expiry; do
+  "$lab/local-dsh-session-bridge-0.5.0-rc.16.tgz" stress
+unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+  "$(command -v node)" ./test/collaboration-auto.mjs "$(command -v dsh)" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.16.tgz" \
+  "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
+unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+  "$(command -v node)" ./test/sidebar-transfers.mjs "$(command -v dsh)" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.16.tgz" \
+  "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
+unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+  "$(command -v node)" ./test/collaboration-contextual.mjs "$(command -v dsh)" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.16.tgz" \
+  "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
+for test in collaboration-native collaboration-conversation collaboration-auto collaboration-direct collaboration-recovery collaboration-expiry; do
   unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
     "$(command -v node)" "./test/$test.mjs" "$(command -v dsh)" \
-    "$lab/local-dsh-session-bridge-0.5.0-rc.8.tgz"
+    "$lab/local-dsh-session-bridge-0.5.0-rc.16.tgz"
 done
 bash .github/ci/run.sh
 ```
 
-同布局换包用 `test/collaboration-rollback.mjs <dsh> <固定 0.4.5-rc.2 tgz> <候选 tgz>`，同样在 loopback 命名空间运行。基线包从 `87b06bf9fc8f9b3fc523d0ab227edd9d284c8609` 打包，SHA-256 为 `fb5de752634093c23be783fdf507b86e23ca362250ea787756de09f1e6ff6a91`。
+固定 rc.8 与 rc.9 的停机换包与回退复验使用 `test/collaboration-auto-rollback.mjs <dsh> <固定 rc.8 tgz> <rc.9 tgz>`，在同一隔离方式下运行。脚本校验 rc.8 包指纹，并读回两项配置、白名单、普通回执和 rc.9 的直派收口。
 
-恢复和真实模型闭环测试在一次性宿主启用逐步时间快照，复验派工、接续重启和收口。真实模型闭环用 `node ./test/collaboration-pilot.mjs "$(command -v dsh)" "$lab/local-dsh-session-bridge-0.5.0-rc.8.tgz" gpt-6.1-sol`。该脚本使用合成窗口和文件、loopback 模型适配器，以及已授权的 Codex 模型访问。适配器只传合成任务，并把模型选择交给宿主真实执行的委托工具。
+0.4.5-rc.2 同布局换包用 `test/collaboration-rollback.mjs <dsh> <固定 0.4.5-rc.2 tgz> <候选 tgz>`，同样在 loopback 命名空间运行。基线包从 `87b06bf9fc8f9b3fc523d0ab227edd9d284c8609` 打包，SHA-256 为 `fb5de752634093c23be783fdf507b86e23ca362250ea787756de09f1e6ff6a91`。
+
+恢复和真实模型闭环测试在一次性宿主启用逐步时间快照，复验派工、接续重启和收口。真实模型闭环用 `node ./test/collaboration-pilot.mjs "$(command -v dsh)" "$lab/local-dsh-session-bridge-0.5.0-rc.16.tgz" gpt-6.1-sol`。该脚本使用合成窗口和文件、loopback 模型适配器，以及已授权的 Codex 模型访问。适配器只传合成任务，并把模型选择交给宿主真实执行的委托工具。
 
 ### 自然语句隔离复验
 
@@ -146,11 +190,11 @@ npm pack --offline --pack-destination "$lab"
 npm install --prefix "$lab/tools" playwright-core@1.65.0
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/natural-send.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.8.tgz" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.16.tgz" \
   "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
 unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
   "$(command -v node)" ./test/natural-send-time-context.mjs "$(command -v dsh)" \
-  "$lab/local-dsh-session-bridge-0.5.0-rc.8.tgz"
+  "$lab/local-dsh-session-bridge-0.5.0-rc.16.tgz"
 bash .github/ci/run.sh
 ```
 

@@ -7,7 +7,10 @@ import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { draftPreview, hostContext, matchingTitles, naturalIntent } from './natural-message.js'
+import { directIntent } from './workflow-authorization.js'
+import { createActivity } from './activity.js'
 import { applyWorkflow } from './workflow.js'
+import { observeNativeResults } from './native-result.js'
 
 // Local DSH bundles are linked, so resolve the schema from the running DSH CLI.
 const cli = realpathSync(process.argv[1])
@@ -125,15 +128,35 @@ export function apply(ctx, config) {
   const allowed = (id) => typeof id === 'string' && config.allowedSessions.get().includes(id)
     && !ctx.workspaceRegistry.archivedSessionIds.includes(id)
   let web = false
+  let activity
+  let workflow
+  let subagents
   if (supportsOwnerPrompt) {
     ctx.inject(['profileContext', 'sessionPersistence'], (workflowCtx) => {
       if (workflowCtx.profileContext.name !== 'web') return
       web = true
-      applyWorkflow(workflowCtx, config, allowed)
+      const projection = createActivity(allowed)
+      activity = projection
+      workflowCtx.inject(['connection'], (scope) => {
+        if (scope.connection) projection.register(scope)
+      })
+      workflow = applyWorkflow(workflowCtx, config, allowed, projection, matchConversation)
+      workflowCtx.inject(['subagents'], (scope) => {
+        subagents = scope.subagents
+        observeNativeResults(scope, () => config.workflowEnabled.get(), allowed, projection)
+      })
     })
   }
   const receiptPath = (key) => join(dir, key + '.json')
   const processingPath = (key) => join(dir, key + '.turn.json')
+  function messageActivity(record, state, attempt) {
+    try {
+      activity?.record({ key: record.messageId, from: record.from, to: record.to, kind: 'message', state,
+        nativeParent: record.authorization?.nativeParent }, attempt)
+    } catch {
+      ctx.logger.warn('message activity could not be projected')
+    }
+  }
 
   function hasEmptyInbox(session) {
     try {
@@ -178,7 +201,7 @@ export function apply(ctx, config) {
       if (source?.kind === 'user') {
         const input = !active.hasRelay && config.enabled.get() ? ownerText(event.data) : undefined
         active.authorization = input === undefined ? undefined : ownerAuthorization(input, event.data.id)
-        if (web && input !== undefined) {
+        if (web && input !== undefined && !directIntent(input)) {
           const confirmed = input.trim() === '确认发送' && draft?.expiresAt > performance.now() ? draft : undefined
           const intent = confirmed ? { kind: 'confirmed' } : naturalIntent(input)
           if (intent) {
@@ -196,7 +219,8 @@ export function apply(ctx, config) {
       const record = read(receiptPath(key))
       if (record?.messageId === event.data.id && record.to === session.id &&
           record.from === source.senderSessionId && allowed(record.from)) {
-        active.message = { key, id: event.data.id }
+        active.message = { key, id: event.data.id, record }
+        messageActivity(record, 'executing')
       }
       return
     }
@@ -225,21 +249,29 @@ export function apply(ctx, config) {
     clearNatural(active)
     turns.delete(session.id)
     if (!active.message) return
-    const { key, id } = active.message
+    const { key, id, record } = active.message
     const processing = reason === 'completed' && active.replied ? 'processed' : 'not_completed'
     void Promise.resolve().then(async () => {
       if (await ctx.sessions.flush(session)) {
         write(dir, processingPath(key), {
           messageId: id, processing, turn: active.turn, endReason: reason, at: now(),
         }, true)
-      }
-    }).catch(() => ctx.logger.warn('dsh-session-bridge could not persist turn evidence'))
+        messageActivity(record, processing === 'processed' ? 'processed' : 'uncertain')
+      } else messageActivity(record, 'uncertain')
+    }).catch(() => {
+      messageActivity(record, 'uncertain')
+      ctx.logger.warn('dsh-session-bridge could not persist turn evidence')
+    })
   })
 
-  const senderId = (exec) => {
+  const liveSenderId = (exec) => {
     const caller = exec?.agent
     const id = caller?.session?.id
-    return allowed(id) && ctx.agents.get(id) === caller ? id : undefined
+    return validId(id) && ctx.agents.get(id) === caller ? id : undefined
+  }
+  const senderId = (exec) => {
+    const id = liveSenderId(exec)
+    if (allowed(id)) return id
   }
   const result = (key, record, duplicate = false) => {
     const turn = read(processingPath(key))
@@ -250,6 +282,8 @@ export function apply(ctx, config) {
       delivery: observed ? 'delivered' : record.delivery === 'reserved' ? 'unknown' : record.delivery,
       processing: observed?.processing ?? (live ? 'running' : 'unconfirmed'),
       ...(observed ? { turn: observed.turn, endReason: observed.endReason } : {}),
+      ...(record.authorization?.job ? { task: record.authorization.task, job: record.authorization.job } : {}),
+      ...(record.nativeMessageId ? { nativeMessageId: record.nativeMessageId } : {}),
       duplicate,
     }
   }
@@ -295,6 +329,7 @@ export function apply(ctx, config) {
       return existingResult(key, read(path), from, payloadHash)
     }
 
+    messageActivity(record, 'queued')
     let attempted = false
     try {
       const resolved = await ctx.sessionController.resolveAgent(to)
@@ -313,6 +348,7 @@ export function apply(ctx, config) {
         throw new Error('destination unavailable')
       }
       attempted = true
+      messageActivity(record, 'sending', true)
       target.followup({
         id: record.messageId, role: 'user',
         content: [{
@@ -326,7 +362,82 @@ export function apply(ctx, config) {
       record.delivery = attempted ? 'unknown' : 'not_delivered'
     }
     write(dir, path, record, false)
-    return result(key, record)
+    const receipt = result(key, record)
+    messageActivity(record, receipt.processing === 'processed' ? 'processed'
+      : receipt.processing === 'running' ? 'executing'
+        : receipt.processing === 'not_completed' || receipt.delivery === 'unknown' ? 'uncertain'
+          : receipt.delivery === 'delivered' ? 'delivered' : 'failed')
+    return receipt
+  }
+
+  const conversationHeading = (route) => `任务消息 · ${route.task} · ${route.from} → ${route.to}\n\n`
+
+  function matchConversation(route, message) {
+    const key = message.source?.bridgeReceiptKey
+    if (!KEY.test(key ?? '') || message.role !== 'user' || message.source.kind !== 'agent-message' ||
+        message.source.form !== 'relay' || message.source.bridgeWorkflowKind !== 'conversation' ||
+        message.source.bridgeWorkflowTask !== route.task || message.source.bridgeWorkflowId !== route.id ||
+        message.source.senderSessionId !== route.from ||
+        message.content?.length !== 1 || message.content[0]?.type !== 'text') return false
+    const record = read(receiptPath(key))
+    const text = message.content[0].text
+    const heading = conversationHeading(route)
+    return record?.messageId === message.id && record.from === route.from && record.to === route.to &&
+      record.authorization?.kind === 'native-workflow-conversation' &&
+      record.authorization.job === route.id && record.authorization.task === route.task &&
+      ['reserved', 'delivered', 'unknown'].includes(record.delivery) && text?.startsWith(heading) &&
+      record.payloadHash === sha([route.to, text.slice(heading.length)])
+  }
+
+  function reserveConversation(route, requestId, text) {
+    const { id, task, from, to } = route
+    const key = sha([from, id, requestId])
+    const path = receiptPath(key)
+    const payloadHash = sha([to, text])
+    const record = {
+      from, to, requestId, payloadHash, messageId: randomUUID(), delivery: 'reserved', at: now(),
+      authorization: { kind: 'native-workflow-conversation', job: id, task },
+    }
+    if (!write(dir, path, record, true)) {
+      return { receipt: existingResult(key, read(path), from, payloadHash) }
+    }
+    messageActivity(record, 'queued')
+    let attempted = false
+    function settle(delivery) {
+      if (record.delivery !== 'reserved') return
+      record.delivery = delivery
+      write(dir, path, record, false)
+      const receipt = result(key, record)
+      messageActivity(record, receipt.processing === 'processed' ? 'processed'
+        : receipt.processing === 'running' ? 'executing'
+        : receipt.processing === 'not_completed' || delivery === 'unknown' ? 'uncertain'
+          : delivery === 'delivered' ? 'delivered' : 'failed')
+    }
+    return {
+      receipt: { ...result(key, record), task, job: id, delivery: 'queued' },
+      async send(deadline, live) {
+        try {
+          if (!live()) return
+          const { agent } = await ctx.sessionController.resolveAgent(to)
+          deadline.throwIfAborted()
+          if (!agent || ctx.agents.get(to) !== agent || !live()) return
+          attempted = true
+          messageActivity(record, 'sending', true)
+          agent.followup({
+            id: record.messageId, role: 'user',
+            content: [{ type: 'text', text: conversationHeading(route) + text }],
+            source: {
+              kind: 'agent-message', form: 'relay', senderSessionId: from, bridgeReceiptKey: key,
+              bridgeWorkflowKind: 'conversation', bridgeWorkflowId: id, bridgeWorkflowTask: task,
+            },
+          })
+          settle(await ctx.sessions.flush(agent.session) ? 'delivered' : 'unknown')
+        } finally {
+          settle(attempted ? 'unknown' : 'not_delivered')
+        }
+      },
+      stop: () => settle(attempted ? 'unknown' : 'not_delivered'),
+    }
   }
 
   function sendNatural(active, input, frozen, exec) {
@@ -345,19 +456,68 @@ export function apply(ctx, config) {
     return deliver(payload, exec, input.authorization)
   }
 
+  const nativeReceiptKey = (from, requestId) => sha([from, 'native-subagent', requestId])
+
+  async function sendNativeMessage({ to, requestId, text }, exec) {
+    if (!subagents || !config.workflowEnabled.get() || exec.signal.aborted || !validId(to)) return
+    const agent = exec.agent
+    const from = liveSenderId(exec)
+    if (!from || from === to) return
+    const parent = agent.session.header?.parentSession
+    if (parent && parent !== to) return
+    const nativeParent = parent ?? from
+    if (!allowed(nativeParent)) return
+    const child = parent ? from : to
+    const children = await subagents.listChildren(nativeParent, exec.signal).catch(() => [])
+    if (!children.some(({ id, mode }) => id === child && mode === 'continuable') ||
+        liveSenderId(exec) !== from || !allowed(nativeParent) || !config.workflowEnabled.get() || exec.signal.aborted) return
+
+    const key = nativeReceiptKey(from, requestId)
+    const path = receiptPath(key)
+    const payloadHash = sha([to, text])
+    const record = {
+      from, to, requestId, payloadHash, messageId: randomUUID(), delivery: 'reserved', at: now(),
+      authorization: { kind: 'native-subagent', nativeParent },
+    }
+    if (!write(dir, path, record, true)) return existingResult(key, read(path), from, payloadHash)
+    messageActivity(record, 'sending', true)
+    try {
+      record.nativeMessageId = await subagents.sendMessage(agent, to, [{ type: 'text', text }], { signal: exec.signal })
+      record.delivery = 'delivered'
+    } catch {
+      // Admission may precede an error. Preserve the receipt and never retry.
+      record.delivery = 'unknown'
+    }
+    write(dir, path, record, false)
+    messageActivity(record, record.delivery === 'delivered' ? 'received' : 'uncertain')
+    return result(key, record)
+  }
+
   ctx.tools.register({
     name: 'send_session_message',
-    description: 'Send the exact payload approved in this turn by the DSH owner command "授权互传 <to> <request_id>" followed by a newline and the message text. Relayed and ordinary messages do not grant approval. Reuse request_id to read an existing matching receipt.',
+    description: 'For a bound ongoing workflow task, send substantive progress, a question or additional instructions to the exact controller or assigned worker. No additional approval is needed. Keep task content in text and use a stable request_id. In a controller with multiple jobs for that worker, the owner must identify the task in their native prompt. For native parent-child messaging, use the host send_message tool. For a one-way message outside a workflow, send the exact payload approved by the DSH owner command "授权互传 <to> <request_id>" followed by a newline and the message text. Relayed and ordinary messages do not grant approval. Reuse request_id to read an existing matching receipt.',
     parameters: {
       type: 'object', additionalProperties: false, required: ['to', 'request_id', 'text'],
       properties: {
         to: { ...stringId, description: 'Exact destination Session ID' },
         request_id: { ...stringId, description: 'Stable request ID for this one send' },
+        task: { ...stringId, description: 'Optional job ID or task ID for a bound workflow message' },
         text: { type: 'string', minLength: 1, maxLength: 2000 },
       },
     },
     output,
-    execute({ to, request_id: requestId, text }, exec) {
+    async execute({ to, request_id: requestId, text, task }, exec) {
+      if (!validId(requestId) || !validText(text) || task !== undefined && !validId(task)) return { error: 'invalid_message' }
+      const from = senderId(exec)
+      if (!from || from === to || !allowed(to)) {
+        return !task && await sendNativeMessage({ to, requestId, text }, exec) ||
+          { error: 'route_not_allowed' }
+      }
+      const legacy = turns.get(from)?.authorization
+      if (!task && legacy && !legacy.natural && legacy.to === to && legacy.requestId === requestId &&
+          legacy.payloadHash === sha([to, text])) return deliver({ to, requestId, text }, exec)
+      const queued = workflow?.queueMessage({ to, task }, exec, (route) => reserveConversation(route, requestId, text))
+      if (queued || task) return queued ?? { error: 'workflow_task_context_required' }
       return deliver({ to, requestId, text }, exec)
     },
   })
@@ -423,21 +583,27 @@ export function apply(ctx, config) {
 
   ctx.tools.register({
     name: 'session_message_status',
-    description: 'Read the inbox delivery and turn-processing receipts for a message this Session sent. Does not open the destination conversation.',
+    description: 'Read this session’s delivery receipt. Include job for an independent workflow message. Native child messages include the host’s nativeMessageId when accepted.',
     parameters: {
       type: 'object', additionalProperties: false, required: ['request_id'],
-      properties: { request_id: stringId },
+      properties: { request_id: stringId, job: stringId },
     },
     output,
-    async execute({ request_id: requestId }, exec) {
-      const from = senderId(exec)
+    async execute({ request_id: requestId, job }, exec) {
+      const from = liveSenderId(exec)
       if (!from) return { error: 'route_not_allowed' }
-      if (typeof requestId !== 'string' || !ID.test(requestId)) return { error: 'invalid_request_id' }
-      const key = sha([from, requestId])
-      const record = read(receiptPath(key))
-      return record?.from === from && allowed(record.to)
-        ? result(key, record)
-        : { error: 'receipt_not_found' }
+      if (!validId(requestId)) return { error: 'invalid_request_id' }
+      if (job !== undefined && !validId(job)) return { error: 'invalid_job_id' }
+      const key = sha(job === undefined ? [from, requestId] : [from, job, requestId])
+      const record = allowed(from) && read(receiptPath(key))
+      if (record?.from === from && allowed(record.to)) return result(key, record)
+      if (job === undefined) {
+        const nativeKey = nativeReceiptKey(from, requestId)
+        const native = read(receiptPath(nativeKey))
+        if (native?.from === from && native.authorization?.kind === 'native-subagent' &&
+            allowed(native.authorization.nativeParent)) return result(nativeKey, native)
+      }
+      return { error: allowed(from) ? 'receipt_not_found' : 'route_not_allowed' }
     },
   })
 }
