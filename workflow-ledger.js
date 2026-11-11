@@ -75,6 +75,7 @@ export function openLedger(dir) {
     const get = database.prepare('SELECT body FROM ledger WHERE id = 1')
     const set = database.prepare('UPDATE ledger SET body = ? WHERE id = 1 AND version = 2')
     const grant = database.prepare('SELECT body FROM grant_history WHERE key = ?')
+    const ownerGrants = database.prepare('SELECT body FROM grant_history WHERE key >= ? AND key < ? ORDER BY rowid DESC LIMIT 64')
     const job = database.prepare('SELECT body FROM job_history WHERE id = ?')
     const attempt = database.prepare('SELECT body FROM job_history WHERE task_key = ? AND item = ? AND attempt = ?')
     const jobsFor = database.prepare('SELECT body FROM job_history WHERE task_key = ? ORDER BY rowid DESC LIMIT 64')
@@ -91,6 +92,7 @@ export function openLedger(dir) {
     const read = () => unpack(get.get())
     const history = {
       grant: (key) => unpack(grant.get(key)),
+      grantsFor: (owner) => ownerGrants.all(owner + ':', owner + ';').map(unpack),
       job: (id) => unpack(job.get(id)),
       attempt: (key, item, number) => unpack(attempt.get(key, item, number)),
       jobsFor: (key) => jobsFor.all(key).map(unpack),

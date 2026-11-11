@@ -1,4 +1,4 @@
-# dsh-session-bridge 0.4.5-rc.2
+# dsh-session-bridge 0.5.0-rc.1
 
 适用于 DeepSeek Harness Web 0.2.2-rc.1。全新安装可通过「插件 → 添加插件」输入宿主机可读的包绝对路径并启用。已有版本请先按下文迁移。
 
@@ -46,7 +46,29 @@
 - 只完成部分迁移时，先停宿主，再按表逐项核对实际路径和设置。用备份、回执及原主控留存的委托证据确认当前完整数据。只完成剩余的移动，避免把已完成的部分再次覆盖。
 - 新旧路径并存时，保留两侧，先核对来源。确认哪一侧是包含所需历史的完整数据后，将另一侧整个目录单独保全，再完成重命名和原生读回。发现空账本或分歧账本也按此处理。两侧均含独有历史或无法确认权威数据时，继续停用并逐项对账。不要覆盖、合并 SQLite 文件或按更新时间猜测。配置中两套条目并存时，同样先核对实际生效的设置及覆盖来源。
 
-## 一次授权任务委托
+## 跨窗口任务
+
+一项任务只交给一个明确窗口时，可直接输入「把『核对合成文件的摘要』委托给『开发窗口』」。插件从本轮所有者原文取目标和唯一白名单窗口，自动开立并入队一次。期限固定为 30 分钟，用途为执行原文目标，预算为一次尝试。需要其他窗口、返修预算或不同期限时，使用下述方案确认。
+
+在原主控窗口输入「请把合成候选的实现交给开发窗口，把独立核查交给核查窗口，等两项都返回后交给审核窗口。审核退回就安排返修并复审」。主控生成方案，列出任务、目标、窗口标题、用途、有效期和总派工预算。看到完整预览且该轮结束后，在原主控回复「确认委托」。原主控 DSH 所有者的这条原生输入开立方案。窗口同名、目标或范围含糊时先澄清。回复「取消委托」可作废待确认方案。
+
+主控在批准范围内并行派工、等齐汇总、按原任务返修和收口。共用执行窗口逐项领取。批次等待每项回报、失败或进入待核对，只返回一次结果通知。主控可查看部分失败并按剩余预算返修。遇到待核对或明确要求所有者决定的回报，主控从原窗口继续处理，确认后可输入 `继续委托 <任务>`。右栏「开始 → dsh-session-bridge → 原主控任务」可查看批次、尝试、执行窗口、回报、失败和接续状态。
+
+### 工具与验收接口
+
+| 工具 | 参数与约束 |
+| --- | --- |
+| `workflow_delegate_direct` | 无参数。只接受原主控所有者本轮明确引用的单窗口和目标原文。开立与一次派工写入同一笔账本事务。 |
+| `workflow_propose` | `task`、`goal`、`ttlMinutes`、`budget`、`scopes`。每个范围用 `name`、`windows`（宿主窗口标题）和 `purpose`。用户要求正式审核时，审核范围加 `review: true`，成功收口须有通过的固定产物。预算为整个任务可新建的尝试数，最多 32，包含返修。返回 `preview` 时主控须原样作为整条最终回复展示。 |
+| `workflow_confirm` | 所有者在原窗口新回复「确认委托」后，无参数调用。成功返回冻结的任务、范围、已解析窗口 ID、预算和到期时间，可在该轮继续派工。 |
+| `workflow_dispatch_batch` | `task`、`batch`、`completion`、`assignments`。每项填写 `item`、`attempt`、`target`、`scope`、`instructions`、`acceptance`。一次原子入账，成员固定，最多 16 项。等齐后原主控调用 `workflow_consume` 得到 `batch.items`。单项仍用 `workflow_dispatch`。 |
+| `workflow_claim`、`workflow_report` | 执行窗口领取到本次尝试及用途后再执行。产出固定产物时，回报 `artifacts`，支持 `git:<40 位小写十六进制>` 或 `sha256:<64 位小写十六进制>`。 |
+| 审核绑定 | 派工增加 `reviewOf`（原任务内产物尝试 ID）和 `artifact`（该尝试已回报的固定引用）。审核窗口在对应领取轮回报 `approved` 或 `changes_requested` 时，须用 `reviewedArtifact` 回传同一个引用。返修从原条目增加尝试号，复审重新绑定。 |
+| `workflow_close` | 协作任务提供 `task`、`outcome`（`completed`、`partial` 或 `failed`）、`summary`，可带 `finalArtifacts`。成功收口须核实最新尝试与结果接续。有审核时，最终引用还须对应最新产物尝试的通过结论。 |
+
+取消用 `取消委托 <任务>`。取消和到期会挡住后续派工与接续。已经进入宿主投递边界的尝试单独显示待核对，现有宿主工具负责停止执行。恢复只在已证实安全的边界继续。领取后缺回报、结果接续中断或已派出的下游动作不明时，由主控按回执对账。所有者核实已消费的结果后，可在原窗口用 `对账委托 <任务> <结果对应的尝试ID> result` 并换行写判断。账本保留中断和对账两份证据，已消费通知不会重发。插件校验窗口、预算、尝试与摘要绑定，任务正文与用途的语义仍由所有者和执行模型核对。文件、命令和外部操作继续由 DSH 权限及原生审批控制。产物引用可用本地 Git 或 SHA-256 对实际内容核验。
+
+### 原结构化授权
 
 在原主控会话以 DSH 所有者发送一条消息。首行写 `授权委托`，随后写 JSON。以下会话 ID 为合成示例。
 
@@ -71,13 +93,42 @@
 
 在发送会话由 DSH 所有者输入 `授权互传 目标会话ID 请求号`，下一行开始写准确正文。助手用 `send_session_message` 按原样发送，从原发送会话用 `session_message_status` 查投递和处理。精确重试只返回已有回执。迁移保留回执内容和去重键。目标轮次正常回复并落盘仅证明处理，项目验收仍要看结构化结果和产物。
 
-### 从 0.4.4-rc.3 换入或回退
+### 从 0.4.4-rc.3 或 0.4.5-rc.2 换入或回退
 
-排空在途消息和委托，保存两个开关与白名单的当前值，关闭两个开关并停用插件。备份当前配置、回执和委托账本，换入固定包后完整重启。两版共用相同设置 ID、回执与账本路径，无需搬移。核对安装版本、白名单、开关及已有回执和委托记录，再按原授权恢复开关。回退时按同一步骤换回固定的 0.4.4-rc.3。
+排空在途消息和委托，保存两个开关与白名单的当前值，关闭两个开关并停用插件。完整停止宿主后备份当前配置、回执和委托账本，再换入固定包并完整重启。各版共用相同设置 ID、回执和账本路径。核对安装版本、白名单、开关和已有回执及委托记录，再按原授权恢复开关。
+
+回退前在 0.5.0 核对并收口或取消其活动协作任务，保全宿主未决的尝试及账本，保持两个开关关闭，再换回已核对的固定旧包。旧版能读回历史，活动协作授权在旧版保持不可派发。若候选无法启动，完整保存升级后的数据后再执行回退，未能读回的协作任务按待对账处理。
+
+### 协作任务隔离复验
+
+用 DSH Web `0.2.2-rc.1`、Node `24.22.2` 和 Chrome。在源码目录离线打包。合成模型、临时 DSH_HOME 和浏览器使用 loopback 网络命名空间。
+
+```sh
+lab="$(mktemp -d)"
+npm pack --offline --pack-destination "$lab"
+npm install --prefix "$lab/tools" playwright-core@1.65.0
+unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+  "$(command -v node)" ./test/collaboration.mjs "$(command -v dsh)" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.1.tgz" full \
+  "$lab/tools/node_modules/playwright-core/index.mjs" "$(command -v google-chrome)"
+unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+  "$(command -v node)" ./test/collaboration.mjs "$(command -v dsh)" \
+  "$lab/local-dsh-session-bridge-0.5.0-rc.1.tgz" stress
+for test in collaboration-direct collaboration-recovery; do
+  unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+    "$(command -v node)" "./test/$test.mjs" "$(command -v dsh)" \
+    "$lab/local-dsh-session-bridge-0.5.0-rc.1.tgz"
+done
+bash .github/ci/run.sh
+```
+
+同布局换包用 `test/collaboration-rollback.mjs <dsh> <固定 0.4.5-rc.2 tgz> <候选 tgz>`，同样在 loopback 命名空间运行。基线包从 `87b06bf9fc8f9b3fc523d0ab227edd9d284c8609` 打包，SHA-256 为 `fb5de752634093c23be783fdf507b86e23ca362250ea787756de09f1e6ff6a91`。
+
+真实模型闭环用 `node ./test/collaboration-pilot.mjs "$(command -v dsh)" "$lab/local-dsh-session-bridge-0.5.0-rc.1.tgz" gpt-6.1-sol`。该脚本使用一次性宿主、合成窗口和文件、loopback 模型适配器，以及已授权的 Codex 模型访问。适配器只传合成任务，并把模型选择交给宿主真实执行的委托工具。
 
 ### 自然语句隔离复验
 
-使用固定 DSH Web 0.2.2-rc.1、Node 24.22.2、Chrome 和 Playwright Core 1.65.0。在源码目录运行下列命令。测试在仅有 loopback 的网络命名空间内启动 Web、浏览器和合成模型，并使用一次性配置与会话。
+使用固定 DSH Web 0.2.2-rc.1、Node 24.22.2、Chrome 和 Playwright Core 1.65.0。在 0.4.5-rc.2 源码目录（`87b06bf`）运行下列命令。测试在仅有 loopback 的网络命名空间内启动 Web、浏览器和合成模型，并使用一次性配置与会话。
 
 ```sh
 lab="$(mktemp -d)"
