@@ -121,15 +121,27 @@ window.__ModuleLoader__.load({
       dictionaries.en['transfer_' + key] = en
     }
 
+    const rowsReordering = Symbol()
+    const reorderWaitMs = 350
+
     function rowPoint(row) {
       if (!row?.isConnected || document.hidden) return
       const { left, right, top, width, height } = row.getBoundingClientRect()
       if (width < 30 || height < 12) return
       const y = top + height / 2
+      let overlap = false
       for (const x of [right - 18, left + width / 2, left + 16]) {
         const hit = document.elementFromPoint(x, y)
         if (hit && row.contains(hit)) return { x, y }
+        if (!overlap && hit) {
+          // The native workspace reorders rows with overlapping wrappers. Wait
+          // briefly only while a sibling row covers an otherwise visible row.
+          const other = hit.closest('[role="treeitem"]') ?? hit.querySelector(':scope > [role="treeitem"]')
+          if (other && other !== row && other.closest('[role="tree"]') === row.closest('[role="tree"]') &&
+              document.elementsFromPoint(x, y).some((element) => row.contains(element))) overlap = true
+        }
       }
+      if (overlap) return rowsReordering
     }
 
     function transferColors(state) {
@@ -161,10 +173,13 @@ window.__ModuleLoader__.load({
       }
 
       function findAnchor(id) {
+        let overlap
         for (const anchor of anchors.get(id) ?? []) {
           const point = rowPoint(anchor.closest('[role="treeitem"]'))
-          if (point) return point
+          if (point === rowsReordering) overlap = point
+          else if (point) return point
         }
+        return overlap
       }
 
       const visibleState = (row) => row.kind === 'task' && row.state === 'executing' ? 'working' : row.state
@@ -233,6 +248,11 @@ window.__ModuleLoader__.load({
               finish(id)
               return
             }
+            if (nextStart === rowsReordering || nextEnd === rowsReordering) {
+              if (!animation && performance.now() < route.deadline) frame = requestAnimationFrame(check)
+              else finish(id)
+              return
+            }
             if (!animation) {
               start = nextStart
               end = nextEnd
@@ -272,7 +292,16 @@ window.__ModuleLoader__.load({
               pending.length = 0
               return
             }
-            const started = pending.splice(0).filter(({ from, to }) => findAnchor(from) && findAnchor(to))
+            const started = []
+            for (const route of pending.splice(0)) {
+              const from = findAnchor(route.from)
+              const to = findAnchor(route.to)
+              if (!from || !to) continue
+              if (from === rowsReordering || to === rowsReordering) {
+                if (performance.now() < route.deadline) pending.push(route)
+              } else started.push(route)
+            }
+            if (pending.length) frame = requestAnimationFrame(launch)
             if (started.length) {
               setFlights((current) => [...current, ...started.slice(0, Math.max(0, 4 - current.length))])
             }
@@ -295,7 +324,10 @@ window.__ModuleLoader__.load({
             if (after === undefined || motion.matches || document.hidden) return
             for (const row of rows) {
               if (pending.length >= 8) break
-              if (row.flight > after) pending.push({ id: row.flight, kind: row.kind, from: row.from, to: row.to, motion })
+              if (row.flight > after) pending.push({
+                id: row.flight, kind: row.kind, from: row.from, to: row.to, motion,
+                deadline: performance.now() + reorderWaitMs,
+              })
             }
             if (pending.length && frame === undefined) frame = requestAnimationFrame(launch)
           }
