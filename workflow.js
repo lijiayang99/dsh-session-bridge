@@ -103,6 +103,7 @@ function setGrantState(grant, state) {
 }
 
 const batchOf = (grant, id) => grant?.batches?.find(({ batch }) => batch === id)
+const isDirectGrant = (grant) => grant?.authorization?.kind === 'native-owner-workflow-direct'
 
 function sent(delivery) {
   return delivery?.state === 'sending' || delivery?.state === 'admitted'
@@ -143,6 +144,18 @@ function continuationIssue(resume) {
   if (continuation.state === 'interrupted' &&
       (!['before_dispatch', 'after_dispatch'].includes(continuation.phase) ||
         typeof continuation.reason !== 'string')) return invalid
+}
+
+function pendingDirectCompletion(grant, job) {
+  const { resume } = job
+  const continuation = resume?.continuation
+  return isDirectGrant(grant) && grant.state === 'collaboration_active' && !grant.closure &&
+    grant.budget === 1 && grant.dispatched === 1 && grant.owner === job.owner &&
+    job.key === taskKey(grant.owner, grant.task) && !job.batch && !job.quarantine &&
+    job.wake?.state === 'reported' && job.report?.status === 'completed' && !job.report.late &&
+    continuation?.state === 'started' && !continuationIssue(resume) && !continuation.dispatches.length &&
+    Number.isSafeInteger(resume.startSeq) && Number.isSafeInteger(continuation.replyAfterSeq) &&
+    continuation.replyAfterSeq >= resume.startSeq
 }
 
 function jobView(job, grant) {
@@ -190,7 +203,10 @@ async function hostEvidence(ctx, job, kind, signal) {
   let inputs = 0
   let mixedTurn = false
   let endReason
-  for (const { type, data } of events) {
+  const replyAfterSeq = kind === 'result' ? job.resume.continuation?.replyAfterSeq : undefined
+  let replySeen = false
+  let replyEndTime
+  for (const { type, data, seq, time } of events) {
     if (type === 'turn/start') {
       turn = data.turn
       inMatchedTurn = false
@@ -210,10 +226,17 @@ async function hostEvidence(ctx, job, kind, signal) {
         }
       }
     }
+    if (inMatchedTurn && type === 'assistant/message' && data.turn === matchedTurn &&
+        Number.isSafeInteger(replyAfterSeq) && seq > replyAfterSeq && !data.interrupted &&
+        data.message?.role === 'assistant' && data.message.content?.some(({ type, text }) =>
+          type === 'text' && typeof text === 'string' && text.trim())) {
+      replySeen = true
+    }
     if (type === 'turn/end') {
       if (inMatchedTurn && data.turn === matchedTurn) {
         endReason = data.reason.kind
         mixedTurn = inputs !== 1
+        if (replySeen && Number.isFinite(time)) replyEndTime = time
       }
       inMatchedTurn = false
       turn = undefined
@@ -225,6 +248,7 @@ async function hostEvidence(ctx, job, kind, signal) {
     consumptions,
     ...(matchedTurn !== undefined ? { turn: matchedTurn } : {}),
     ...(endReason !== undefined ? { endReason } : {}),
+    ...(replyEndTime !== undefined ? { replyEndTime } : {}),
     ...(mixedTurn ? { mixedTurn } : {}),
   }
 }
@@ -472,7 +496,7 @@ export function applyWorkflow(ctx, config, allowed) {
   }
 
   register('delegate_direct',
-    'For the owner’s exact one-window request 把『目标原文』委托给『窗口标题』 or 你给合成查询这个窗口问他今天气温怎么样, call with no arguments. Queue one assignment with the exact goal or question and a 30-minute deadline. The result returns to this controller through workflow_consume. Ask for clarification if the title is ambiguous. Use workflow_propose for broader requests.',
+    'For the owner’s exact one-window request 把『目标原文』委托给『窗口标题』 or 你给合成查询这个窗口问他今天气温怎么样, call once with no arguments. Queue one assignment with the exact goal or question and a 30-minute deadline. When the receipt state is queued, acknowledge the dispatch using its exact targetTitle and end the turn. The result returns to this controller through workflow_consume. Ask for clarification if the title is ambiguous. Use workflow_propose for broader requests.',
     {}, (args, exec, caller) => {
       if (!args || Object.keys(args).length !== 0) return denied('workflow_direct_arguments_not_allowed')
       return authorization.delegateDirect(exec, caller, current, (input, evidence) => {
@@ -491,7 +515,10 @@ export function applyWorkflow(ctx, config, allowed) {
         if (!grant) return denied('grant_not_opened')
         schedule()
         const { task, goal, scopes, budget, expiresAt } = grant
-        return { task, goal, scopes, budget, expiresAt, id: job.id, duplicate: false }
+        return {
+          task, goal, scopes, budget, expiresAt, id: job.id,
+          targetTitle: evidence.targets[0].title, state: 'queued', duplicate: false,
+        }
       })
     })
 
@@ -735,9 +762,9 @@ export function applyWorkflow(ctx, config, allowed) {
     }, ['id', 'attempt', 'token', 'status', 'summary', 'evidence'])
 
   register('consume',
-    'When this turn receives DSH-WORKFLOW RESULT <id>, read the result once. A batch result contains all members, including failures and uncertain work. A successful consume opens the original task in this turn for further dispatch or close.',
+    'When this turn receives DSH-WORKFLOW RESULT <id>, read the result once. A batch result contains all members, including failures and uncertain work. For a successful direct delegation, reply with the result in this turn and the plugin can close the grant on normal turn completion. Other workflows can continue with further dispatch or explicit close.',
     { id: uuidSchema },
-    ({ id }, _exec, caller) => {
+    ({ id }, exec, caller) => {
       const { context, turn } = caller
       if (context.mode === 'main' && context.after === id) return { id, duplicate: true }
       if (context.mode !== 'result' || context.id !== id) return denied('result_wake_required')
@@ -761,6 +788,10 @@ export function applyWorkflow(ctx, config, allowed) {
         job.resume.consumedTurn = turn.number
         job.resume.handoffAt = Date.now()
         job.resume.continuation = { state: 'started', turn: turn.number, at: Date.now(), dispatches: [] }
+        const replyAfterSeq = exec.agent.session.seq
+        if (isDirectGrant(grant) && Number.isSafeInteger(replyAfterSeq) && replyAfterSeq >= turn.input?.sequence) {
+          job.resume.continuation.replyAfterSeq = replyAfterSeq
+        }
         return success({
           ...(batch ? { batch: batchView(grant, batch, jobs) } : jobView(job, grant)),
           task: grant.task, goal: grant.goal, duplicate: false,
@@ -1160,7 +1191,7 @@ export function applyWorkflow(ctx, config, allowed) {
       // Missing evidence is recorded conservatively after the host boundary.
     }
     if (signal.aborted) return
-    ledger.change(({ jobs }, archive) => {
+    ledger.change(({ grants, jobs }, archive) => {
       const stored = jobs[job.id]
       if (!stored) return noChange()
       const issue = continuationIssue(stored.resume)
@@ -1172,6 +1203,16 @@ export function applyWorkflow(ctx, config, allowed) {
       if (continuation?.state !== 'started' || continuation.turn !== started.turn) return noChange()
       const exactTurn = evidence?.turn === continuation.turn && evidence.consumptions === 1
       if (exactTurn && evidence.endReason === 'completed' && !evidence.mixedTurn) {
+        const grant = grants[stored.key]
+        if (pendingDirectCompletion(grant, stored) &&
+            enabled() && available(stored.owner) && evidence.replyEndTime < grant.expiresAt) {
+          // Verify the native reply and close the one-shot grant in the same
+          // transaction. Explicit close and historical proofs remain separate.
+          grant.state = 'closed'
+          grant.closedAt = evidence.replyEndTime
+          grant.closedTurn = continuation.turn
+          grant.outcome = { status: 'completed', summary: stored.report.summary, finalArtifacts: [] }
+        }
         continuation.state = 'verified'
       } else {
         continuation.state = 'interrupted'
@@ -1289,6 +1330,12 @@ export function applyWorkflow(ctx, config, allowed) {
     const now = Date.now()
     return ledger.change((state, archive) => {
       const { grants, jobs } = state
+      const pendingDirect = new Set()
+      for (const job of Object.values(jobs)) {
+        const grant = grants[job?.key]
+        if (stateOf(grant, now) === 'expired' && pendingDirectCompletion(grant, job) &&
+            turns.get(job.owner)?.number !== job.resume.continuation.turn) pendingDirect.add(job.key)
+      }
       let changed = false
       for (const [key, grant] of Object.entries(grants)) {
         const status = stateOf(grant, now)
@@ -1299,6 +1346,9 @@ export function applyWorkflow(ctx, config, allowed) {
           Object.assign(grant.closure, { state: 'expired', settledAt: now })
         }
         if (!terminal(status)) continue
+        // Keep the expired grant only until the scanner can check whether the
+        // consumed result already ended before expiry. Routing still sees expired.
+        if (pendingDirect.has(key)) continue
         grant.state = status
         archive.grant(key, grant)
         delete grants[key]

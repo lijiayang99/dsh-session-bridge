@@ -25,3 +25,9 @@ Time-context cases use the fixed host's source-attributed clock snapshot. They c
 The ordinary send cases check the same native time snapshot around the complete preview and the subsequent owner confirmation. They also verify that an additional owner or relay input containing the same text clears the frozen send authorization.
 
 Colloquial routing cases exercise a bounded owner question to one named window and the original controller's result. They also verify that ambiguous or untrusted inputs do not dispatch, and that a quoted literal with a window suffix outside the title is delivered as ordinary text.
+
+Direct-delegation receipt cases bind the queued status and exact title to the accepted target, preserve that receipt on a same-turn retry, and exercise route drift before dispatch and interruption after claim.
+
+One-shot closeout cases exercise the 128-grant boundary, archived grant and attempt evidence, and a durable reply recovered after restart. The deadline cases distinguish when the native result turn completed from when the plugin restarted. Negative cases cover earlier, blank and interrupted replies, mixed turns, failure, owner action, cancellation, late reports and records created without the reply sequence.
+
+Expiry recovery cases hold the durable history scan to check that an expired grant cannot resume work while awaiting evidence. They verify capacity is reusable once recovery settles, and that a missing turn end or unreadable history results in expiration and no replay.
