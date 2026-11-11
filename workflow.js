@@ -1,10 +1,14 @@
 import { randomUUID } from 'node:crypto'
 import { lstatSync } from 'node:fs'
 import { join } from 'node:path'
+import { hostContext, plainText } from './natural-message.js'
+import { createWorkflowAuthorization, workflowProposalProperties } from './workflow-authorization.js'
 import { openLedger } from './workflow-ledger.js'
+import { registerWorkflowView } from './workflow-view.js'
 
 const ID = /^[a-zA-Z0-9_-]{1,128}$/
 const UUID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/
+const ARTIFACT = /^(?:git:[a-f0-9]{40}|sha256:[a-f0-9]{64})$/
 const validId = (value) => typeof value === 'string' && ID.test(value)
 const validText = (value, max) => typeof value === 'string' && value.trim().length > 0 && value.length <= max
 const maxGrants = 128
@@ -22,6 +26,18 @@ const idSchema = { type: 'string', pattern: ID.source, maxLength: 128 }
 const uuidSchema = { type: 'string', pattern: UUID.source }
 const textSchema = (maxLength) => ({ type: 'string', minLength: 1, maxLength })
 const attemptSchema = { type: 'integer', minimum: 1, maximum: 8 }
+const artifactSchema = { type: 'string', pattern: ARTIFACT.source }
+const artifactList = { type: 'array', maxItems: 8, uniqueItems: true, items: artifactSchema }
+const validArtifact = (value) => typeof value === 'string' && ARTIFACT.test(value)
+const validArtifacts = (value) => Array.isArray(value) && value.length <= 8 &&
+  value.every(validArtifact) && new Set(value).size === value.length
+const assignmentProperties = {
+  item: idSchema, attempt: attemptSchema, target: idSchema, scope: idSchema,
+  instructions: textSchema(4000), acceptance: textSchema(1500),
+  reviewOf: uuidSchema, artifact: artifactSchema,
+}
+const assignmentRequired = ['item', 'attempt', 'target', 'scope', 'instructions', 'acceptance']
+const batchSettled = new Set(['reported', 'failed', 'uncertain', 'skipped', 'reconciled'])
 const output = {
   schema: { type: 'object', additionalProperties: true },
   render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
@@ -52,11 +68,6 @@ function nativeOwner(message) {
     message.source.principal === undefined && validId(message.source.rpcId) && validId(message.id)
 }
 
-function plainText(message) {
-  return message.content?.length === 1 && message.content[0]?.type === 'text'
-    ? message.content[0].text : undefined
-}
-
 function deliveryOf(job, kind) {
   return kind === 'task' ? job.wake : job.resume
 }
@@ -79,9 +90,19 @@ function isWake(job, kind, message) {
 
 function stateOf(grant, now = Date.now()) {
   if (!grant) return 'missing_grant'
-  if (grant.state !== 'active' && grant.state !== 'paused') return grant.state
-  return now >= grant.expiresAt ? 'expired' : grant.state
+  const state = grant.state === 'collaboration_active' ? 'active'
+    : grant.state === 'collaboration_paused' ? 'paused'
+      : grant.state === 'collaboration_closing' ? 'closing' : grant.state
+  if (state !== 'active' && state !== 'paused' && state !== 'closing') return state
+  return now >= grant.expiresAt ? 'expired' : state
 }
+
+// Older versions will read these grants but cannot open their dispatch gate.
+function setGrantState(grant, state) {
+  grant.state = grant.collaboration ? 'collaboration_' + state : state
+}
+
+const batchOf = (grant, id) => grant?.batches?.find(({ batch }) => batch === id)
 
 function sent(delivery) {
   return delivery?.state === 'sending' || delivery?.state === 'admitted'
@@ -124,10 +145,19 @@ function continuationIssue(resume) {
         typeof continuation.reason !== 'string')) return invalid
 }
 
-function jobView(job) {
+function jobView(job, grant) {
   const { id, item, attempt, scope, target, after, instructions, acceptance, wake, claim, report, resume } = job
+  const title = grant?.authorization?.targets?.find(({ id }) => id === target)?.title
+  const stopped = terminal(stateOf(grant))
+  const execution = stopped && (wake.state === 'claimed' || wake.state === 'uncertain' || sent(wake) ||
+    wake.stoppedFrom === 'sending' || wake.stoppedFrom === 'admitted')
+    ? 'host_execution_unconfirmed' : undefined
   return {
     id, item, attempt, scope, target, after, instructions, acceptance,
+    ...(title ? { targetTitle: title } : {}),
+    ...(job.batch ? { batch: job.batch } : {}),
+    ...(job.reviewOf ? { reviewOf: job.reviewOf, artifact: job.artifact } : {}),
+    ...(execution ? { execution } : {}),
     delivery: wake,
     ...(job.quarantine ? { quarantine: job.quarantine } : {}),
     ...(claim ? { claim: { turn: claim.turn, messageId: claim.messageId, at: claim.at } } : {}),
@@ -136,40 +166,90 @@ function jobView(job) {
   }
 }
 
-// Exact durable host evidence. A matching ID in arbitrary text is irrelevant.
-async function hostEvidence(ctx, job, kind, signal) {
-  const handle = await ctx.sessionPersistence.open(receiverOf(job, kind), 'read', { signal })
+async function hostEvents(ctx, sessionId, startSeq, signal) {
+  const handle = await ctx.sessionPersistence.open(sessionId, 'read', { signal })
   try {
     const limit = 20_000
-    const { events } = await handle.read(deliveryOf(job, kind).startSeq, limit, { signal })
+    const { events } = await handle.read(startSeq, limit, { signal })
     if (events.length === limit) throw new Error('Recovery evidence exceeds the scan bound')
-    const queues = { 'next-turn': [], 'next-step': [] }
-    let admissions = 0
-    let consumptions = 0
-    let turn
-    let matchedTurn
-    let endReason
-    for (const { type, data } of events) {
-      if (type === 'turn/start') turn = data.turn
-      if (type === 'agent/inbox/spliced') {
-        queues[data.target].splice(data.start, data.removedCount ?? 0, ...data.inserted)
-        admissions += data.inserted.filter((message) => isWake(job, kind, message)).length
-      }
-      if (type === 'user/message' && isWake(job, kind, data)) {
-        consumptions++
-        if (consumptions === 1) matchedTurn = turn
-      }
-      if (type === 'turn/end' && data.turn === matchedTurn && endReason === undefined) endReason = data.reason.kind
-    }
-    return {
-      pending: Object.values(queues).flat().some((message) => isWake(job, kind, message)),
-      admissions,
-      consumptions,
-      ...(matchedTurn !== undefined ? { turn: matchedTurn } : {}),
-      ...(endReason !== undefined ? { endReason } : {}),
-    }
+    return events
   } finally {
     await handle.close()
+  }
+}
+
+// Exact durable host evidence. A matching ID in arbitrary text is irrelevant.
+async function hostEvidence(ctx, job, kind, signal) {
+  const events = await hostEvents(ctx, receiverOf(job, kind), deliveryOf(job, kind).startSeq, signal)
+  const queues = { 'next-turn': [], 'next-step': [] }
+  let admissions = 0
+  let consumptions = 0
+  let turn
+  let matchedTurn
+  let inMatchedTurn = false
+  let inputs = 0
+  let mixedTurn = false
+  let endReason
+  for (const { type, data } of events) {
+    if (type === 'turn/start') {
+      turn = data.turn
+      inMatchedTurn = false
+      inputs = 0
+    }
+    if (type === 'agent/inbox/spliced') {
+      queues[data.target].splice(data.start, data.removedCount ?? 0, ...data.inserted)
+      admissions += data.inserted.filter((message) => isWake(job, kind, message)).length
+    }
+    if (type === 'user/message' && !hostContext(data)) {
+      inputs++
+      if (isWake(job, kind, data)) {
+        consumptions++
+        if (consumptions === 1) {
+          matchedTurn = turn
+          inMatchedTurn = turn !== undefined
+        }
+      }
+    }
+    if (type === 'turn/end') {
+      if (inMatchedTurn && data.turn === matchedTurn) {
+        endReason = data.reason.kind
+        mixedTurn = inputs !== 1
+      }
+      inMatchedTurn = false
+      turn = undefined
+    }
+  }
+  return {
+    pending: Object.values(queues).flat().some((message) => isWake(job, kind, message)),
+    admissions,
+    consumptions,
+    ...(matchedTurn !== undefined ? { turn: matchedTurn } : {}),
+    ...(endReason !== undefined ? { endReason } : {}),
+    ...(mixedTurn ? { mixedTurn } : {}),
+  }
+}
+
+function closeTurnEvidence(events, closure, anchor) {
+  const [start] = events
+  if (start?.type !== 'turn/start' || start.seq !== closure.startSeq || start.data.turn !== closure.turn) return
+  let inputSeen = false
+  for (let index = 1; index < events.length; index++) {
+    const event = events[index]
+    if (event.type === 'turn/start') return
+    if (event.type === 'user/message' && !hostContext(event.data)) {
+      const { data, seq } = event
+      const matchesSource = anchor ? isWake(anchor, 'result', data)
+        : nativeOwner(data) && data.source.rpcId === closure.input.rpcId
+      if (inputSeen || seq !== closure.input.sequence || data.id !== closure.input.messageId || !matchesSource) return
+      inputSeen = true
+    }
+    if (event.type === 'turn/end') {
+      if (inputSeen && event.data.turn === closure.turn && Number.isFinite(event.time) &&
+          event.time >= closure.requestedAt) {
+        return { sequence: event.seq, time: event.time, reason: event.data.reason?.kind }
+      }
+      return
+    }
   }
 }
 
@@ -191,8 +271,12 @@ export function applyWorkflow(ctx, config, allowed) {
   const activeGrant = (grant) => stateOf(grant) === 'active'
   const grantFor = (grants, key) => grants[key] ?? ledger.history.grant(key)
   const jobFor = (jobs, id) => jobs[id] ?? ledger.history.job(id)
-  const canRoute = (grant, job, kind) => enabled() && available(job.owner) && available(job.target) &&
-    (activeGrant(grant) || (kind === 'result' && stateOf(grant) === 'paused' && job.report?.status === 'needs_owner'))
+  const batchResult = (grant, job, kind) => kind === 'result' && job.batch &&
+    batchOf(grant, job.batch)?.anchor === job.id
+  const canRoute = (grant, job, kind) => enabled() && available(job.owner) &&
+    (available(job.target) || batchResult(grant, job, kind)) &&
+    (activeGrant(grant) || (kind === 'result' && stateOf(grant) === 'paused' &&
+      (batchResult(grant, job, kind) || job.report?.status === 'needs_owner')))
 
   async function existing(id, requestSignal) {
     if (!available(id)) return false
@@ -200,6 +284,7 @@ export function applyWorkflow(ctx, config, allowed) {
     return Boolean(stored?.sizeBytes && stored.header.cwd &&
       stored.header.origin !== 'subagent' && !stored.header.parentSession)
   }
+  const authorization = createWorkflowAuthorization(ctx, { enabled, available, existing, signal })
 
   function controlInput(session, turn, message) {
     if (!nativeOwner(message)) return { mode: 'other' }
@@ -217,7 +302,10 @@ export function applyWorkflow(ctx, config, allowed) {
       if (command === '取消委托') {
         ledger.change(({ grants }) => {
           const grant = grants[key]
-          if (!grant || !['active', 'paused'].includes(stateOf(grant))) return noChange()
+          if (!grant || !['active', 'paused', 'closing'].includes(stateOf(grant))) return noChange()
+          if (grant.closure?.state === 'pending') {
+            Object.assign(grant.closure, { state: 'cancelled', settledAt: Date.now() })
+          }
           grant.state = 'cancelled'
           grant.closedAt = Date.now()
           grant.closedBy = message.id
@@ -230,7 +318,7 @@ export function applyWorkflow(ctx, config, allowed) {
       const resumed = ledger.change(({ grants }) => {
         const grant = grants[key]
         if (!grant || !['active', 'paused'].includes(stateOf(grant))) return noChange(false)
-        if (grant.state === 'paused') grant.state = 'active'
+        if (stateOf(grant) === 'paused') setGrantState(grant, 'active')
         grant.lastOwnerResume = message.id
         grant.lastOwnerResumeAt = Date.now()
         grant.lastOwnerResumeTurn = turn.number
@@ -256,21 +344,33 @@ export function applyWorkflow(ctx, config, allowed) {
           !enabled() || !available(owner) || turns.get(owner) !== turn || turn.mixed) return false
       const now = Date.now()
       compact()
-      return ledger.change(({ grants, jobs }) => {
-        const known = grantFor(grants, key) || ledger.history.jobCount(key) || ledger.history.hasQuarantined(key) ||
-          Object.values(jobs).some((job) => job.key === key)
-        if (known || Object.keys(grants).length >= maxGrants) return noChange(false)
-        grants[key] = {
-          task: input.task, owner, goal: input.goal, scopes: input.scopes,
-          expiresAt: now + input.ttlMinutes * 60_000, state: 'active',
-          openedAt: now, ownerMessageId: messageId, ownerTurn: turn.number,
-        }
-        return success(true)
-      })
+      return Boolean(openGrant(input, key, owner, messageId, turn.number, now))
     } catch {
       if (!signal.aborted) ctx.logger.warn('workflow grant could not be validated')
       return false
     }
+  }
+
+  function openGrant(input, key, owner, messageId, turn, now, evidence, directJob) {
+    return ledger.change(({ grants, jobs }) => {
+      const known = grantFor(grants, key) || ledger.history.jobCount(key) || ledger.history.hasQuarantined(key) ||
+        Object.values(jobs).some((job) => job.key === key)
+      if (known || Object.keys(grants).length >= maxGrants || directJob && Object.keys(jobs).length >= maxJobs) {
+        return noChange()
+      }
+      const grant = {
+        task: input.task, owner, goal: input.goal, scopes: input.scopes,
+        expiresAt: now + input.ttlMinutes * 60_000, state: 'active',
+        openedAt: now, ownerMessageId: messageId, ownerTurn: turn,
+      }
+      if (evidence) Object.assign(grant, {
+        collaboration: true, state: 'collaboration_active', budget: input.budget, dispatched: directJob ? 1 : 0,
+        authorization: evidence, batches: [],
+      })
+      grants[key] = grant
+      if (directJob) jobs[directJob.id] = directJob
+      return success(grant)
+    })
   }
 
   function workflowInput(session, message) {
@@ -285,18 +385,19 @@ export function applyWorkflow(ctx, config, allowed) {
     if (signal.aborted) return
     try {
       if (!available(session.id)) {
+        authorization.clear(session.id)
         turns.delete(session.id)
         return
       }
       if (event.type === 'turn/start') {
-        turns.set(session.id, { number: event.data.turn, context: null, mixed: false, wakes: [] })
+        turns.set(session.id, { number: event.data.turn, startSeq: event.seq, context: null, mixed: false, wakes: [] })
         return
       }
       const turn = turns.get(session.id)
       if (!turn) return
       if (event.type === 'user/message') {
         const source = event.data.source
-        if (source?.kind === 'runtime-context') return
+        if (hostContext(event.data)) return
         const wake = source?.kind === 'agent-message' ? workflowInput(session, event.data) : undefined
         if (wake) {
           turn.wakes.push(wake)
@@ -309,14 +410,23 @@ export function applyWorkflow(ctx, config, allowed) {
         }
         // Mixed native or relay inputs never share workflow authority.
         if (turn.context) turn.mixed = true
-        if (!turn.mixed) turn.context = wake ?? controlInput(session, turn, event.data)
+        const natural = authorization.input(session, turn, event.data)
+        if (!turn.mixed) {
+          turn.context = wake ?? natural ?? controlInput(session, turn, event.data)
+          if (wake || nativeOwner(event.data)) turn.input = {
+            sequence: event.seq, messageId: event.data.id,
+            ...(wake ? {} : { rpcId: source.rpcId }),
+          }
+        }
         // A native owner cancellation still applies even in a mixed turn.
         else if (nativeOwner(event.data) && /^取消委托 /.test(plainText(event.data) ?? '')) {
           controlInput(session, turn, event.data)
         }
         return
       }
+      if (event.type === 'assistant/message') authorization.reply(session, turn, event)
       if (event.type !== 'turn/end' || event.data.turn !== turn.number) return
+      authorization.end(session, turn, event)
       turns.delete(session.id)
       ledger.change(({ jobs }) => {
         let changed = false
@@ -347,11 +457,11 @@ export function applyWorkflow(ctx, config, allowed) {
     return { id, turn, context: turn.context }
   }
 
-  function register(name, description, properties, execute) {
+  function register(name, description, properties, execute, required = Object.keys(properties)) {
     ctx.tools.register({
       name: 'workflow_' + name,
       description,
-      parameters: { type: 'object', additionalProperties: false, required: Object.keys(properties), properties },
+      parameters: { type: 'object', additionalProperties: false, required, properties },
       output,
       execute(args, exec) {
         const caller = current(exec)
@@ -361,60 +471,184 @@ export function applyWorkflow(ctx, config, allowed) {
     })
   }
 
-  register('dispatch',
-    'Delegate to an existing session under this turn’s authorized workflow task. Use item and attempt for idempotency. A retry attempt requires the earlier result to have been consumed. Use the exact owner-approved scope and target.',
-    { task: idSchema, item: idSchema, attempt: attemptSchema, target: idSchema, scope: idSchema, instructions: textSchema(4000), acceptance: textSchema(1500) },
-    async (args, exec, caller) => {
-      const { id, turn, context } = caller
-      const { task, item, attempt, target, scope, instructions, acceptance } = args
-      const key = taskKey(id, task)
-      if (!enabled()) return denied('workflow_disabled')
-      if ((context.mode !== 'authorize' && context.mode !== 'main') || context.key !== key) return denied('main_task_context_required')
-      if (!validId(task) || !validId(item) || !validId(scope) || !validId(target) ||
-          !Number.isInteger(attempt) || attempt < 1 || attempt > 8 ||
-          !validText(instructions, 4000) || !validText(acceptance, 1500)) return denied('invalid_dispatch')
-      if (context.pending && !await context.pending) return denied('grant_not_opened')
-      const grant = ledger.read().grants[key]
-      if (!grant || !activeGrant(grant)) return denied('grant_inactive')
-      if (target === id || !grant.scopes.find(({ name }) => name === scope)?.targets.includes(target)) return denied('scope_or_target_denied')
-      if (!await existing(target, exec.signal)) return denied('existing_target_required')
-      if (current(exec)?.turn !== turn || turn.context !== context || !enabled()) return denied('main_task_context_required')
-      compact()
-      const result = ledger.change(({ grants, jobs }) => {
-        if (!activeGrant(grants[key]) || !available(target)) return noChange(denied('grant_inactive'))
-        const sameGrant = Object.values(jobs).filter((job) => job.key === key)
+  register('delegate_direct',
+    'For the owner’s exact one-window request 把『目标原文』委托给『窗口标题』, open and queue the exact goal with the fixed one-assignment scope and 30-minute deadline. Call with no arguments. Ask for clarification if the title is ambiguous; use workflow_propose for broader requests.',
+    {}, (args, exec, caller) => {
+      if (!args || Object.keys(args).length !== 0) return denied('workflow_direct_arguments_not_allowed')
+      return authorization.delegateDirect(exec, caller, current, (input, evidence) => {
+        const key = taskKey(caller.id, input.task)
+        const now = Date.now()
+        const target = input.scopes[0].targets[0]
+        const job = {
+          id: randomUUID(), key, owner: caller.id, target, item: 'execute', attempt: 1, scope: 'execute',
+          instructions: input.goal, acceptance: '按所有者原文完成目标并回报实际结果及证据。',
+          after: null, dispatchedTurn: caller.turn.number, createdAt: now,
+          wake: { id: randomUUID(), state: 'queued', updatedAt: now },
+        }
+        compact()
+        const grant = openGrant(input, key, caller.id, evidence.request.messageId,
+          caller.turn.number, now, evidence, job)
+        if (!grant) return denied('grant_not_opened')
+        schedule()
+        const { task, goal, scopes, budget, expiresAt } = grant
+        return { task, goal, scopes, budget, expiresAt, id: job.id, duplicate: false }
+      })
+    })
+
+  register('propose',
+    'For an explicit owner delegation request in this turn, prepare a bounded plan with its goal, window titles, purposes, expiry and total assignment budget. Mark each formal review scope with review:true when the owner requests review. Clarify uncertain titles or scope first. If preview is returned, copy its exact text as your entire final reply and wait for the owner.',
+    workflowProposalProperties, (args, exec, caller) => authorization.propose(args, exec, caller, current))
+
+  register('confirm',
+    'Open the frozen workflow plan after the owner replies 确认委托 in the original controller. Call with no arguments. A successful response allows dispatch in this turn.',
+    {}, async (_args, exec, caller) => {
+      const result = await authorization.confirm(exec, caller, current, (input, evidence) => {
+        const key = taskKey(caller.id, input.task)
+        compact()
+        const grant = openGrant(input, key, caller.id, evidence.confirmation.messageId,
+          caller.turn.number, Date.now(), evidence)
+        if (!grant) return denied('grant_not_opened')
+        const { task, goal, scopes, budget, expiresAt } = grant
+        return { task, goal, scopes, budget, expiresAt, duplicate: false }
+      })
+      if (result?.duplicate === false && current(exec)?.context === caller.context) {
+        caller.turn.context = { mode: 'main', key: taskKey(caller.id, result.task) }
+      }
+      return result
+    })
+
+  const validAssignment = (entry) => entry && Object.keys(entry).every((key) => Object.hasOwn(assignmentProperties, key)) &&
+    validId(entry.item) && validId(entry.scope) && validId(entry.target) &&
+    Number.isInteger(entry.attempt) && entry.attempt >= 1 && entry.attempt <= 8 &&
+    validText(entry.instructions, 4000) && validText(entry.acceptance, 1500) &&
+    (entry.reviewOf === undefined && entry.artifact === undefined ||
+      typeof entry.reviewOf === 'string' && UUID.test(entry.reviewOf) && validArtifact(entry.artifact))
+
+  function sameAssignment(job, entry, batch) {
+    return job?.batch === batch && Object.keys(assignmentProperties).every((key) => job?.[key] === entry[key])
+  }
+
+  function resultJob(grant, job, jobs) {
+    const anchor = job?.batch && batchOf(grant, job.batch)?.anchor
+    return job?.batch ? (anchor ? jobFor(jobs, anchor) : undefined) : job
+  }
+
+  async function dispatch(task, assignments, exec, caller, group) {
+    const { id, turn, context } = caller
+    const key = taskKey(id, task)
+    if (!enabled()) return denied('workflow_disabled')
+    if ((context.mode !== 'authorize' && context.mode !== 'main') || context.key !== key) return denied('main_task_context_required')
+    if (!validId(task) || !assignments.every(validAssignment)) return denied('invalid_dispatch')
+    if (context.pending && !await context.pending) return denied('grant_not_opened')
+    const grant = ledger.read().grants[key]
+    if (!activeGrant(grant)) return denied('grant_inactive')
+    if (!grant.collaboration && (group || assignments.some(({ reviewOf }) => reviewOf))) {
+      return denied('collaboration_grant_required')
+    }
+    const formalReview = grant.collaboration && grant.scopes.some(({ review }) => review)
+    const inScope = ({ scope, target, reviewOf }) => {
+      const route = grant.scopes.find(({ name }) => name === scope)
+      return target !== id && available(target) && route?.targets.includes(target) &&
+        (!formalReview || Boolean(route.review) === Boolean(reviewOf))
+    }
+    if (!assignments.every(inScope)) return denied('scope_or_target_denied')
+    const targets = [...new Set(assignments.map(({ target }) => target))]
+    if (!(await Promise.all(targets.map((target) => existing(target, exec.signal)))).every(Boolean)) {
+      return denied('existing_target_required')
+    }
+    if (current(exec)?.turn !== turn || turn.context !== context || !enabled()) return denied('main_task_context_required')
+    compact()
+    const result = ledger.change(({ grants, jobs }) => {
+      const grant = grants[key]
+      if (!activeGrant(grant) || !targets.every(available)) return noChange(denied('grant_inactive'))
+      const knownBatch = group && batchOf(grant, group.batch)
+      if (knownBatch) {
+        const exact = knownBatch.completion === group.completion && knownBatch.members.length === assignments.length &&
+          knownBatch.members.every((jobId, index) => sameAssignment(jobFor(jobs, jobId), assignments[index], group.batch))
+        return noChange(exact
+          ? { batch: group.batch, ids: knownBatch.members, duplicate: true }
+          : denied('batch_conflict'))
+      }
+      const sameGrant = Object.values(jobs).filter((job) => job.key === key)
+      for (const entry of assignments) {
+        const { item, attempt, target, scope, reviewOf, artifact } = entry
         const findAttempt = (number) => sameGrant.find((job) => job.item === item && job.attempt === number) ??
           ledger.history.attempt(key, item, number)
         if (ledger.history.quarantinedAttempt(key, item, attempt)) return noChange(denied('attempt_quarantined'))
         const same = findAttempt(attempt)
-        if (same) {
-          const exact = same.target === target && same.scope === scope && same.instructions === instructions && same.acceptance === acceptance
-          return noChange(exact ? { id: same.id, duplicate: true } : denied('attempt_conflict'))
+        if (same) return noChange(!group && sameAssignment(same, entry)
+          ? { id: same.id, duplicate: true } : denied('attempt_conflict'))
+        if (attempt > 1) {
+          const previous = findAttempt(attempt - 1)
+          if (previous?.target !== target || previous.scope !== scope ||
+              resultJob(grant, previous, jobs)?.resume?.state !== 'consumed') {
+            return noChange(denied('previous_attempt_not_consumed'))
+          }
         }
-        const previous = attempt > 1 ? findAttempt(attempt - 1) : undefined
-        if (attempt > 1 && (previous?.target !== target || previous.scope !== scope || previous.resume?.state !== 'consumed')) {
-          return noChange(denied('previous_attempt_not_consumed'))
+        if (reviewOf) {
+          const producer = jobFor(jobs, reviewOf)
+          if (producer?.key !== key || producer.owner !== id || producer.target === target ||
+              producer.report?.status !== 'completed' || producer.report.late ||
+              !producer.report.artifacts?.includes(artifact)) return noChange(denied('artifact_binding_required'))
         }
-        if (sameGrant.length >= maxPerGrant || Object.keys(jobs).length >= maxJobs) return noChange(denied('ledger_limit'))
+      }
+      if (sameGrant.length + assignments.length > maxPerGrant || Object.keys(jobs).length + assignments.length > maxJobs) {
+        return noChange(denied('ledger_limit'))
+      }
+      if (grant.collaboration && grant.dispatched + assignments.length > grant.budget) {
+        return noChange(denied('assignment_budget_exhausted'))
+      }
+      const continuation = context.after && jobs[context.after]?.resume?.continuation
+      if (context.after && (continuation?.state !== 'started' || continuation.turn !== turn.number)) {
+        return noChange(denied('continuation_not_active'))
+      }
+      const now = Date.now()
+      const ids = assignments.map(({ item, attempt, target, scope, instructions, acceptance, reviewOf, artifact }) => {
         const jobId = randomUUID()
-        if (context.after) {
-          const continuation = jobs[context.after]?.resume?.continuation
-          if (continuation?.state !== 'started' || continuation.turn !== turn.number) return noChange(denied('continuation_not_active'))
-          continuation.dispatches.push(jobId)
-        }
         jobs[jobId] = {
           id: jobId, key, owner: id, target, item, attempt, scope, instructions, acceptance,
-          after: context.after ?? null, dispatchedTurn: turn.number, createdAt: Date.now(),
-          wake: { id: randomUUID(), state: 'queued', updatedAt: Date.now() },
+          ...(group ? { batch: group.batch } : {}),
+          ...(reviewOf ? { reviewOf, artifact } : {}),
+          after: context.after ?? null, dispatchedTurn: turn.number, createdAt: now,
+          wake: { id: randomUUID(), state: 'queued', updatedAt: now },
         }
-        return success({ id: jobId, state: 'queued', duplicate: false })
+        return jobId
       })
-      schedule()
-      return result
+      if (continuation) continuation.dispatches.push(...ids)
+      if (grant.collaboration) grant.dispatched += ids.length
+      if (group) {
+        grant.batches.push({ ...group, members: ids })
+        return success({ batch: group.batch, ids, duplicate: false })
+      }
+      return success({ id: ids[0], state: 'queued', duplicate: false })
+    })
+    schedule()
+    return result
+  }
+
+  register('dispatch',
+    'Delegate to an existing session under this turn’s authorized workflow task. Use item and attempt for idempotency. A retry requires the earlier result to have been consumed. For a review, bind reviewOf to the producer job id and artifact to its exact reported digest.',
+    { task: idSchema, ...assignmentProperties },
+    ({ task, ...entry }, exec, caller) => dispatch(task, [entry], exec, caller),
+    ['task', ...assignmentRequired])
+
+  register('dispatch_batch',
+    'Atomically dispatch a named group under a confirmed collaboration grant. Each assignment uses the same fields as workflow_dispatch except task. The controller receives one result when all assignments have reported, failed or need reconciliation. completion describes the batch acceptance condition.',
+    {
+      task: idSchema, batch: idSchema, completion: textSchema(1000),
+      assignments: { type: 'array', minItems: 1, maxItems: 16, items: {
+        type: 'object', additionalProperties: false, required: assignmentRequired, properties: assignmentProperties,
+      } },
+    },
+    ({ task, batch, completion, assignments }, exec, caller) => {
+      if (!validId(batch) || !validText(completion, 1000) || !Array.isArray(assignments) ||
+          assignments.length < 1 || assignments.length > 16 ||
+          new Set(assignments.map((entry) => entry?.item)).size !== assignments.length) return denied('invalid_batch')
+      return dispatch(task, assignments, exec, caller, { batch, completion })
     })
 
   register('claim',
-    'When this turn receives DSH-WORKFLOW TASK <id>, call once to claim the task and get its instructions, attempt number and claim token. Do not execute on a duplicate or rejected claim.',
+    'When this turn receives DSH-WORKFLOW TASK <id>, call once to claim the task and get its instructions, approved purpose, attempt number and claim token. Execute only under that purpose and the host’s permissions. Do not execute on a duplicate or rejected claim.',
     { id: uuidSchema },
     ({ id }, _exec, caller) => {
       const { context, turn } = caller
@@ -432,6 +666,8 @@ export function applyWorkflow(ctx, config, allowed) {
         return success({
           id, task: grant.task, goal: grant.goal, item: job.item, attempt: job.attempt,
           owner: job.owner, scope: job.scope, instructions: job.instructions, acceptance: job.acceptance,
+          ...(grant.collaboration ? { purpose: grant.scopes.find(({ name }) => name === job.scope)?.purpose } : {}),
+          ...(job.reviewOf ? { reviewOf: job.reviewOf, artifact: job.artifact } : {}),
           expiresAt: grant.expiresAt, token, duplicate: false,
         })
       })
@@ -440,18 +676,21 @@ export function applyWorkflow(ctx, config, allowed) {
     })
 
   register('report',
-    'Submit the structured result in the exact turn that claimed the task. Use its id, attempt and claim token. Include concrete evidence references for an approved or returned review. Closing a turn without this tool does not report completion.',
+    'Submit the structured result in the exact turn that claimed the task. Include concrete evidence. A completed producer may report immutable artifacts. An approval or change request for a bound review must give reviewedArtifact exactly as claimed.',
     {
       id: uuidSchema, attempt: attemptSchema, token: uuidSchema,
       status: { type: 'string', enum: statuses },
       summary: textSchema(2400),
       evidence: { type: 'array', maxItems: 8, items: textSchema(300) },
+      artifacts: artifactList, reviewedArtifact: artifactSchema,
     },
-    ({ id, attempt, token, status, summary, evidence }, _exec, caller) => {
+    ({ id, attempt, token, status, summary, evidence, artifacts, reviewedArtifact }, _exec, caller) => {
       const { context, turn } = caller
       if (context.mode !== 'task' || context.id !== id) return denied('task_wake_required')
       if (!statuses.includes(status) || !validText(summary, 2400) || !Array.isArray(evidence) ||
           evidence.length > 8 || !evidence.every((entry) => validText(entry, 300)) ||
+          (artifacts !== undefined && (!validArtifacts(artifacts) || status !== 'completed')) ||
+          (reviewedArtifact !== undefined && !validArtifact(reviewedArtifact)) ||
           (['approved', 'changes_requested'].includes(status) && evidence.length === 0)) return denied('invalid_report')
       const result = ledger.change(({ grants, jobs }) => {
         const job = jobFor(jobs, id)
@@ -460,27 +699,43 @@ export function applyWorkflow(ctx, config, allowed) {
             claim.turn !== turn.number || claim.messageId !== context.messageId) return noChange(denied('claim_mismatch'))
         if (job.report) {
           const exact = job.report.status === status && job.report.summary === summary &&
-            JSON.stringify(job.report.evidence) === JSON.stringify(evidence)
+            JSON.stringify(job.report.evidence) === JSON.stringify(evidence) &&
+            JSON.stringify(job.report.artifacts) === JSON.stringify(artifacts) &&
+            job.report.reviewedArtifact === reviewedArtifact
           return noChange(exact ? { id, recorded: true, duplicate: true, late: job.report.late } : denied('report_conflict'))
         }
         if (!jobs[id] || job.wake.state !== 'claimed') return noChange(denied('claim_not_active'))
         const grant = grants[job.key]
+        const collaborative = grantFor(grants, job.key)?.collaboration
+        const reviewVerdict = status === 'approved' || status === 'changes_requested'
+        if (!collaborative && (artifacts !== undefined || reviewedArtifact !== undefined)) {
+          return noChange(denied('collaboration_grant_required'))
+        }
+        if ((collaborative && reviewVerdict && (!job.reviewOf || reviewedArtifact !== job.artifact)) ||
+            (reviewedArtifact !== undefined && (!job.reviewOf || reviewedArtifact !== job.artifact)) ||
+            (job.reviewOf && (status === 'completed' || artifacts !== undefined))) {
+          return noChange(denied('artifact_binding_required'))
+        }
         const late = !enabled() || !available(job.owner) || !available(job.target) ||
           !['active', 'paused'].includes(stateOf(grant))
-        job.report = { status, summary, evidence, reporter: caller.id, turn: turn.number, at: Date.now(), late }
+        job.report = {
+          status, summary, evidence, reporter: caller.id, turn: turn.number, at: Date.now(), late,
+          ...(artifacts !== undefined ? { artifacts } : {}),
+          ...(reviewedArtifact !== undefined ? { reviewedArtifact } : {}),
+        }
         setDelivery(job.wake, 'reported')
-        if (!late) {
+        if (!late && !job.batch) {
           job.resume = { id: randomUUID(), state: 'queued', updatedAt: Date.now() }
-          if (status === 'needs_owner') grant.state = 'paused'
+          if (status === 'needs_owner') setGrantState(grant, 'paused')
         }
         return success({ id, recorded: true, duplicate: false, late })
       })
       schedule()
       return result
-    })
+    }, ['id', 'attempt', 'token', 'status', 'summary', 'evidence'])
 
   register('consume',
-    'When this turn receives DSH-WORKFLOW RESULT <id>, read the structured result once. Only a successful consume opens the original task in this turn for further dispatch or close.',
+    'When this turn receives DSH-WORKFLOW RESULT <id>, read the result once. A batch result contains all members, including failures and uncertain work. A successful consume opens the original task in this turn for further dispatch or close.',
     { id: uuidSchema },
     ({ id }, _exec, caller) => {
       const { context, turn } = caller
@@ -493,6 +748,10 @@ export function applyWorkflow(ctx, config, allowed) {
         const grant = grants[job.key]
         if (!canRoute(grant, job, 'result') || !jobs[id]) return noChange(denied('grant_inactive'))
         if (!sent(job.resume)) return noChange(denied('result_not_consumable'))
+        const batch = batchOf(grant, job.batch)
+        if (job.batch && (batch?.anchor !== id || !batchMembers(grant, batch, jobs))) {
+          return noChange(denied('batch_evidence_unavailable'))
+        }
         const issue = continuationIssue(job.resume)
         if (issue) {
           quarantineContinuation(job, issue, jobs, archive)
@@ -502,12 +761,70 @@ export function applyWorkflow(ctx, config, allowed) {
         job.resume.consumedTurn = turn.number
         job.resume.handoffAt = Date.now()
         job.resume.continuation = { state: 'started', turn: turn.number, at: Date.now(), dispatches: [] }
-        return success({ ...jobView(job), task: grant.task, goal: grant.goal, duplicate: false })
+        return success({
+          ...(batch ? { batch: batchView(grant, batch, jobs) } : jobView(job, grant)),
+          task: grant.task, goal: grant.goal, duplicate: false,
+        })
       })
       if (result.duplicate === false) turn.context = { mode: 'main', key: taskKey(caller.id, result.task), after: id }
       schedule()
       return result
     })
+
+  function taskJobs(jobs, owner, key) {
+    return [...Object.values(jobs).filter((job) => job?.key === key), ...ledger.history.jobsFor(key)]
+      .filter((job) => job?.key === key && job.owner === owner)
+  }
+
+  function batchMembers(grant, batch, jobs) {
+    const key = taskKey(grant.owner, grant.task)
+    const members = batch.members.map((id) => jobFor(jobs, id))
+    return members.every((job) => job?.key === key && job.owner === grant.owner && job.batch === batch.batch)
+      ? members : undefined
+  }
+
+  function batchView(grant, batch, jobs) {
+    const members = batchMembers(grant, batch, jobs)
+    const anchor = members?.find(({ id }) => id === batch.anchor)
+    return {
+      batch: batch.batch, completion: batch.completion,
+      state: members ? anchor?.resume?.state ?? (terminal(stateOf(grant)) ? stateOf(grant) : 'collecting') : 'needs_reconciliation',
+      items: members?.map((job) => jobView(job, grant)) ?? [],
+      ...(anchor?.resume?.continuation ? { continuation: anchor.resume.continuation } : {}),
+    }
+  }
+
+  function taskStatus(owner, task) {
+    const key = taskKey(owner, task)
+    const { grants, jobs } = ledger.read()
+    const recorded = grantFor(grants, key)
+    const grant = recorded?.owner === owner && recorded.task === task ? recorded : undefined
+    const rows = taskJobs(jobs, owner, key)
+    const quarantined = ledger.history.quarantined(key).map(({ id, reason }) => ({ id, reason }))
+    if (!grant && !rows.length && !quarantined.length) return denied('grant_not_found')
+    rows.sort((a, b) => a.createdAt - b.createdAt)
+    return {
+      ...(grant ?? { task, owner }), state: stateOf(grant), workflowEnabled: enabled(),
+      jobs: rows.map((job) => jobView(job, grant)), archivedJobs: ledger.history.jobCount(key), quarantined,
+      ...(grant?.batches ? { batches: grant.batches.map((batch) => batchView(grant, batch, jobs)) } : {}),
+    }
+  }
+
+  ctx.inject(['connection'], (scope) => {
+    if (!scope.connection) return
+    registerWorkflowView(scope, (owner, task) => {
+      if (signal.aborted || !available(owner)) return denied('route_not_allowed')
+      if (task !== undefined) return taskStatus(owner, task)
+      const grants = [...Object.values(ledger.read().grants), ...ledger.history.grantsFor(owner)]
+        .filter((grant) => grant?.owner === owner && validId(grant.task))
+        .sort((a, b) => b.openedAt - a.openedAt)
+        .map((grant) => ({
+          task: grant.task, owner: grant.owner, goal: grant.goal, expiresAt: grant.expiresAt,
+          openedAt: grant.openedAt, outcome: grant.outcome, state: stateOf(grant),
+        }))
+      return { tasks: grants, workflowEnabled: enabled() }
+    })
+  })
 
   register('status',
     'Read the local ledger for a task in its original main session. Use an owner prompt or that task’s workflow continuation. Uncertain items require review and are never automatically resent.',
@@ -518,16 +835,7 @@ export function applyWorkflow(ctx, config, allowed) {
       if (context.mode !== 'owner' && context.key !== key) return denied('main_task_context_required')
       if (context.pending) await context.pending
       if (current(exec)?.turn !== turn || turn.context !== context) return denied('main_task_context_required')
-      const { grants, jobs } = ledger.read()
-      const grant = grantFor(grants, key)
-      const rows = [...Object.values(jobs).filter((job) => job?.key === key), ...ledger.history.jobsFor(key)]
-      const quarantined = ledger.history.quarantined(key).map(({ id, reason }) => ({ id, reason }))
-      if (!grant && !rows.length && !quarantined.length) return denied('grant_not_found')
-      rows.sort((a, b) => a.createdAt - b.createdAt)
-      return {
-        ...(grant ?? { task, owner: caller.id }), state: stateOf(grant), workflowEnabled: enabled(),
-        jobs: rows.map(jobView), archivedJobs: ledger.history.jobCount(key), quarantined,
-      }
+      return taskStatus(caller.id, task)
     })
 
   register('item_status',
@@ -542,31 +850,97 @@ export function applyWorkflow(ctx, config, allowed) {
       const { grants, jobs } = ledger.read()
       const job = jobFor(jobs, id)
       if (job?.key !== key || job.owner !== caller.id) return denied('job_not_found')
-      return { task, grantState: stateOf(grantFor(grants, key)), ...jobView(job) }
+      const grant = grantFor(grants, key)
+      return { task, grantState: stateOf(grant), ...jobView(job, grant) }
     })
 
   register('close',
-    'Close a finished workflow task in its bound main turn, after all work and reports are settled. The native owner can cancel with 取消委托 <task>.',
-    { task: idSchema },
-    async ({ task }, exec, caller) => {
+    'Request closeout of a finished workflow in its bound main turn. A collaboration task returns closing until this exact native turn ends normally and its completion is durable. Finish the turn after requesting closeout. Include outcome and summary. completed requires successful latest attempts and exact finalArtifacts backed by the latest approved review whenever review was requested. Use partial or failed for settled failures. The owner can cancel with 取消委托 <task>.',
+    {
+      task: idSchema, outcome: { type: 'string', enum: ['completed', 'partial', 'failed'] },
+      summary: textSchema(2400), finalArtifacts: artifactList,
+    },
+    async ({ task, outcome, summary, finalArtifacts }, exec, caller) => {
       const { id, turn, context } = caller
       const key = taskKey(id, task)
       if (!enabled() || (context.mode !== 'main' && context.mode !== 'authorize') || context.key !== key) return denied('main_task_context_required')
       if (context.pending && !await context.pending) return denied('grant_not_opened')
-      if (current(exec)?.turn !== turn || turn.context !== context) return denied('main_task_context_required')
-      return ledger.change(({ grants, jobs }) => {
+      if (!enabled() || current(exec)?.turn !== turn || turn.context !== context) return denied('main_task_context_required')
+      const result = ledger.change(({ grants, jobs }) => {
         const grant = grants[key]
+        if (grant?.collaboration && stateOf(grant) === 'closing') {
+          const closure = grant.closure
+          if (closure?.state !== 'pending' || closure.turn !== turn.number || closure.startSeq !== turn.startSeq) {
+            return noChange(denied('close_pending'))
+          }
+          const requested = closure.requestedOutcome
+          const exact = requested.status === outcome && requested.summary === summary &&
+            JSON.stringify(requested.finalArtifacts) === JSON.stringify(finalArtifacts ?? [])
+          return noChange(exact ? { task, state: 'closing', duplicate: true } : denied('close_conflict'))
+        }
         if (!activeGrant(grant)) return noChange(denied('grant_inactive'))
         const unsettled = Object.values(jobs).some((job) => job.key === key &&
           (!['reported', 'failed', 'skipped', 'reconciled'].includes(job.wake.state) ||
             job.resume && !['consumed', 'failed', 'skipped', 'reconciled'].includes(job.resume.state)))
         if (unsettled) return noChange(denied('work_unsettled'))
+        if (grant.collaboration) {
+          if (!['completed', 'partial', 'failed'].includes(outcome) || !validText(summary, 2400) ||
+              finalArtifacts !== undefined && !validArtifacts(finalArtifacts)) return noChange(denied('invalid_outcome'))
+          if (!Number.isSafeInteger(turn.startSeq) || !Number.isSafeInteger(turn.input?.sequence)) {
+            return noChange(denied('close_turn_identity_unavailable'))
+          }
+          if (grant.batches.some((batch) => !batch.anchor || !batchMembers(grant, batch, jobs) ||
+              jobFor(jobs, batch.anchor)?.resume?.state !== 'consumed')) return noChange(denied('batch_not_consumed'))
+          const all = taskJobs(jobs, id, key)
+          const latest = new Map()
+          for (const job of all) if ((latest.get(job.item)?.attempt ?? 0) < job.attempt) latest.set(job.item, job)
+          const jobsAtClose = [...latest.values()]
+          const producers = jobsAtClose.filter((job) => !job.reviewOf && job.report?.status === 'completed' && !job.report.late)
+          const reviews = jobsAtClose.filter((job) => job.reviewOf)
+          const refs = finalArtifacts ?? []
+          const produced = (artifact) => producers.some((job) => job.report.artifacts?.includes(artifact))
+          if (!refs.every(produced)) return noChange(denied('artifact_binding_required'))
+          if (outcome === 'completed') {
+            const verified = (job) => {
+              const result = resultJob(grant, job, jobs)
+              const continuation = result?.resume?.continuation
+              return result?.resume?.state === 'consumed' && (continuation?.state === 'verified' ||
+                (continuation?.state === 'interrupted' &&
+                  continuation.reconciliation?.decision === 'reviewed_without_replay' &&
+                  continuation.reconciliation.owner === id) ||
+                (continuation?.state === 'started' && result.id === context.after && continuation.turn === turn.number))
+            }
+            if (!jobsAtClose.length || ledger.history.hasQuarantined(key) || jobsAtClose.some((job) =>
+              job.wake.state !== 'reported' || job.report?.late ||
+              !['completed', 'approved'].includes(job.report?.status) || !verified(job))) {
+              return noChange(denied('successful_attempts_required'))
+            }
+            const approved = (artifact) => producers.some((producer) => producer.report.artifacts?.includes(artifact) &&
+              reviews.some((job) => job.reviewOf === producer.id && job.report.status === 'approved' &&
+                job.artifact === artifact && job.report.reviewedArtifact === artifact))
+            const reviewRequired = grant.scopes.some(({ review }) => review)
+            if ((reviewRequired || reviews.length) && (!refs.length || !refs.every(approved) || reviews.some((job) =>
+              !producers.some(({ id }) => id === job.reviewOf)))) return noChange(denied('approved_artifacts_required'))
+          }
+          if (grant.closure?.state === 'interrupted') grant.previousClosure = grant.closure
+          grant.closure = {
+            state: 'pending', turn: turn.number, startSeq: turn.startSeq, input: turn.input,
+            after: context.after ?? null, requestedAt: Date.now(),
+            requestedOutcome: { status: outcome, summary, finalArtifacts: refs },
+          }
+          setGrantState(grant, 'closing')
+          return success({ task, state: 'closing', duplicate: false })
+        } else if (outcome !== undefined || summary !== undefined || finalArtifacts !== undefined) {
+          return noChange(denied('collaboration_grant_required'))
+        }
         grant.state = 'closed'
         grant.closedAt = Date.now()
         grant.closedTurn = turn.number
         return success({ task, state: 'closed' })
       })
-    })
+      schedule()
+      return result
+    }, ['task'])
 
   const isIdle = (agent) => agent.status === 'idle' && !agent.inbox.hasPending && !turns.has(agent.session.id)
 
@@ -624,7 +998,18 @@ export function applyWorkflow(ctx, config, allowed) {
       const resolved = await bounded(() => ctx.sessionController.resolveAgent(to))
       agent = resolved.agent
     } catch {
-      if (!signal.aborted) checkpoint(job, kind, 'queued', 'failed', 'destination_resolution_failed_before_send')
+      if (!signal.aborted) updateDelivery(job, kind, 'queued', (delivery, grant) => {
+        if (!grant?.collaboration) {
+          setDelivery(delivery, 'failed', 'destination_resolution_failed_before_send')
+          return success(true)
+        }
+        delivery.lookupFailures = (delivery.lookupFailures ?? 0) + 1
+        const failed = delivery.lookupFailures >= 3
+        setDelivery(delivery, failed ? 'failed' : 'queued',
+          failed ? 'destination_resolution_failed_before_send' : 'waiting_for_destination_resolution')
+        if (!failed) delivery.retryAt = Date.now() + delivery.lookupFailures * 1500
+        return success(true)
+      })
       return
     }
     if (signal.aborted) return
@@ -636,6 +1021,7 @@ export function applyWorkflow(ctx, config, allowed) {
     const ready = updateDelivery(job, kind, 'queued', (delivery, grant, stored, { grants, jobs }) => {
       if (!canRoute(grant, stored, kind) || retainedSlot(Object.values(jobs), stored, kind, grants)) return noChange(false)
       delivery.startSeq = agent.session.seq
+      delete delivery.retryAt
       setDelivery(delivery, 'sending')
       return success(true)
     })
@@ -713,10 +1099,14 @@ export function applyWorkflow(ctx, config, allowed) {
 
   async function ownerReconcile(owner, turn, message, task, id, kind, reason) {
     const key = taskKey(owner, task)
+    const canReviewContinuation = (grant, item) => grant?.collaboration && kind === 'result' &&
+      item?.state === 'consumed' && item.continuation?.state === 'interrupted' && !item.continuation.reconciliation
     try {
-      const job = jobFor(ledger.read().jobs, id)
+      const state = ledger.read()
+      const job = jobFor(state.jobs, id)
       const delivery = job && deliveryOf(job, kind)
-      if (job?.key !== key || job.owner !== owner || delivery?.state !== 'uncertain') return false
+      const continuation = canReviewContinuation(grantFor(state.grants, key), delivery)
+      if (job?.key !== key || job.owner !== owner || delivery?.state !== 'uncertain' && !continuation) return false
       let evidence = { state: 'host_call_not_started' }
       if (Number.isSafeInteger(delivery.startSeq)) {
         try {
@@ -727,16 +1117,24 @@ export function applyWorkflow(ctx, config, allowed) {
         }
       }
       if (signal.aborted || !available(owner) || turns.get(owner) !== turn || turn.mixed) return false
-      const result = ledger.change(({ jobs }, archive) => {
+      const result = ledger.change(({ jobs, grants }, archive) => {
         const stored = jobFor(jobs, id)
         const item = stored && deliveryOf(stored, kind)
-        if (stored?.key !== key || stored.owner !== owner || item?.state !== 'uncertain') return noChange(false)
-        item.reconciliation = {
-          decision: 'release_without_replay', previousReason: item.reason ?? null, reason,
+        if (stored?.key !== key || stored.owner !== owner) return noChange(false)
+        if (continuation ? !canReviewContinuation(grantFor(grants, key), item) : item?.state !== 'uncertain') {
+          return noChange(false)
+        }
+        const record = {
+          decision: continuation ? 'reviewed_without_replay' : 'release_without_replay',
+          previousReason: (continuation ? item.continuation.reason : item.reason) ?? null, reason,
           owner, ownerMessageId: message.id, ownerRpcId: message.source.rpcId, ownerTurn: turn.number,
           at: Date.now(), evidence,
         }
-        setDelivery(item, 'reconciled')
+        if (continuation) item.continuation.reconciliation = record
+        else {
+          item.reconciliation = record
+          setDelivery(item, 'reconciled')
+        }
         if (jobs[id]) return success(true)
         archive.job(stored)
         return noChange(true)
@@ -772,15 +1170,65 @@ export function applyWorkflow(ctx, config, allowed) {
       }
       const continuation = stored.resume?.continuation
       if (continuation?.state !== 'started' || continuation.turn !== started.turn) return noChange()
-      const exactTurn = evidence?.turn === continuation.turn
-      if (exactTurn && evidence.endReason === 'completed') {
+      const exactTurn = evidence?.turn === continuation.turn && evidence.consumptions === 1
+      if (exactTurn && evidence.endReason === 'completed' && !evidence.mixedTurn) {
         continuation.state = 'verified'
       } else {
         continuation.state = 'interrupted'
         continuation.phase = continuation.dispatches.length ? 'after_dispatch' : 'before_dispatch'
-        continuation.reason = exactTurn ? evidence.endReason ?? 'turn_end_not_proven' : 'turn_evidence_unavailable'
+        continuation.reason = !exactTurn ? 'turn_evidence_unavailable'
+          : evidence.endReason === 'completed' && evidence.mixedTurn ? 'mixed_turn'
+            : evidence.endReason ?? 'turn_end_not_proven'
       }
       continuation.settledAt = Date.now()
+      return success()
+    })
+  }
+
+  async function finishClosure(key, grant) {
+    const requested = grant.closure
+    const observed = turns.get(grant.owner)
+    const live = ctx.agents.get(grant.owner)
+    if (observed?.startSeq === requested.startSeq || live?.status === 'running' && !observed) return
+    let evidence
+    try {
+      if (live) await bounded(() => ctx.sessions.flush(live.session))
+      const anchor = requested.after && jobFor(ledger.read().jobs, requested.after)
+      if (!requested.after || anchor?.key === key && anchor.owner === grant.owner) {
+        const events = await bounded((deadline) => hostEvents(ctx, grant.owner, requested.startSeq, deadline))
+        evidence = closeTurnEvidence(events, requested, anchor)
+      }
+    } catch {
+      // Missing durable evidence leaves the request uncommitted.
+    }
+    if (signal.aborted) return
+    ledger.change(({ grants, jobs }) => {
+      const stored = grants[key]
+      const closure = stored?.closure
+      if (stored?.state !== 'collaboration_closing' || closure?.state !== 'pending' ||
+          closure.startSeq !== requested.startSeq) return noChange()
+      const continuation = closure.after && jobFor(jobs, closure.after)?.resume?.continuation
+      if (continuation?.state === 'started') return noChange()
+      const permitted = enabled() && available(stored.owner)
+      const verified = !closure.after || continuation?.state === 'verified' && continuation.turn === closure.turn
+      const completed = evidence?.reason === 'completed' && evidence.time < stored.expiresAt && permitted && verified
+      closure.settledAt = Date.now()
+      if (evidence) closure.turnEnd = evidence
+      if (completed) {
+        closure.state = 'committed'
+        stored.state = 'closed'
+        stored.outcome = closure.requestedOutcome
+        stored.closedAt = evidence.time
+        stored.closedTurn = closure.turn
+      } else if (stateOf(stored) === 'expired') {
+        closure.state = 'expired'
+        stored.state = 'expired'
+      } else {
+        closure.state = 'interrupted'
+        closure.reason = !permitted ? 'close_authority_unavailable' : !evidence ? 'close_turn_evidence_unavailable'
+          : evidence.reason !== 'completed' ? evidence.reason : 'close_continuation_unverified'
+        setGrantState(stored, 'paused')
+      }
       return success()
     })
   }
@@ -814,6 +1262,29 @@ export function applyWorkflow(ctx, config, allowed) {
     archiveJob(job, jobs, archive)
   }
 
+  function prepareBatchResults(grants, jobs) {
+    let changed = false
+    for (const grant of Object.values(grants)) {
+      if (!grant.collaboration || !['active', 'paused'].includes(stateOf(grant))) continue
+      for (const batch of grant.batches) {
+        if (batch.anchor) continue
+        const members = batchMembers(grant, batch, jobs)
+        if (!members?.length || !members.every((job) => batchSettled.has(job.wake.state))) continue
+        // Keep one native result handshake for the immutable membership. All
+        // members still have their own delivery, claim, and report evidence.
+        const anchor = members.find((job) => jobs[job.id])
+        if (!anchor) continue
+        batch.anchor = anchor.id
+        anchor.resume = { id: randomUUID(), state: 'queued', updatedAt: Date.now() }
+        if (members.some((job) => job.wake.state === 'uncertain' || job.report?.late || job.report?.status === 'needs_owner')) {
+          setGrantState(grant, 'paused')
+        }
+        changed = true
+      }
+    }
+    return changed
+  }
+
   function compact() {
     const now = Date.now()
     return ledger.change((state, archive) => {
@@ -821,6 +1292,12 @@ export function applyWorkflow(ctx, config, allowed) {
       let changed = false
       for (const [key, grant] of Object.entries(grants)) {
         const status = stateOf(grant, now)
+        if (grant.state === 'collaboration_closing' && grant.closure?.state === 'pending') {
+          // Recovery can still commit a turn that ended before expiry. A
+          // currently open closing turn has no earlier end to recover.
+          if (status !== 'expired' || turns.get(grant.owner)?.startSeq !== grant.closure.startSeq) continue
+          Object.assign(grant.closure, { state: 'expired', settledAt: now })
+        }
         if (!terminal(status)) continue
         grant.state = status
         archive.grant(key, grant)
@@ -846,6 +1323,11 @@ export function applyWorkflow(ctx, config, allowed) {
         }
         const grant = grantFor(grants, job.key)
         const status = stateOf(grant, now)
+        if (grant?.collaboration && status === 'active' && enabled() &&
+            job.wake.state === 'queued' && available(job.owner) && !available(job.target)) {
+          setDelivery(job.wake, 'failed', 'route_unavailable_before_send')
+          changed = true
+        }
         if (job.resume?.state === 'consumed' && job.resume.continuation === undefined) {
           job.resume.continuation = { state: 'legacy_unverified', turn: job.resume.consumedTurn }
           changed = true
@@ -876,15 +1358,16 @@ export function applyWorkflow(ctx, config, allowed) {
         const liveContinuation = job.resume?.continuation?.state === 'started'
         const taskDone = ['reported', 'failed', 'skipped', 'reconciled'].includes(job.wake.state)
         const resultDone = !job.resume || ['consumed', 'failed', 'skipped', 'reconciled'].includes(job.resume.state)
+        const batchWaiting = job.batch && !terminal(status) && !batchOf(grant, job.batch)?.anchor
         const orphanReleased = status === 'missing_grant' &&
           (!job.quarantine.taskHadHostRisk || job.wake.state !== 'uncertain') &&
           (!job.quarantine.resultHadHostRisk || job.resume?.state !== 'uncertain')
-        if (!liveClaim && !liveContinuation && (terminal(status) || (taskDone && resultDone) || orphanReleased)) {
+        if (!liveClaim && !liveContinuation && (terminal(status) || (!batchWaiting && taskDone && resultDone) || orphanReleased)) {
           archiveJob(job, jobs, archive)
           changed = true
         }
       }
-      return { changed, value: state }
+      return { changed: prepareBatchResults(grants, jobs) || changed, value: state }
     })
   }
 
@@ -901,19 +1384,33 @@ export function applyWorkflow(ctx, config, allowed) {
     for (const job of activeJobs) {
       if (job.resume?.continuation?.state === 'started') {
         const observed = turns.get(job.owner)
-        if (observed?.number !== job.resume.continuation.turn) add(job, 'result', finishContinuation, 2)
+        if (observed?.number !== job.resume.continuation.turn) add(job, 'result', finishContinuation, 3)
       }
       for (const kind of ['task', 'result']) {
         const delivery = deliveryOf(job, kind)
         if (delivery?.state === 'claimed' || (sent(delivery) && enabled())) {
           add(job, kind, reconcile, 1)
-        } else if (delivery?.state === 'queued' && canRoute(grants[job.key], job, kind) &&
+        } else if (delivery?.state === 'queued' && (delivery.retryAt ?? 0) <= Date.now() &&
+            canRoute(grants[job.key], job, kind) &&
             !retainedSlot(activeJobs, job, kind, grants)) {
           add(job, kind, send, 0)
         }
       }
     }
-    await Promise.all([...lanes.values()].map(async ({ job, kind, work }) => {
+    for (const [key, grant] of Object.entries(grants)) {
+      const closure = grant.closure
+      if (grant.state !== 'collaboration_closing' || closure?.state !== 'pending' ||
+          turns.get(grant.owner)?.startSeq === closure.startSeq ||
+          (lanes.get(grant.owner)?.priority ?? -1) >= 2) continue
+      lanes.set(grant.owner, { priority: 2, close: { key, grant } })
+    }
+    await Promise.all([...lanes.values()].map(async ({ job, kind, work, close }) => {
+      if (close) {
+        try { await finishClosure(close.key, close.grant) } catch {
+          if (!signal.aborted) ctx.logger.warn('workflow close evidence could not be recorded')
+        }
+        return
+      }
       try {
         await work(job, kind)
       } catch {
