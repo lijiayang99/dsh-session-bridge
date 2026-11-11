@@ -43,6 +43,13 @@ test('independent withdrawal and routing clauses stay out of automatic questions
     assert.equal(directQuestionInScope(text), true, text)
   }
 
+  const topical = '委托功能的状态，为什么没有更新？'
+  assert.deepEqual(contextualRequest('帮我问问02窗口，' + topical),
+    { action: 'ask', selector: alias, goal: topical })
+  for (const ending of ['请取消委托。', '收到回复后请把结果发给03窗口。今天能处理吗？']) {
+    assert.equal(contextualRequest('帮我问问02窗口，' + topical + ending), undefined)
+  }
+
   const blocked = '帮我问问02窗口，插件还有哪些坑？把结果发给03窗口。今天能处理吗？'
   assert.equal(contextualRequest(blocked), undefined)
   assert.equal(contextualRequest('帮我问问02窗口，插件还有哪些坑？先别问了。你给我看看日志行吗？'), undefined)

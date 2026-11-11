@@ -89,6 +89,12 @@ function nativeOwner(message) {
     message.source.principal === undefined && validId(message.source.rpcId) && validId(message.id)
 }
 
+function withdrawalTask(message) {
+  if (!nativeOwner(message)) return
+  const match = action.exec(plainText(message) ?? '')
+  if (match?.[1] === '取消委托') return match[2]
+}
+
 function deliveryOf(job, kind) {
   return kind === 'task' ? job.wake : job.resume
 }
@@ -497,6 +503,18 @@ export function applyWorkflow(ctx, config, allowed, activity, matchConversation)
     return { mode: kind, id, messageId: message.id }
   }
 
+  // Claiming removes an inbox entry before the host appends its user/message.
+  // Retain that withdrawal fence until the same native turn ends.
+  ctx.on('agent/inbox/claimed', ({ agent, message, turn: number }) => {
+    const owner = agent?.session?.id
+    const turn = turns.get(owner)
+    if (!message || !turn || turn.number !== number || ctx.agents.get(owner) !== agent) return
+    const task = withdrawalTask(message)
+    if (!task) return
+    turn.withdrawals ??= new Set()
+    turn.withdrawals.add(task)
+  })
+
   ctx.on('session/event', (session, event) => {
     if (signal.aborted) return
     try {
@@ -537,7 +555,7 @@ export function applyWorkflow(ctx, config, allowed, activity, matchConversation)
           }
         }
         // A native owner cancellation still applies even in a mixed turn.
-        else if (nativeOwner(event.data) && /^取消委托 /.test(plainText(event.data) ?? '')) {
+        else if (withdrawalTask(event.data)) {
           controlInput(session, turn, event.data)
         }
         return
@@ -545,9 +563,9 @@ export function applyWorkflow(ctx, config, allowed, activity, matchConversation)
       if (event.type === 'assistant/message') authorization.reply(session, turn, event)
       if (event.type !== 'turn/end' || event.data.turn !== turn.number) return
       authorization.end(session, turn, event)
+      finishConversationTurn(session, turn, event)
       turns.delete(session.id)
       finishOwnerInput(session, turn, event)
-      finishConversationTurn(session, turn, event)
       ledger.change(({ jobs }) => {
         let changed = false
         for (const wake of turn.wakes) {
@@ -901,11 +919,18 @@ export function applyWorkflow(ctx, config, allowed, activity, matchConversation)
     return { id: job.id, task: grant.task, from, to }
   }
 
+  function pendingWithdrawal(owner, task) {
+    const inbox = ctx.agents.get(owner)?.inbox
+    const matches = (message) => withdrawalTask(message) === task
+    return turns.get(owner)?.withdrawals?.has(task) ||
+      inbox?.nextTurn?.some(matches) || inbox?.nextStep?.some(matches)
+  }
+
   function liveConversation(route) {
     const { grants, jobs } = ledger.read()
     const job = jobs[route.id]
     const active = conversationRoute(grants[job?.key], job, route.from, route.to)
-    return active?.task === route.task
+    return active?.task === route.task && !pendingWithdrawal(job.owner, route.task)
   }
 
   function queueMessage({ to, task }, exec, reserve) {
@@ -948,36 +973,39 @@ export function applyWorkflow(ctx, config, allowed, activity, matchConversation)
       if (job && task && task !== job.id && task !== grants[job.key]?.task) return denied('workflow_task_mismatch')
     }
     const route = conversationRoute(grants[job?.key], job, from, to)
-    if (!route) return denied('workflow_task_route_inactive')
+    if (!route || pendingWithdrawal(job.owner, route.task)) return denied('workflow_task_route_inactive')
     if (caller.turn.deferred?.length >= 8) return denied('workflow_turn_message_limit')
     const { receipt, send, stop } = reserve(route)
-    if (send) defer(caller.turn, {
-      run: (deadline) => send(deadline, () => liveConversation(route)),
-      stop,
-    })
+    if (send) defer(caller.turn, route, (deadline) => send(deadline, () => liveConversation(route)), stop)
     return receipt
   }
 
-  function defer(turn, work) {
+  function defer(turn, route, run, stop) {
     turn.deferred ??= []
-    turn.deferred.push(work)
+    turn.deferred.push({ route, run, stop })
   }
 
   function finishConversationTurn(session, turn, event) {
     if (!turn.deferred?.length) return
+    // Read the owner's queues synchronously at the source turn boundary.
+    // The driver can claim the next input while the durable proof is read.
     const { context, input } = turn
+    const ready = !turn.mixed && input && event.data.reason.kind === 'completed'
+      ? turn.deferred.filter(({ route }) => liveConversation(route)) : []
     const job = (context.mode === 'task' || context.mode === 'conversation') && ledger.read().jobs[context.id]
     const matchesInput = context.mode === 'conversation' ? (data) => matchConversation(context.route, data)
       : job ? (data) => isWake(job, 'task', data) : undefined
     const sourceDigest = turn.ownerMessage && digest(plainText(turn.ownerMessage) ?? '')
     const proof = { turn: turn.number, startSeq: turn.startSeq, input, requestedAt: 0, sourceDigest }
     void Promise.resolve().then(async () => {
-      if (turn.mixed || !input || event.data.reason.kind !== 'completed') return
+      if (!ready.length) return
       await bounded(() => ctx.sessions.flush(session))
       const end = await bounded(async (deadline) =>
         closeTurnEvidence(await hostEvents(ctx, session.id, turn.startSeq, deadline), proof, undefined, matchesInput))
       if (end?.reason !== 'completed' || end.sequence !== event.seq) return
-      for (const entry of turn.deferred) await bounded(entry.run)
+      for (const entry of ready) {
+        if (liveConversation(entry.route)) await bounded(entry.run)
+      }
     }).catch(() => {
       if (!signal.aborted) ctx.logger.warn('workflow task exchange could not be verified')
     }).finally(() => {
@@ -1081,7 +1109,8 @@ export function applyWorkflow(ctx, config, allowed, activity, matchConversation)
       const job = jobs[id]
       if (job?.conversation) {
         if (job.target !== caller.id || job.attempt !== attempt || job.claim?.token !== token) return denied('claim_mismatch')
-        if (!conversationRoute(grants[job.key], job, caller.id, job.owner)) return denied('grant_inactive')
+        const route = conversationRoute(grants[job.key], job, caller.id, job.owner)
+        if (!route || pendingWithdrawal(job.owner, route.task)) return denied('grant_inactive')
         const reportDigest = digest(JSON.stringify([status, summary, evidence, artifacts, reviewedArtifact]))
         if (turn.pendingReport) return turn.pendingReport === reportDigest
           ? { id, queued: true, duplicate: true } : denied('report_conflict')
@@ -1090,7 +1119,7 @@ export function applyWorkflow(ctx, config, allowed, activity, matchConversation)
             (!job.reviewOf || reviewedArtifact !== job.artifact) ||
             job.reviewOf && (status === 'completed' || artifacts !== undefined)) return denied('artifact_binding_required')
         turn.pendingReport = reportDigest
-        defer(turn, { run: () => { recordReport(); schedule() } })
+        defer(turn, route, () => { recordReport(); schedule() })
         return { id, queued: true, duplicate: false }
       }
       const result = recordReport()

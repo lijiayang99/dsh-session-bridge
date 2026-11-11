@@ -57,14 +57,17 @@ function withdrawsQuestion(text) {
   return independentClauses(text)?.some((clause) => withdrawal.test(clause))
 }
 
-// The direct path only forwards one clause. Compound requests need a
-// concrete plan the owner can see, rather than a classifier of side effects.
+// A nominal topic before a comma can belong to the same question.
+const topicalQuestion = /^[\p{L}\p{N}_.· -]{1,160}的(?:状态|进度|配置|设置|结果|记录|版本)[ \t]*[，,][ \t]*(?:为什么|为何|怎么|如何|何时|什么时候|是否)[^，,。；;？！!?\r\n]+[？?]$/u
+
+// A direct query stays within one question. Separate actions require a plan.
 export function directQuestionInScope(text) {
   // The previous direct-query entry accepts a trailing verbatim-copy note.
   // Strip it for scope checking only; the delivery still preserves the input.
   const question = text.replace(/\r?\n[ \t]*请保留问题原文[ \t]*$/u, '')
   const clauses = independentClauses(question)
-  return clauses?.length === 1 && !withdrawal.test(clauses[0])
+  if (clauses?.length === 1) return !withdrawal.test(clauses[0])
+  return clauses?.length === 2 && topicalQuestion.test(question.trim())
 }
 
 function clearQuestion(value) {

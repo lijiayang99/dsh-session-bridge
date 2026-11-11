@@ -181,6 +181,8 @@ await withCollaborationHost({ dsh, archive, decide, timeRefreshIntervalMs: 0 }, 
     await verifyDispatch(host, followup, goal, [first])
     await verifyDispatch(host, '看一下02今天都做了什么，问一下他', '今天都做了什么')
     await verifyDispatch(host, '帮我问问02窗口，插件还有哪些坑？', '插件还有哪些坑？')
+    const topical = '委托功能的状态，为什么没有更新？'
+    await verifyDispatch(host, '帮我问问02窗口，' + topical, topical)
     console.log('PASS exact colloquial owner line, period/newline, and adjacent two-turn request dispatch once with zero controller bridge tools')
 
     await host.rename(alternative, '02-合成备选')

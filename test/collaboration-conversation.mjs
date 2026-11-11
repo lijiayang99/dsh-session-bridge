@@ -210,9 +210,60 @@ await withCollaborationHost({ dsh, archive, decide, modelDeadlineMs: 30_000 }, a
   assert.equal(unknown.results[0].delivery, 'unknown')
   assert(!(await messages(worker, 'conversation')).some(({ data }) => bodyOf(data) === queuedText))
 
-  await host.prompt(owner, '取消委托 ' + secondaryTask)
+  const controlTask = taskKey((await host.prompt(owner, '让99窗口检查合成队列对照。')).input)
+  const controlJob = await waitClaim(controlTask)
+  await host.idle(worker)
+
+  async function reserveBeforeWithdrawal(job, body, request, withdrawnTask) {
+    const text = '补充合成队列对照任务 ' + controlTask
+    let reserved
+    let release = false
+    plans.set(text, async (results, { signal }) => {
+      if (!results.length) return send(worker, request, body, job)
+      reserved = results[0]
+      while (!release) await delay(20, undefined, { signal })
+      return modelResult('合成消息来源轮已结束。')
+    })
+    try {
+      const first = await host.submit(owner, text)
+      await host.until(() => reserved?.delivery === 'queued', 'receipt reserved before withdrawal')
+      const cancel = await host.submit(owner, '取消委托 ' + withdrawnTask, 'queue')
+      release = true
+      const [origin, cancelled] = await Promise.all([host.turn(owner, first), host.turn(owner, cancel)])
+      const admission = (await history(owner)).find(({ type, data }) =>
+        type === 'agent/inbox/spliced' && data.inserted.some(({ id }) => id === cancelled.input.data.id))
+      assert.equal(origin.end.data.reason.kind, 'completed')
+      assert(admission && admission.seq < origin.end.seq && cancelled.input.seq > origin.end.seq)
+      assert.equal(host.snapshot(owner, withdrawnTask).grant.state, 'cancelled')
+      return reserved
+    } finally {
+      release = true
+      plans.delete(text)
+    }
+  }
+
+  const controlBody = '不同任务撤回时仍送达这一条。'
+  await reserveBeforeWithdrawal(controlJob.id, controlBody, 'unrelated-withdrawal', secondaryTask)
+  await receive(worker, 'conversation', (data) => bodyOf(data) === controlBody)
   const cancelled = await sendToWorker('向撤销任务追加 ' + secondaryTask, 'after-cancel', ignored, secondary.id)
   assert(cancelled.results[0].error)
+
+  const revokedBody = '同任务在宿主队列撤回，这条消息不得入队。'
+  const blocked = await reserveBeforeWithdrawal(controlJob.id, revokedBody, 'queued-withdrawal', controlTask)
+  const readRevoked = () => call(owner, '核对已撤回消息的回执', tool('session_message_status', {
+    request_id: 'queued-withdrawal', job: controlJob.id,
+  }))
+  const receipt = (await readRevoked()).results[0]
+  assert.equal(receipt.messageId, blocked.messageId)
+  assert.equal(receipt.delivery, 'not_delivered')
+  await host.stop()
+  await host.start()
+  assert.deepEqual((await readRevoked()).results[0], receipt)
+  await host.idle(worker)
+  assert(!(await history(worker)).some(({ type, data }) =>
+    type === 'agent/inbox/spliced' && data.inserted.some(({ id }) => id === blocked.messageId)))
+  console.log('PASS pending native withdrawal blocks only its own task before host admission; receipt survives restart')
+
   const expiredTask = taskKey((await host.prompt(owner, expires)).input)
   const expiring = await waitClaim(expiredTask)
   await host.idle(worker)
