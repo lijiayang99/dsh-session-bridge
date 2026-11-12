@@ -5,14 +5,14 @@ const textBlocks = (content) => (content ?? []).filter(({ type, text }) =>
   type === 'text' && typeof text === 'string' && text.length).map(({ text }) => text)
 const fingerprint = (texts) => createHash('sha256').update(texts.join('\n').trim()).digest('hex')
 
-export function observeNativeResults(ctx, enabled, allowed, activity) {
+export function observeNativeResults(ctx, enabled, available, activity, reserve) {
   const runs = new Map()
 
   ctx.on('subagent/start', ({ id, runId, provider, local }) => {
     if (!enabled() || !local || provider !== 'spawn') return
     const child = ctx.agents.get(id)
     const parent = ctx.agents.get(child?.session.header.parentSession)
-    if (!parent || !allowed(parent.id)) return
+    if (!parent || !available(parent.id)) return
     runs.set(id, { runId, parent, forwarded: new Set(), omitted: false })
   })
 
@@ -44,7 +44,7 @@ export function observeNativeResults(ctx, enabled, allowed, activity) {
     runs.delete(id)
     const { parent } = run
     if (!local || provider !== 'spawn' || stopReason !== 'completed' || !run.omitted || run.overflow ||
-        !enabled() || !allowed(parent.id) || ctx.agents.get(parent.id) !== parent) return
+        !enabled() || !available(parent.id) || ctx.agents.get(parent.id) !== parent) return
     const texts = textBlocks(lastAssistantMessage)
     if (!texts.some((text) => text.trim()) || run.forwarded.has(fingerprint(texts))) return
 
@@ -57,16 +57,23 @@ export function observeNativeResults(ctx, enabled, allowed, activity) {
       },
     }
     const route = { key: message.id, from: id, to: parent.id, kind: 'result', nativeParent: parent.id }
+    let settle
     try {
+      if (reserve) {
+        settle = reserve(message, id, parent.id)
+        if (!settle) return
+      }
       parent.followup(message)
       activity.record({ ...route, state: 'sending' }, true)
     } catch {
-      activity.record({ ...route, state: 'uncertain' })
+      finish(false)
       return
     }
-    return Promise.resolve(ctx.sessions.flush(parent.session)).then(
-      (flushed) => activity.record({ ...route, state: flushed ? 'delivered' : 'uncertain' }),
-      () => activity.record({ ...route, state: 'uncertain' }),
-    )
+    function finish(flushed) {
+      try { settle?.(flushed ? 'delivered' : 'unknown') }
+      catch { ctx.logger.warn('native result receipt could not be persisted') }
+      activity.record({ ...route, state: flushed ? 'delivered' : 'uncertain' })
+    }
+    return Promise.resolve(ctx.sessions.flush(parent.session)).then(finish, () => finish(false))
   })
 }

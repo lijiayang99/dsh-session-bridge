@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto'
+import { ID, nativeOwner, validId as isId } from './bridge-input.js'
 import { matchingTitles, naturalIntent, plainText } from './natural-message.js'
-import { contextualRequest, conversationRequest, directQuestionInScope } from './workflow-context.js'
+import { contextualRequest, conversationRequest, directQuestionInScope, namedQuestionGoal, namedQuestionText } from './workflow-context.js'
 
-const ID = /^[a-zA-Z0-9_-]{1,128}$/
 const confirmationText = '确认委托'
 const shortConfirmation = /^(?:好|好的|可以|同意)[。！!]?$/u
 const draftLifetime = 120_000
@@ -11,7 +11,6 @@ const directLifetimeMinutes = 30
 const directRequest = /^(?:请[ \t]*)?把(?:『([^』]*)』|「([^」]*)」|“([^”]*)”)[ \t]*委托给[ \t]*(?:『([^』\r\n]*)』|「([^」\r\n]*)」|“([^”\r\n]*)”)[。]?$/u
 const digest = (text) => createHash('sha256').update(text).digest('hex')
 const denied = (error) => ({ error })
-const isId = (value) => typeof value === 'string' && ID.test(value)
 const boundedText = (value, limit) => typeof value === 'string' &&
   value.length <= limit && value.trim().length > 0
 const textSchema = (maxLength) => ({ type: 'string', minLength: 1, maxLength })
@@ -75,9 +74,7 @@ export function directIntent(text) {
 }
 
 function proposalSource(message) {
-  if (message.role !== 'user' || message.source?.kind !== 'user' ||
-      message.source.principal !== undefined || !isId(message.source.rpcId) ||
-      !isId(message.id) || !Array.isArray(message.content) || message.content.length !== 1 ||
+  if (!nativeOwner(message) || !Array.isArray(message.content) || message.content.length !== 1 ||
       message.content[0]?.type !== 'text') return
   const text = message.content[0].text
   if (!boundedText(text, 2300)) return
@@ -142,6 +139,17 @@ function contextTarget(items, registry, owner, selector) {
   return matches[0] ?? denied('workflow_context_alias_unknown')
 }
 
+function catalogQuestion(items, text) {
+  const matches = items.flatMap(({ sessionId, blank, parentSessionId, origin, projections }) => {
+    const title = projections?.values?.title
+    return !blank && !parentSessionId && origin !== 'subagent' && isId(sessionId) &&
+      typeof title === 'string' && title && text.startsWith(title) ? [{ to: sessionId, title }] : []
+  })
+  const length = matches.reduce((max, { title }) => Math.max(max, title.length), 0)
+  return matches.filter(({ title }) => title.length === length)
+    .map((target) => ({ ...target, goal: namedQuestionGoal(text, target.title) }))
+}
+
 export function matchesContextNotice(message, notice) {
   const { source } = message
   return message.id === notice.id && message.role === 'user' && source?.kind === 'agent-message' &&
@@ -149,7 +157,7 @@ export function matchesContextNotice(message, notice) {
     source.bridgeWorkflowKind === 'direct-notice' && plainText(message) === notice.text
 }
 
-function planTarget(items, registry, owner, query) {
+export function planTarget(items, registry, owner, query) {
   const alias = /^([0-9]{1,3})(?:号)?(?:窗口)?$/u.exec(query)
   return alias ? contextTarget(items, registry, owner, { kind: 'alias', value: alias[1] }) : uniqueTitle(items, query)
 }
@@ -162,7 +170,7 @@ function resolvePlan(items, proposal, source, owner, available, registry) {
     if (!match?.to) return denied('workflow_target_clarification_required')
     if (match.to === owner || !available(match.to)) return denied('workflow_target_not_allowed')
     const value = { id: match.to, title: match.title }
-    bindings.set(query, value)
+    bindings.set(query, { ...value, workspace: match.workspace })
     return value
   }
 
@@ -258,10 +266,16 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
     if (direct?.question && !directQuestionInScope(direct.goal)) return
     if (direct && !direct.alias) return { mode: 'direct-workflow', identity, text, direct }
     const prior = adjacent?.notice ? undefined : adjacent
+    const ordinary = naturalIntent(text)
     const request = direct?.alias ? {
       action: 'ask', selector: { kind: 'alias', value: direct.alias }, goal: direct.goal,
-    } : !naturalIntent(text) && (conversationRequest(text) ||
-      contextualRequest(text, prior))
+    } : !ordinary && (conversationRequest(text) || contextualRequest(text, prior))
+    // The established forms take precedence when they already provide both
+    // parts. The host catalog supplies a missing title/body boundary.
+    const named = !ordinary && (!request || request.action === 'ask' && !request.prior && !request.conversation &&
+      (!request.goal || request.selector?.kind === 'title')) && namedQuestionText(text)
+    if (named) return { mode: 'direct-workflow', identity, text,
+      direct: { ...request, action: 'ask', named }, contextual: true }
     if (request) {
       if (request.prior?.conversation) request.conversation = true
       if (request.action === 'topic' && request.selector) {
@@ -369,7 +383,7 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
       const { items } = await readWindows(requestSignal)
       for (const [query, expected] of draft.bindings) {
         const live = planTarget(items, ctx.workspaceRegistry, caller.id, query)
-        if (live?.to !== expected.id || live.title !== expected.title || !available(expected.id)) {
+        if (live?.to !== expected.id || live.title !== expected.title || live.workspace !== expected.workspace || !available(expected.id)) {
           return denied('workflow_target_changed')
         }
       }
@@ -384,6 +398,7 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
       preview: draft.previewProof,
       confirmation: context.identity,
       targets: draft.targets,
+      bindings: [...draft.bindings],
       planDigest: draft.planDigest,
     }
     return open(draft.grant, evidence)
@@ -456,18 +471,36 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
     }
     if (context.directResult) return { ...context.directResult, duplicate: true }
     if (context.delegating) return denied('workflow_direct_in_progress')
-    const { goal, title, error, prior } = context.direct
+    let { goal } = context.direct
+    const { title, error, prior, named } = context.direct
     if (error) return denied(error)
     const requestSignal = scopedSignal(exec)
     context.delegating = true
     let target
     try {
-      if (context.contextual) {
+      if (named) {
+        const first = catalogQuestion((await readWindows(requestSignal)).items, named)
+        if (first.length > 1) return denied('workflow_context_target_ambiguous')
+        const [known] = first
+        if (known?.goal) {
+          if (known.to === id || !available(known.to) || !await existing(known.to, requestSignal)) {
+            return denied('workflow_target_not_available')
+          }
+          const current = catalogQuestion((await readWindows(requestSignal)).items, named)
+          if (current.length !== 1 || current[0].to !== known.to || current[0].title !== known.title ||
+              current[0].goal !== known.goal || !available(known.to)) return denied('workflow_target_changed')
+          target = known
+          goal = known.goal
+        } else if (known && context.direct.selector?.value !== known.title) {
+          return denied('workflow_context_target_ambiguous')
+        }
+      }
+      if (!target && context.contextual) {
         if (prior && prior.expires <= performance.now()) return denied('workflow_context_expired')
         const resolved = await contextualTarget(caller, requestSignal)
         if (resolved.error) return resolved
         target = resolved.target
-      } else {
+      } else if (!target) {
         const first = uniqueTitle((await readWindows(requestSignal)).items, title)
         if (first?.title !== title) return denied('workflow_target_clarification_required')
         if (first.to === id || !available(first.to) || !await existing(first.to, requestSignal)) {
@@ -488,9 +521,12 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
     }
     if (prior && prior.expires <= performance.now()) return denied('workflow_context_expired')
     const task = 'direct-' + digest(JSON.stringify([id, context.identity.messageId]))
+    const query = !context.direct.conversation && (Boolean(target.goal || context.direct.question) ||
+      context.contextual && context.direct.action === 'ask')
     const grant = {
       task, goal, ttlMinutes: directLifetimeMinutes, budget: 1,
-      ...(context.direct.conversation ? { conversation: true } : {}),
+      ...(context.direct.conversation || query ? { conversation: true } : {}),
+      ...(query ? { query: true } : {}),
       scopes: [{ name: 'execute', purpose: '执行所有者明确给出的原文目标', targets: [target.to] }],
     }
     const targets = [{ id: target.to, title: target.title }]
@@ -499,7 +535,7 @@ export function createWorkflowAuthorization(ctx, { enabled, available, existing,
       request: { ...context.identity, sourceDigest: digest(context.text) },
       targets, planDigest: digest(JSON.stringify([grant, targets])),
       ...(context.contextual ? { context: {
-        selector: context.direct.selector,
+        selector: target.goal ? { kind: 'title', value: target.title } : context.direct.selector,
         ...(target.workspace !== undefined ? { workspace: target.workspace } : {}),
         earlierInputs: (prior?.proofs ?? []).filter((proof) => !proof.notice).map((proof) => ({
           ...proof.input, turn: proof.turn, endSequence: proof.endSeq, sourceDigest: proof.sourceDigest,

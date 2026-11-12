@@ -19,7 +19,9 @@ export function assertIsolated() {
   assert(networkInterfaces().lo.every(({ internal }) => internal))
 }
 
-export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSessions = [], workspaces = [] } = {}) {
+export async function fixture(t, {
+  hostVersion = '0.2.2-rc.1', additionalSessions = [], workspaces = [], legacySettings = {},
+} = {}) {
   assertIsolated()
   const root = await mkdtemp(join(tmpdir(), 'bridge-fixture-'))
   const schemaDir = join(root, 'node_modules', '@deepseek-ai', 'schemastery')
@@ -56,13 +58,14 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
   const faults = {}
   const records = new Map()
   const turns = new Map()
+  const archived = new Set()
+  let enabled = true
   const emit = (agent, type, data) => {
     const event = { type, data, seq: ++agent.session.seq, time: Date.now() }
     records.get(agent.session.id).push(event)
     for (const listen of listeners) listen(agent.session, event)
   }
-  let allowedSessions = [main, secondMain, worker, reviewer, ...additionalSessions]
-  for (const id of [...allowedSessions, outsider]) {
+  for (const id of [main, secondMain, worker, reviewer, ...additionalSessions, outsider]) {
     const queue = []
     pending.set(id, queue)
     records.set(id, [])
@@ -89,7 +92,7 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
 
   const ctx = {
     profileContext: { name: 'web', dir: profile },
-    workspaceRegistry: { archivedSessionIds: [], list: () => workspaces },
+    workspaceRegistry: { get archivedSessionIds() { return [...archived] }, list: () => workspaces },
     agents,
     tools: { register: ({ name, execute }) => tools.set(name, execute) },
     sessions: { flush: async session => faults.flush ? faults.flush(session.id) : true },
@@ -131,9 +134,8 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
       process.argv[1] = cli
       const { apply } = await import(entry.href)
       apply(ctx, {
-        enabled: { get: () => true },
-        workflowEnabled: { get: () => true },
-        allowedSessions: { get: () => allowedSessions },
+        enabled: { get: () => enabled },
+        ...Object.fromEntries(Object.entries(legacySettings).map(([key, value]) => [key, { get: () => value }])),
       })
     } finally {
       process.argv[1] = argvEntry
@@ -173,9 +175,13 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
     begin(id, text, source = ownerSource) {
       begin(id, ownerMessage(text, source))
     },
-    setAllowedSessions(ids) {
-      assert(ids.every(id => agents.has(id)))
-      allowedSessions = [...ids]
+    archive(id, value = true) {
+      assert(agents.has(id))
+      if (value) archived.add(id)
+      else archived.delete(id)
+    },
+    setEnabled(value) {
+      enabled = value
     },
     rename(id, title) {
       assert(titles.has(id))
