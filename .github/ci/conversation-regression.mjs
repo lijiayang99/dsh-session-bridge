@@ -16,17 +16,16 @@ test('a queued native owner cancellation blocks a reserved task continuation', a
   host.end(worker)
 
   const text = '请继续只读核对合成指纹。'
-  const request_id = 'synthetic-owner-queued-cancellation'
   host.begin(main, '请追加合成任务。')
-  const receipt = await host.call(main, 'send_session_message', { to: worker, request_id, text, task: job })
+  const receipt = await host.call(main, 'workflow_message', { text })
   assert.equal(receipt.delivery, 'queued')
   assert.deepEqual(host.deliveries.map(({ target }) => target), [worker])
   host.enqueueInput(main, '取消委托 ' + claim.task)
   host.end(main)
 
   const settled = await until(async () => {
-    const receipt = await host.call(main, 'session_message_status', { request_id, job })
-    return receipt.delivery !== 'unknown' && receipt
+    const value = await host.call(main, 'session_message_status', { request_id: receipt.requestId, job })
+    return value.delivery !== 'unknown' && value
   }, 'Expected the provisional continuation receipt to settle')
   assert.equal(settled.messageId, receipt.messageId)
   assert.equal(settled.delivery, 'not_delivered')

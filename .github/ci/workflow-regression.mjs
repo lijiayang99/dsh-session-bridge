@@ -140,7 +140,9 @@ test('a destination failure before admission leaves the independent destination 
   authorize(host)
   const missing = await queue(host)
   const unaffected = await queue(host, main, nextDispatch)
+  host.end(main)
   assert.equal((await host.receive(reviewer)).source.bridgeWorkflowId, unaffected)
+  host.begin(main, 'Read the synthetic destination failure receipt.')
   const state = await until(async () => {
     const { delivery } = await itemStatus(host, missing)
     return delivery?.state === 'failed' && delivery
@@ -149,6 +151,23 @@ test('a destination failure before admission leaves the independent destination 
   assert.equal(failed, 1)
   assert.deepEqual(host.deliveries.map(({ target }) => target), [reviewer])
   host.end(reviewer)
+  host.end(main)
+})
+
+test('a reserved structured dispatch still needs the original owner turn to complete cleanly', async t => {
+  const host = await fixture(t)
+  authorize(host)
+  const id = await queue(host)
+  host.appendInput(main, 'This synthetic turn now contains a second owner input.')
+  host.end(main)
+
+  host.begin(main, 'Read the synthetic structured dispatch receipt.')
+  const failed = await until(async () => {
+    const { delivery } = await itemStatus(host, id)
+    return delivery?.state === 'skipped' && delivery
+  }, 'Expected the queued attempt to be rejected after the mixed owner turn')
+  assert.equal(failed.reason, 'owner_turn_not_verified')
+  assert.deepEqual(host.deliveries, [])
   host.end(main)
 })
 

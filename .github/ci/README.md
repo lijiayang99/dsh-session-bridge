@@ -45,3 +45,15 @@ Contextual direct tests cover adjacent owner proofs, workspace-scoped aliases, e
 The question boundary also covers a polite explicit cancellation, a separate forwarding instruction with a time condition, and a legitimate single question whose topic names the delegation feature.
 
 Conversation cases cover cancellation queued before a provisional named-window message can be released, and native final-body supplementation restricted to the exact live parent and current child run. Native Chrome tests exercise the real host tools, preserved permissions and the rendered final reply.
+
+Autonomy cases verify exact named-window routing when a model mistakenly calls either ordinary sender, and ensure tool arguments cannot change the owner-bound goal or destination. A source-attributed native model-selection notice preserves a clean owner turn. The same text from an owner or relay remains a separate input. The native DSH integration verifies the real selectModel notice and tool routing.
+
+An unlisted or nonexistent longer title must not be rewritten as an available shorter title, even when that shorter title begins the owner's text.
+
+An explicit ordinary message is also tested with two concurrently active tasks. Selecting the old sender with a different destination must not enter the second task or append the owner's text to its receiver.
+
+The allowlist-removal cases use the native owner's exact authorization and exercise a stale legacy list as migration data. An archived destination still fails admission. Title ambiguity is checked against the current catalog, including duplicate live titles. The dispatch fault case closes the owner turn before checking delivery so both attempts share durable owner authorization.
+
+The master-switch case verifies that disabled transport cannot send new or already queued work, and that re-enabling can deliver the eligible queued assignment once. Status-log tests verify session filtering, sanitized metadata, and readback while transport is disabled.
+
+The unified messaging cases use `workflow_message` for task-bound follow-ups and for observing a host-owned send or delegation. The original owner input controls the recipient and text. The fixtures check durable delivery after the native turn, reject the two retired tool names, preserve same-task worker selection, and verify that an unquoted full title with a read-only suffix is delivered exactly. Duplicate titles and an explicitly delimited unknown longer title leave only a clarification at the origin.

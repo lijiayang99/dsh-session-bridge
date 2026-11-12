@@ -27,15 +27,14 @@ async function lab(t) {
   return { host, active, change, history, key, grant }
 }
 
-async function open(host, endReason = 'completed') {
-  host.begin(main, question)
-  const opened = await host.call(main, 'workflow_delegate_direct', {})
-  host.end(main, endReason)
-  return opened
+async function open(host) {
+  const input = host.begin(main, question)
+  host.end(main)
+  const { task, grant, job } = await host.directAssignment(main, input)
+  return { task, expiresAt: grant.expiresAt, id: job.id }
 }
 
 async function result(host, opened, { status = 'completed', afterAdmission, beforeReport } = {}) {
-  assert.equal(opened.state, 'queued', JSON.stringify(opened))
   assert.equal((await host.receive(worker)).source.bridgeWorkflowId, opened.id)
   if (afterAdmission) await afterAdmission()
   const lease = await host.call(worker, 'workflow_claim', { id: opened.id })
@@ -76,16 +75,23 @@ test('a verified one-shot reply releases a slot and retains its history at the 1
   const opened = await open(host)
   assert.equal(Object.keys(active().grants).length, 128)
   await result(host, opened, { async afterAdmission() {
-    assert.deepEqual(await open(host, 'aborted'), { error: 'grant_not_opened' })
+    host.begin(main, question)
+    host.end(main)
+    const refused = await host.receive(main)
+    assert.equal(refused.source.bridgeWorkflowKind, 'direct-notice')
+    assert.match(refused.content[0].text, /无法建立/)
+    host.end(main)
+    assert.equal(Object.keys(active().grants).length, 128)
   } })
   await consume(host, opened)
   host.reply(main, answer)
   assert.equal(grant(opened).state, 'collaboration_active')
   host.end(main)
   const archived = await until(() => history(opened), 'Expected the completed attempt in history')
-  assert.deepEqual(host.deliveries.map(({ target }) => target), route)
+  assert.deepEqual(host.deliveries.filter(({ message }) => message.source.bridgeWorkflowKind !== 'direct-notice')
+    .map(({ target }) => target), route)
   const next = await open(host)
-  assert.equal(next.state, 'queued', JSON.stringify(next))
+  assert.notEqual(next.id, opened.id)
   assert.equal(archived.resume.continuation.state, 'verified')
   assert(Number.isSafeInteger(archived.resume.continuation.replyAfterSeq))
   assert.equal(active().grants[key(opened)], undefined)
@@ -274,7 +280,7 @@ test('an expired grant awaiting proof cannot resume work and releases its slot a
   assert.equal(grant(opened).state, 'closed')
   assert.equal(Object.keys(active().grants).length, 127)
   assert.deepEqual(host.deliveries.map(({ target }) => target), route)
-  assert.equal((await open(host)).state, 'queued')
+  assert((await open(host)).id)
 })
 
 for (const [name, complete, reason] of [
@@ -341,14 +347,14 @@ test('a completed exact owner turn delegates and shows the structured native res
   assert.deepEqual(host.deliveries.map(({ target }) => target), route)
 })
 
-test('a matching receipt stays idempotent when the target changes before verified owner admission', async t => {
+test('a host-created receipt stays idempotent when the target changes before verified owner admission', async t => {
   const { host, grant, history } = await lab(t)
   host.begin(main, question)
-  const opened = await host.call(main, 'workflow_delegate_direct', {})
+  const opened = await host.call(main, 'workflow_message', {})
   assert.equal(opened.state, 'queued')
   assert.equal(grant(opened).state, 'collaboration_authorizing')
   host.rename(worker, '合成改名')
-  assert.deepEqual(await host.call(main, 'workflow_delegate_direct', {}), { ...opened, duplicate: true })
+  assert.deepEqual(await host.call(main, 'workflow_message', {}), { ...opened, duplicate: true })
   assert.deepEqual(host.deliveries, [])
   host.end(main)
 

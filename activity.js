@@ -6,7 +6,7 @@ const maxStreams = 8
 const activeStates = new Set(['queued', 'sending', 'delivered', 'executing'])
 const encoder = new TextEncoder()
 
-export function createActivity(allowed) {
+export function createActivity(available) {
   const routes = new Map()
   const streams = new Set()
   let sequence = 0
@@ -23,7 +23,7 @@ export function createActivity(allowed) {
     const rows = []
     for (const { id, from, to, kind, state, flight, startedAt, nativeParent } of routes.values()) {
       let visible
-      try { visible = nativeParent ? allowed(nativeParent) : allowed(from) && allowed(to) } catch { continue }
+      try { visible = nativeParent ? available(nativeParent) : available(from) && available(to) } catch { continue }
       if (visible) rows.push({
         id, from, to, kind, state,
         ...(flight && now - startedAt < 2500 ? { flight } : {}),
@@ -112,7 +112,7 @@ export function createActivity(allowed) {
       },
     })
     ctx.effect(() => {
-      // Recheck the current allowlist and retire rows even when work is quiet.
+      // Recheck window availability and retire rows even when work is quiet.
       const timer = setInterval(() => {
         if (streams.size) broadcast(true)
         else prune(Date.now())

@@ -252,7 +252,7 @@ async function verifyDirect(host, request, body, {
     })
     return { reply: '已派给「' + directResults[0].targetTitle + '」，等待结果。' }
   })
-  if (checkOrdinary) assert.deepEqual(started.results[0], { error: 'message_authorization_required' })
+  if (checkOrdinary) assert.deepEqual(started.results[0], { state: 'waiting_for_owner_turn_end' })
   const [result, repeated, expanded] = checkOrdinary ? started.results.slice(1) : started.results
   assert.equal(result?.task, 'direct-' + digest(JSON.stringify([owner, started.input.data.id])), JSON.stringify(started.results))
   assert.equal(result.goal, body)

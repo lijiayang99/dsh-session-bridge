@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { networkInterfaces, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as delay } from 'node:timers/promises'
 
 export const main = 'synth-main'
@@ -19,7 +20,9 @@ export function assertIsolated() {
   assert(networkInterfaces().lo.every(({ internal }) => internal))
 }
 
-export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSessions = [], workspaces = [] } = {}) {
+export async function fixture(t, {
+  hostVersion = '0.2.2-rc.1', additionalSessions = [], workspaces = [], legacySettings = {},
+} = {}) {
   assertIsolated()
   const root = await mkdtemp(join(tmpdir(), 'bridge-fixture-'))
   const schemaDir = join(root, 'node_modules', '@deepseek-ai', 'schemastery')
@@ -56,13 +59,14 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
   const faults = {}
   const records = new Map()
   const turns = new Map()
+  const archived = new Set()
+  let enabled = true
   const emit = (agent, type, data) => {
     const event = { type, data, seq: ++agent.session.seq, time: Date.now() }
     records.get(agent.session.id).push(event)
     for (const listen of listeners) listen(agent.session, event)
   }
-  let allowedSessions = [main, secondMain, worker, reviewer, ...additionalSessions]
-  for (const id of [...allowedSessions, outsider]) {
+  for (const id of [main, secondMain, worker, reviewer, ...additionalSessions, outsider]) {
     const queue = []
     pending.set(id, queue)
     records.set(id, [])
@@ -89,7 +93,7 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
 
   const ctx = {
     profileContext: { name: 'web', dir: profile },
-    workspaceRegistry: { archivedSessionIds: [], list: () => workspaces },
+    workspaceRegistry: { get archivedSessionIds() { return [...archived] }, list: () => workspaces },
     agents,
     tools: { register: ({ name, execute }) => tools.set(name, execute) },
     sessions: { flush: async session => faults.flush ? faults.flush(session.id) : true },
@@ -131,9 +135,8 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
       process.argv[1] = cli
       const { apply } = await import(entry.href)
       apply(ctx, {
-        enabled: { get: () => true },
-        workflowEnabled: { get: () => true },
-        allowedSessions: { get: () => allowedSessions },
+        enabled: { get: () => enabled },
+        ...Object.fromEntries(Object.entries(legacySettings).map(([key, value]) => [key, { get: () => value }])),
       })
     } finally {
       process.argv[1] = argvEntry
@@ -171,11 +174,33 @@ export async function fixture(t, { hostVersion = '0.2.2-rc.1', additionalSession
       await start()
     },
     begin(id, text, source = ownerSource) {
-      begin(id, ownerMessage(text, source))
+      const message = ownerMessage(text, source)
+      begin(id, message)
+      return message.id
     },
-    setAllowedSessions(ids) {
-      assert(ids.every(id => agents.has(id)))
-      allowedSessions = [...ids]
+    async directAssignment(owner, messageId) {
+      const task = 'direct-' + createHash('sha256').update(JSON.stringify([owner, messageId])).digest('hex')
+      const key = owner + ':' + task
+      const ledger = new DatabaseSync(join(profile, 'dsh-session-bridge-workflow', 'workflow-v1.sqlite'), { readOnly: true })
+      try {
+        const select = ledger.prepare('SELECT body FROM ledger WHERE id=1')
+        return await until(() => {
+          const { grants, jobs } = JSON.parse(select.get().body)
+          const grant = grants[key]
+          const job = Object.values(jobs).find((item) => item.key === key)
+          return grant && job && { task, grant, job }
+        }, 'Expected one durable assignment from the native owner turn')
+      } finally {
+        ledger.close()
+      }
+    },
+    archive(id, value = true) {
+      assert(agents.has(id))
+      if (value) archived.add(id)
+      else archived.delete(id)
+    },
+    setEnabled(value) {
+      enabled = value
     },
     rename(id, title) {
       assert(titles.has(id))

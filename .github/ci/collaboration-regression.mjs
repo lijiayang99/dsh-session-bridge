@@ -85,34 +85,72 @@ function report(host, target, lease, fields) {
   })
 }
 
+test('a native task-bound owner turn can choose one of two approved workers for a follow-up', async t => {
+  const host = await collaborationHost(t)
+  const plan = { ...proposal, budget: 2, scopes: [proposal.scopes[0]], conversation: true }
+  const input = '请把合成样本分别交给「' + workerTitle + '」和「' + reviewerTitle + '」核对。'
+  host.reply(main, await prepare(host, plan, input))
+  host.end(main)
+
+  host.begin(main, '确认委托')
+  assert.equal((await confirm(host)).task, task)
+  const jobs = new Map()
+  for (const [target, item] of [[worker, 'first'], [reviewer, 'second']]) {
+    const job = await host.call(main, 'workflow_dispatch', { task, ...assignment(item, target) })
+    assert.equal(job.duplicate, false)
+    jobs.set(target, job.id)
+  }
+  host.end(main)
+  for (const [target, id] of jobs) {
+    await claim(host, target, id)
+    host.end(target)
+  }
+
+  const text = '请核查窗口补核合成文件的时间。'
+  host.begin(main, '继续委托 ' + task)
+  const receipt = await host.call(main, 'workflow_message', { target: reviewer, text })
+  assert.equal(receipt.delivery, 'queued')
+  assert.equal(receipt.task, task)
+  assert.equal(receipt.job, jobs.get(reviewer))
+  host.end(main)
+  const message = await host.receive(reviewer)
+  assert.equal(message.source.bridgeWorkflowKind, 'conversation')
+  assert.equal(message.source.bridgeWorkflowId, jobs.get(reviewer))
+  assert(message.content[0].text.endsWith(text))
+  host.end(reviewer)
+  assert.deepEqual(host.deliveries.map(({ target }) => target), [worker, reviewer, reviewer])
+})
+
 test('direct collaboration uses only exact owner input and admits the bound assignment once', async t => {
   const host = await collaborationHost(t)
   for (const source of [guestSource, relaySource, { kind: 'user' }]) {
     host.begin(main, direct, source)
-    assert.equal((await host.call(main, 'workflow_delegate_direct', {})).error, 'workflow_direct_owner_request_required')
+    assert.equal(typeof (await host.call(main, 'workflow_message', {})).error, 'string')
     host.end(main)
   }
   host.rename(secondMain, workerTitle)
   host.begin(main, direct)
-  assert.equal((await host.call(main, 'workflow_delegate_direct', {})).error, 'workflow_target_clarification_required')
+  host.end(main)
+  assert.equal((await host.receive(main)).source.bridgeWorkflowKind, 'direct-notice')
   host.end(main)
   host.rename(secondMain, secondMain)
-  assert.equal(host.deliveries.length, 0)
+  assert.equal(host.deliveries.length, 1)
 
-  host.begin(main, direct)
-  assert.equal((await host.call(main, 'workflow_delegate_direct', { goal: 'Changed goal' })).error,
-    'workflow_direct_arguments_not_allowed')
-  const opened = await host.call(main, 'workflow_delegate_direct', {})
-  assert.equal(opened.duplicate, false)
-  assert.equal(opened.goal, goal)
-  assert.equal(opened.budget, 1)
-  assert.deepEqual(opened.scopes[0].targets, [worker])
-  assert.deepEqual(await host.call(main, 'workflow_delegate_direct', {}), { ...opened, duplicate: true })
+  const input = host.begin(main, direct)
+  assert.equal((await host.call(main, 'workflow_message', { goal: 'Changed goal' })).error,
+    'workflow_message_invalid_arguments')
+  const first = await host.call(main, 'workflow_message', {})
+  assert.equal(first.state, 'queued', JSON.stringify(first))
+  assert.deepEqual(await host.call(main, 'workflow_message', {}), { ...first, duplicate: true })
   host.end(main)
-  const lease = await claim(host, worker, opened.id)
+  const { grant, job } = await host.directAssignment(main, input)
+  assert.equal(grant.goal, goal)
+  assert.equal(grant.budget, 1)
+  assert.deepEqual(grant.scopes[0].targets, [worker])
+  const lease = await claim(host, worker, job.id)
   assert.equal(lease.instructions, goal)
   assert.equal(lease.owner, main)
-  assert.deepEqual(host.deliveries.map(({ target }) => target), [worker])
+  assert.deepEqual(host.deliveries.map(({ target }) => target), [main, worker])
   host.end(worker)
 })
 
@@ -255,10 +293,10 @@ for (const interrupted of [false, true]) {
     : 'completed result turn settles one requested close after restart without another owner confirmation'
   test(testName, async t => {
     const host = await collaborationHost(t)
-    host.begin(main, direct)
-    const opened = await host.call(main, 'workflow_delegate_direct', {})
-    assert.equal(opened.duplicate, false)
+    const input = host.begin(main, direct)
     host.end(main)
+    const { task, job } = await host.directAssignment(main, input)
+    const opened = { task, id: job.id }
     const lease = await claim(host, worker, opened.id)
     assert.equal((await report(host, worker, lease)).recorded, true)
     host.end(worker)
@@ -591,11 +629,11 @@ for (const [kind, source] of [
 
 const ordinaryBody = '保持原样的合成消息。'
 const ordinaryDraft = '请拟一条消息发给' + workerTitle
-const sendNatural = (host, args = {}) => host.call(main, 'send_natural_session_message', args)
+const sendNatural = (host, args = {}) => host.call(main, 'workflow_message', args)
 
 async function prepareOrdinaryDraft(host) {
   host.begin(main, ordinaryDraft)
-  const prepared = await sendNatural(host, { draft: ordinaryBody })
+  const prepared = await sendNatural(host, { text: ordinaryBody })
   assert.equal(prepared.confirmation, 'owner_reply_required', JSON.stringify(prepared))
   assert(prepared.preview.includes(ordinaryBody))
   return prepared.preview
@@ -612,15 +650,12 @@ for (const phase of ['preview', 'confirmation']) {
 
     host.begin(main, '确认发送')
     if (phase === 'confirmation') emitTimeSnapshot(host, main)
-    const sent = await sendNatural(host)
-    assert.equal(sent.delivery, 'delivered', JSON.stringify(sent))
-    assert.equal(sent.duplicate, false)
-    const replay = await sendNatural(host)
-    assert.equal(replay.duplicate, true)
-    assert.equal(replay.messageId, sent.messageId)
+    assert.deepEqual(await sendNatural(host), { state: 'waiting_for_owner_turn_end' })
+    assert.deepEqual(await sendNatural(host), { state: 'waiting_for_owner_turn_end' })
+    assert.deepEqual(host.deliveries, [])
     host.end(main)
     const received = await host.receive(worker)
-    assert.equal(received.id, sent.messageId)
+    assert(received.source.bridgeReceiptKey)
     assert.equal(received.source.senderSessionId, main)
     assert(received.content[0].text.endsWith('\n' + ordinaryBody))
     assert.equal(host.deliveries.length, 1)
@@ -639,7 +674,7 @@ for (const [kind, source] of [
 
     host.begin(main, '确认发送')
     host.appendInput(main, timeText, source)
-    assert.deepEqual(await sendNatural(host), { error: 'message_authorization_required' })
+    assert.deepEqual(await sendNatural(host), { error: 'workflow_context_required' })
     assert.deepEqual(host.deliveries, [])
     host.end(main)
   })
@@ -649,15 +684,12 @@ test('ordinary exact owner text still delivers once when the host inserts time c
   const host = await collaborationHost(t)
   host.begin(main, '给' + workerTitle + '发消息：' + ordinaryBody)
   emitTimeSnapshot(host, main)
-  const sent = await sendNatural(host)
-  assert.equal(sent.delivery, 'delivered', JSON.stringify(sent))
-  assert.equal(sent.duplicate, false)
-  const replay = await sendNatural(host)
-  assert.equal(replay.duplicate, true)
-  assert.equal(replay.messageId, sent.messageId)
+  assert.deepEqual(await sendNatural(host), { state: 'waiting_for_owner_turn_end' })
+  assert.deepEqual(await sendNatural(host), { state: 'waiting_for_owner_turn_end' })
+  assert.deepEqual(host.deliveries, [])
   host.end(main)
   const received = await host.receive(worker)
-  assert.equal(received.id, sent.messageId)
+  assert(received.source.bridgeReceiptKey)
   assert(received.content[0].text.endsWith('\n' + ordinaryBody))
   assert.equal(host.deliveries.length, 1)
   host.end(worker)
