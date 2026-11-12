@@ -1,7 +1,7 @@
 {
   "name": "@local/dsh-session-bridge",
-  "version": "0.5.0-rc.20",
-  "description": "Relay messages and delegate bounded tasks between existing DSH sessions.",
+  "version": "0.5.0-rc.22",
+  "description": "Let agents exchange messages between user-selected DSH windows.",
   "private": true,
   "type": "module",
   "exports": {
@@ -12,30 +12,12 @@
   },
   "files": [
     "index.js",
-    "activity.js",
-    "natural-message.js",
-    "owner-message.js",
-    "native-result.js",
+    "bridge-input.js",
+    "receipt-store.js",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
-    "icon.svg",
-    "workflow.js",
-    "workflow-authorization.js",
-    "workflow-context.js",
-    "workflow-view.js",
-    "workflow-ledger.js",
-    "bridge-input.js",
-    "workflow-state.js",
-    "workflow-evidence.js",
-    "workflow-tools.js",
-    "workflow-routing.js",
-    "workflow-closeout.js",
-    "workflow-maintenance.js",
-    "workflow-dispatcher.js",
-    "workflow-conversation.js",
-    "workflow-worker-tools.js",
-    "receipt-store.js"
+    "icon.svg"
   ],
   "dsh": {
     "bundle": {
@@ -45,9 +27,7 @@
       "platform": "web",
       "immediately": true,
       "inject": [
-        "@deepseek-ai/dsh-client-ui-sidebar-right",
-        "@deepseek-ai/dsh-client-ui-chat",
-        "@deepseek-ai/dsh-client-ui-workspace"
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
       ]
     }
   },
