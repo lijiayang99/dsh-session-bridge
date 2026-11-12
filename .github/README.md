@@ -1,22 +1,30 @@
 # dsh-session-bridge
 
-当前版本为 `0.5.0-rc.16`，固定包已通过独立技术复审。插件仅支持 DSH Web `0.2.2-rc.1`，需要 Node `24.9+`。DSH 包名为 `@local/dsh-session-bridge`，右栏入口为「开始 → dsh-session-bridge」。侧栏显示宿主兼容状态。宿主身份未知时拒绝新发送与派工。
+当前版本为 `0.5.0-rc.20`，固定包已通过独立技术复审。插件仅支持 DSH Web `0.2.2-rc.1`，需要 Node `24.9+`。DSH 包名为 `@local/dsh-session-bridge`，右栏入口为「开始 → dsh-session-bridge」。侧栏显示宿主兼容状态。宿主身份未知时拒绝新发送与派工。
 
 ## 从 GitHub 换包
 
 在「插件 → 添加插件」输入以下固定安装地址。DSH Web `0.2.2-rc.1` 的「更新」只处理 npm registry 来源，GitHub 来源通过「添加插件」手动换包。
 
 ```text
-github:lijiayang99/dsh-session-bridge#a72d2496f82b05fde841ded6230c180e9e3b087a
+github:lijiayang99/dsh-session-bridge#3aca787e3be38ce6a852a44410115dda8b757296
 ```
 
-换包前停发并排空，记录开关和白名单，关闭互传与委托，完整停机备份配置、回执和账本。换包并完整重启后，核对版本、设置和历史，再按原授权恢复功能。[固定安装源码](https://github.com/lijiayang99/dsh-session-bridge/tree/a72d2496f82b05fde841ded6230c180e9e3b087a) · [停机换包与回退](../README.md#停机换包与回退)
+换包前核对在途任务、开关和回执，停用插件并完整停机备份配置和数据。换包并重启后先保持总开关关闭，核对版本、开关、回执和历史，再按实际任务需要启用。[固定安装源码](https://github.com/lijiayang99/dsh-session-bridge/tree/3aca787e3be38ce6a852a44410115dda8b757296) · [停机换包与回退](../README.md#从-rc19-停机换包与回退)
 
-上一公开版本 `0.5.0-rc.12` 的固定安装地址为 `github:lijiayang99/dsh-session-bridge#d75d9b70dda847d793db88eed0691787afea81ef`。[rc.12 固定源码](https://github.com/lijiayang99/dsh-session-bridge/tree/d75d9b70dda847d793db88eed0691787afea81ef)
+上一公开主线版本 `0.5.0-rc.16` 的固定安装地址为 `github:lijiayang99/dsh-session-bridge#a72d2496f82b05fde841ded6230c180e9e3b087a`。[rc.16 固定源码](https://github.com/lijiayang99/dsh-session-bridge/tree/a72d2496f82b05fde841ded6230c180e9e3b087a)
+
+历史版本 `0.5.0-rc.12` 的固定安装地址为 `github:lijiayang99/dsh-session-bridge#d75d9b70dda847d793db88eed0691787afea81ef`。[rc.12 固定源码](https://github.com/lijiayang99/dsh-session-bridge/tree/d75d9b70dda847d793db88eed0691787afea81ef)
 
 已在隔离环境验收的回退入口为 `0.5.0-rc.8`，固定引用为 `github:lijiayang99/dsh-session-bridge#11e4b546949922e7a07fb84285c45ff1aa24c438`。此前从 rc.8 换入 rc.10 并回退 rc.8，保留了设置、白名单、普通回执和已收口直派历史。回退前先核对并收口或取消活动任务，保全未决尝试和账本。[rc.8 固定源码](https://github.com/lijiayang99/dsh-session-bridge/tree/11e4b546949922e7a07fb84285c45ff1aa24c438)
 
 更早的隔离原生测试从 rc.4 换入 rc.8 并回退固定 `0.5.0-rc.4`（`9018c657c25fd2bea07ea44555e53fc60d6c7fd8`），重启后读回了白名单、关闭状态、两代普通回执和工作流历史。`0.4.5-rc.2` 回退基线为 `87b06bf9fc8f9b3fc523d0ab227edd9d284c8609`。从旧命名版本换包还须停机迁移。[旧命名迁移规程](../README.md#迁移与回退)
+
+## rc.20 的跨窗口操作
+
+明确点名一个窗口时，宿主核对原生所有者轮、完整标题或当前工作区内的唯一短号后，原样传递任务正文和限制。普通答复或结构化回报回到原主控。同名或范围不清时先澄清。[跨窗口任务](../README.md#跨窗口任务)
+
+独立窗口的通用通信工具为 `workflow_message`。明确的直接消息由宿主核验后原样发送，拟稿仍须在原窗口预览并确认。原生子代理沿用宿主的父子消息和审批。[工具与验收接口](../README.md#工具与验收接口) · [直接发送一条消息](../README.md#直接发送一条消息)
 
 ## rc.16 的跨窗口操作
 
@@ -36,7 +44,7 @@ github:lijiayang99/dsh-session-bridge#a72d2496f82b05fde841ded6230c180e9e3b087a
 
 ## `0.5.0-rc.8` 单次直派回报与收口
 
-在原主控可以输入「你给合成查询这个窗口问他今天合成样本的状态怎么样」。助手把问题原文派给唯一匹配的白名单窗口，使用入队回执中的准确窗口标题确认。执行窗口回报成功后，原主控读取并显示答复，宿主确认该轮在有效期内正常结束后自动收口，释放活动授权名额并保留历史。单向发消息可写「把『合成正文』发给『合成查询』窗口」，引号外的「窗口」可省略。[跨窗口问答](../README.md#跨窗口任务) · [普通互传](../README.md#普通互传)
+在原主控可以输入「你给合成查询这个窗口问他今天合成样本的状态怎么样」。助手把问题原文派给唯一匹配的白名单窗口，使用入队回执中的准确窗口标题确认。执行窗口回报成功后，原主控读取并显示答复，宿主确认该轮在有效期内正常结束后自动收口，释放活动授权名额并保留历史。单向发消息可写「把『合成正文』发给『合成查询』窗口」，引号外的「窗口」可省略。[跨窗口问答](../README.md#跨窗口任务) · [普通互传](https://github.com/lijiayang99/dsh-session-bridge/blob/a72d2496f82b05fde841ded6230c180e9e3b087a/README.md#普通互传)
 
 插件跨过授权期限重启时，按宿主已持久化的结果轮结束时间核验。期限内已答完的单次直派可恢复为已完成，超时或缺少正常结束与可见答复证据时按过期处理。两条路径均不重放派工或回报。
 
@@ -46,13 +54,13 @@ github:lijiayang99/dsh-session-bridge#a72d2496f82b05fde841ded6230c180e9e3b087a
 
 原主控可用明确的单窗口原文直接委托一次，也可展示冻结的多窗口方案，由所有者在原窗口确认一次。批次等齐后回传一次，审核、返修及复审绑定相应尝试与固定产物。「原主控任务」可查看批次、回报、失败及接续状态。请求收口后，账本等到同一宿主轮正常结束的持久证据才提交结果。轮次中断时，原主控所有者可对账并在新轮请求收口。[跨窗口任务用法](../README.md#跨窗口任务)
 
-协作委托和普通互传均按事件来源识别宿主自动追加的时间快照。固定宿主的独立隔离复验覆盖草稿生成后、确认工具前的时间刷新，以及原文和结构化命令直发。来自所有者或中继的相同文本仍按额外输入处理，原草稿会失效。[普通互传与隔离复验](../README.md#普通互传)
+协作委托和普通互传均按事件来源识别宿主自动追加的时间快照。固定宿主的独立隔离复验覆盖草稿生成后、确认工具前的时间刷新，以及原文和结构化命令直发。来自所有者或中继的相同文本仍按额外输入处理，原草稿会失效。[普通互传与隔离复验](https://github.com/lijiayang99/dsh-session-bridge/blob/a72d2496f82b05fde841ded6230c180e9e3b087a/README.md#普通互传)
 
 在隔离的固定 DSH Web 上，GPT-6 Luna 通过两项固定包试验。单主控多窗流程完成一次所有者确认、并行派工、审核退回、返修、复审通过和持久收口。单窗流程完成一次明确授权、领取、回报和持久收口。两项均使用合成输入、预置合成产物及受限适配器。适配器裁剪上下文、限制工具选择并生成部分例行回复，最终收口轮由模型结束，宿主核验持久证据。[验收范围与固定证据](https://github.com/lijiayang99/dsh-session-bridge/pull/7)
 
 PR #7 和合入后的主线 GitHub Actions 各通过 33 项合成测试，含双主控同名任务和 30 窗口负载。真实模型的跨主控并发和 30 窗口负载、真实供应商限流、独立非所有者登录及外部副作用工具审批仍未实测。[PR Actions](https://github.com/lijiayang99/dsh-session-bridge/actions/runs/42985878951) · [主线 Actions](https://github.com/lijiayang99/dsh-session-bridge/actions/runs/42987784922)
 
-所有者可在发送窗口输入「给审核窗口发消息：候选已就绪」。助手通过插件工具将明确原文发给白名单内唯一匹配的窗口。请助手拟稿或转发上下文时，先等完整预览及该轮结束，再在同一窗口回复「确认发送」。[自然语句用法](../README.md#普通互传)
+所有者可在发送窗口输入「给审核窗口发消息：候选已就绪」。助手通过插件工具将明确原文发给白名单内唯一匹配的窗口。请助手拟稿或转发上下文时，先等完整预览及该轮结束，再在同一窗口回复「确认发送」。[自然语句用法](https://github.com/lijiayang99/dsh-session-bridge/blob/a72d2496f82b05fde841ded6230c180e9e3b087a/README.md#普通互传)
 
 隔离复验使用固定 DSH Web、候选归档、浏览器及合成模型，覆盖自然语句发送、预览和确认。预览前接纳的排队确认和插入当前轮次的确认均被拒绝。真实模型能否稳定生成并复述完整预览仍待验证。
 

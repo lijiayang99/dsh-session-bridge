@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { fixture, guestSource, main, outsider, relaySource, reviewer, worker } from './host-fixture.mjs'
+import { setTimeout as delay } from 'node:timers/promises'
+import { fixture, guestSource, main, outsider, relaySource, reviewer, until, worker } from './host-fixture.mjs'
 
 const ordinary = { to: worker, request_id: 'synth-request', text: 'Exact synthetic text.' }
 const relayCommand = ({ to, request_id, text }) => '授权互传 ' + to + ' ' + request_id + '\n' + text
@@ -16,39 +17,46 @@ const dispatch = {
 
 test('supported owner contract and delegation round trip', async t => {
   const host = await fixture(t)
-  const send = input => host.call(main, 'send_session_message', input)
+  const send = input => host.call(main, 'workflow_message', input)
+  const read = () => host.call(main, 'session_message_status', { request_id: ordinary.request_id })
   for (const source of [guestSource, relaySource, { kind: 'user' }]) {
     host.begin(main, relayCommand(ordinary), source)
-    assert.equal((await send(ordinary)).error, 'message_authorization_required')
+    assert.equal(typeof (await send({ text: ordinary.text })).error, 'string')
     host.end(main)
   }
+  host.archive(outsider)
   host.begin(main, relayCommand({ ...ordinary, to: outsider }))
-  assert.equal((await send({ ...ordinary, to: outsider })).error, 'route_not_allowed')
+  host.end(main)
+  await delay(25)
+  assert.equal(host.deliveries.length, 0)
+  host.begin(main, relayCommand(ordinary))
+  for (const change of [{ to: reviewer }, { request_id: 'different' }]) {
+    assert.equal((await send(change)).error, 'workflow_message_invalid_arguments')
+  }
+  assert.deepEqual(await send({ text: 'Different.' }), { state: 'waiting_for_owner_turn_end' })
+  assert.equal(host.deliveries.length, 0)
+  host.end(main)
+  const delivered = await host.receive(worker)
+  assert.equal(delivered.source.senderSessionId, main)
+  assert(delivered.content[0].text.endsWith('\n' + ordinary.text))
+  host.end(worker)
+  const first = await until(async () => {
+    const receipt = await read()
+    return receipt.delivery === 'delivered' && receipt
+  }, 'Expected one durable owner-authorized delivery receipt')
+  assert.equal(first.messageId, delivered.id)
+
+  host.begin(main, 'Synthetic retry without a fresh authorization')
+  assert.equal((await send({ text: ordinary.text })).error, 'workflow_task_context_required')
   host.end(main)
   host.begin(main, relayCommand(ordinary))
-  for (const change of [{ to: reviewer }, { request_id: 'different' }, { text: 'Different.' }]) {
-    assert.equal((await send({ ...ordinary, ...change })).error, 'message_authorization_required')
-  }
-  assert.equal(host.deliveries.length, 0)
-  const first = await send(ordinary)
-  assert.equal(first.delivery, 'delivered')
-  assert.equal(first.duplicate, false)
-  const delivered = host.deliveries[0]
-  assert.equal(delivered.target, worker)
-  assert.equal(delivered.message.id, first.messageId)
-  assert.equal(delivered.message.source.senderSessionId, main)
-  assert(delivered.message.content[0].text.endsWith('\n' + ordinary.text))
   host.end(main)
-  host.begin(main, 'Synthetic retry without a fresh authorization')
-  const duplicate = await send(ordinary)
-  assert.equal(duplicate.duplicate, true)
-  assert.equal(duplicate.messageId, first.messageId)
-  assert.equal((await send({ ...ordinary, text: 'Different.' })).error, 'request_id_conflict')
+  await delay(25)
+  host.begin(main, relayCommand({ ...ordinary, text: 'Different.' }))
+  host.end(main)
+  await delay(25)
+  assert.equal((await read()).messageId, first.messageId)
   assert.equal(host.deliveries.length, 1)
-  assert.equal((await send({ ...ordinary, request_id: 'different' })).error, 'message_authorization_required')
-  host.end(main)
-  await host.receive(worker)
-  host.end(worker)
 
   for (const source of [guestSource, relaySource]) {
     host.begin(main, grant, source)
@@ -85,11 +93,58 @@ test('supported owner contract and delegation round trip', async t => {
   assert.deepEqual(host.warnings, [])
 })
 
+test('legacy allowlist membership gives no authority and cannot block a new owner-authorized window', async t => {
+  const host = await fixture(t, { legacySettings: { allowedSessions: [main, worker] } })
+  host.begin(main, 'The synthetic model wants to send a message.')
+  assert.equal((await host.call(main, 'workflow_message', { text: ordinary.text })).error, 'workflow_task_context_required')
+  host.end(main)
+  assert.deepEqual(host.deliveries, [])
+
+  const request = { ...ordinary, to: outsider }
+  host.begin(main, relayCommand(request))
+  host.end(main)
+  const delivered = await host.receive(outsider)
+  assert(delivered.content[0].text.endsWith(ordinary.text))
+  host.end(outsider)
+  assert.deepEqual(host.deliveries.map(({ target }) => target), [outsider])
+})
+
+test('the master switch blocks both an authorized send and native delegation', async t => {
+  const host = await fixture(t)
+  host.rename(worker, '合成执行')
+  const question = '你给合成执行这个窗口问他今天合成样本怎么样'
+  host.setEnabled(false)
+  host.begin(main, relayCommand(ordinary))
+  assert.equal((await host.call(main, 'workflow_message', {})).error, 'workflow_disabled')
+  host.end(main)
+  host.begin(main, question)
+  host.end(main)
+  assert.deepEqual(host.deliveries, [])
+
+  host.setEnabled(true)
+  host.begin(worker, '保持合成执行窗忙碌。')
+  const input = host.begin(main, question)
+  host.end(main)
+  const { job } = await host.directAssignment(main, input)
+  assert.equal(job.wake.state, 'queued')
+  host.setEnabled(false)
+  host.end(worker)
+  await delay(850)
+  assert.deepEqual(host.deliveries, [])
+  host.setEnabled(true)
+  const assignment = await host.receive(worker)
+  assert.equal(assignment.source.bridgeWorkflowKind, 'task')
+  assert.equal(assignment.source.senderSessionId, main)
+  assert.equal(assignment.source.bridgeWorkflowId, job.id)
+  assert.equal(host.deliveries.length, 1)
+  host.end(worker)
+})
+
 test('an unknown host cannot start a relay or delegate', async t => {
   const host = await fixture(t, { hostVersion: '0.0.0-synthetic-unknown' })
-  if (host.tools.has('send_session_message')) {
+  if (host.tools.has('workflow_message')) {
     host.begin(main, relayCommand(ordinary))
-    const denied = await host.call(main, 'send_session_message', ordinary)
+    const denied = await host.call(main, 'workflow_message', { text: ordinary.text })
     assert.equal(typeof denied.error, 'string')
     assert.equal(denied.messageId, undefined)
     if (host.tools.has('session_message_status')) {

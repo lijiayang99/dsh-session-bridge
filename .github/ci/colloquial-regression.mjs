@@ -7,7 +7,7 @@ const reviewTitle = '合成核查'
 const question = '今天合成样本的状态怎么样'
 const colloquial = '你给' + queryTitle + '这个窗口问他' + question
 const resultText = '合成样本状态为已核验。'
-const ownerDispatch = host => host.call(main, 'workflow_delegate_direct', {})
+const observe = host => host.call(main, 'workflow_message', {})
 const status = (host, task, owner = main) => host.call(owner, 'workflow_status', { task })
 
 async function queryHost(t) {
@@ -22,18 +22,17 @@ test('an exact colloquial owner question delegates once and returns the answer t
   const receiptTitle = '你是谁'
   const receiptQuestion = '今天成都天气怎么样'
   host.rename(worker, receiptTitle)
-  host.begin(main, '你给' + receiptTitle + '这个窗口问他' + receiptQuestion)
-  const opened = await ownerDispatch(host)
-  assert.equal(opened.duplicate, false, JSON.stringify(opened))
-  assert.deepEqual(opened.scopes[0].targets, [worker])
-  assert.equal(opened.goal, receiptQuestion)
-  assert.equal(opened.state, 'queued')
-  assert.equal(opened.targetTitle, receiptTitle)
-  assert.equal(opened.budget, 1)
-  host.rename(worker, '合成派工后改名')
-  assert.deepEqual(await ownerDispatch(host), { ...opened, duplicate: true })
-  host.rename(worker, receiptTitle)
+  const input = host.begin(main, '你给' + receiptTitle + '这个窗口问他' + receiptQuestion)
+  const first = await observe(host)
+  assert.equal(first.state, 'queued')
+  assert.deepEqual(await observe(host), { ...first, duplicate: true })
+  assert.deepEqual(host.deliveries, [])
   host.end(main)
+  const { task, grant, job: assignment } = await host.directAssignment(main, input)
+  const opened = { task, id: assignment.id, goal: grant.goal }
+  assert.deepEqual(grant.scopes[0].targets, [worker])
+  assert.equal(grant.goal, receiptQuestion)
+  assert.equal(grant.budget, 1)
 
   const job = await host.receive(worker)
   assert.equal(job.source.senderSessionId, main)
@@ -79,7 +78,8 @@ test('colloquial automatic dispatch rejects same-name, multiple-window and non-o
   const host = await queryHost(t)
   host.rename(secondMain, queryTitle)
   host.begin(main, colloquial)
-  assert.equal(typeof (await ownerDispatch(host)).error, 'string')
+  host.end(main)
+  assert.equal((await host.receive(main)).source.bridgeWorkflowKind, 'direct-notice')
   host.end(main)
   host.rename(secondMain, secondMain)
 
@@ -88,74 +88,70 @@ test('colloquial automatic dispatch rejects same-name, multiple-window and non-o
     '这是用法示例：' + colloquial,
   ]) {
     host.begin(main, text)
-    assert.equal(typeof (await ownerDispatch(host)).error, 'string')
     host.end(main)
   }
   for (const source of [guestSource, relaySource, { kind: 'user' }]) {
     host.begin(main, colloquial, source)
-    assert.equal(typeof (await ownerDispatch(host)).error, 'string')
+    assert.equal(typeof (await observe(host)).error, 'string')
     host.end(main)
   }
-  assert.deepEqual(host.deliveries, [])
+  assert(host.deliveries.every(({ target, message }) => target === main && message.source.bridgeWorkflowKind === 'direct-notice'))
 })
 
 test('an explicit quoted message with an outside window suffix stays an exact ordinary send', async t => {
   const host = await queryHost(t)
   const body = '  合成正文第一行\n第二行保留空格  '
   host.begin(main, '把『' + body + '』发给『' + queryTitle + '』窗口')
-  assert.equal(typeof (await ownerDispatch(host)).error, 'string')
-  const send = () => host.call(main, 'send_natural_session_message', {})
-  const sent = await send()
-  assert.equal(sent.delivery, 'delivered', JSON.stringify(sent))
-  assert.equal(sent.duplicate, false)
-  assert.equal(sent.to, worker)
-  const duplicate = await send()
-  assert.equal(duplicate.duplicate, true)
-  assert.equal(duplicate.messageId, sent.messageId)
+  assert.deepEqual(await observe(host), { state: 'waiting_for_owner_turn_end' })
+  assert.deepEqual(await observe(host), { state: 'waiting_for_owner_turn_end' })
+  assert.deepEqual(host.deliveries, [])
   host.end(main)
 
   const message = await host.receive(worker)
-  assert.equal(message.id, sent.messageId)
+  assert(message.source.bridgeReceiptKey)
   assert.equal(message.content[0].text, '[DSH 会话消息｜发送方 ' + main + ']\n' + body)
   assert.deepEqual(host.deliveries.map(({ target }) => target), [worker])
   host.end(worker)
 })
 
-test('a changed title or allowlist before dispatch cannot issue a direct receipt', async t => {
+test('a changed title or archived window before dispatch cannot issue a direct receipt', async t => {
   const host = await queryHost(t)
   let reads = 0
   host.faults.list = () => {
     if (++reads === 2) host.rename(worker, '合成派工前改名')
   }
   host.begin(main, colloquial)
-  assert.deepEqual(await ownerDispatch(host), { error: 'workflow_target_changed' })
-  assert.equal(reads, 2)
+  host.end(main)
+  assert.match((await host.receive(main)).content[0].text, /变化/)
+  assert(reads >= 2)
   host.end(main)
   host.rename(worker, queryTitle)
 
   reads = 0
   host.faults.list = () => {
-    if (++reads === 2) host.setAllowedSessions([main, secondMain, reviewer])
+    if (++reads === 2) host.archive(worker)
   }
   host.begin(main, colloquial)
-  assert.deepEqual(await ownerDispatch(host), { error: 'workflow_target_changed' })
-  assert.equal(reads, 2)
+  host.end(main)
+  assert.match((await host.receive(main)).content[0].text, /变化|可用/)
+  assert(reads >= 2)
   host.end(main)
 
   delete host.faults.list
   host.begin(main, colloquial)
-  assert.deepEqual(await ownerDispatch(host), { error: 'workflow_target_not_available' })
   host.end(main)
-  assert.deepEqual(host.deliveries, [])
+  assert.match((await host.receive(main)).content[0].text, /可用/)
+  host.end(main)
+  assert.deepEqual(host.deliveries.map(({ target }) => target), [main, main, main])
 })
 
 test('an interrupted direct attempt keeps the queued receipt and produces no answer or replay', async t => {
   const host = await queryHost(t)
-  host.begin(main, colloquial)
-  const opened = await ownerDispatch(host)
-  assert.equal(opened.targetTitle, queryTitle)
-  assert.equal(opened.state, 'queued')
+  const input = host.begin(main, colloquial)
   host.end(main)
+  const { task, grant, job: assignment } = await host.directAssignment(main, input)
+  const opened = { task, id: assignment.id }
+  assert.equal(grant.authorization.targets[0].title, queryTitle)
   assert.equal((await host.receive(worker)).source.bridgeWorkflowId, opened.id)
   assert.equal((await host.call(worker, 'workflow_claim', { id: opened.id })).duplicate, false)
   await host.restart()
@@ -178,7 +174,6 @@ test('an interrupted direct attempt keeps the queued receipt and produces no ans
 test('a completed ambiguous owner request emits one bound clarification and no assignment', async t => {
   const host = await queryHost(t)
   host.rename(secondMain, queryTitle)
-  host.setAllowedSessions([main, worker])
   host.begin(main, colloquial)
   assert.deepEqual(host.deliveries, [])
   host.end(main)
@@ -191,7 +186,7 @@ test('a completed ambiguous owner request emits one bound clarification and no a
   })
   assert.deepEqual(notice.content, [{ type: 'text',
     text: '委托未发送。请在原窗口重试，使用引号写出一个完整且唯一的窗口名。' }])
-  assert.deepEqual(await ownerDispatch(host), { error: 'workflow_direct_owner_request_required' })
+  assert.equal(typeof (await observe(host)).error, 'string')
   host.end(main)
   assert.deepEqual(host.deliveries.map(({ target }) => target), [main])
 })
