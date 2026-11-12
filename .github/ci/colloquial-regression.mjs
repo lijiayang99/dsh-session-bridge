@@ -121,7 +121,7 @@ test('an explicit quoted message with an outside window suffix stays an exact or
   host.end(worker)
 })
 
-test('a changed title or allowlist before dispatch cannot issue a direct receipt', async t => {
+test('a changed title or archived window before dispatch cannot issue a direct receipt', async t => {
   const host = await queryHost(t)
   let reads = 0
   host.faults.list = () => {
@@ -135,7 +135,7 @@ test('a changed title or allowlist before dispatch cannot issue a direct receipt
 
   reads = 0
   host.faults.list = () => {
-    if (++reads === 2) host.setAllowedSessions([main, secondMain, reviewer])
+    if (++reads === 2) host.archive(worker)
   }
   host.begin(main, colloquial)
   assert.deepEqual(await ownerDispatch(host), { error: 'workflow_target_changed' })
@@ -178,7 +178,6 @@ test('an interrupted direct attempt keeps the queued receipt and produces no ans
 test('a completed ambiguous owner request emits one bound clarification and no assignment', async t => {
   const host = await queryHost(t)
   host.rename(secondMain, queryTitle)
-  host.setAllowedSessions([main, worker])
   host.begin(main, colloquial)
   assert.deepEqual(host.deliveries, [])
   host.end(main)

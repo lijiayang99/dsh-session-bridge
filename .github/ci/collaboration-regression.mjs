@@ -85,6 +85,44 @@ function report(host, target, lease, fields) {
   })
 }
 
+test('a native task-bound owner turn can choose one of two approved workers for a follow-up', async t => {
+  const host = await collaborationHost(t)
+  const plan = { ...proposal, budget: 2, scopes: [proposal.scopes[0]], conversation: true }
+  const input = '请把合成样本分别交给「' + workerTitle + '」和「' + reviewerTitle + '」核对。'
+  host.reply(main, await prepare(host, plan, input))
+  host.end(main)
+
+  host.begin(main, '确认委托')
+  assert.equal((await confirm(host)).task, task)
+  const jobs = new Map()
+  for (const [target, item] of [[worker, 'first'], [reviewer, 'second']]) {
+    const job = await host.call(main, 'workflow_dispatch', { task, ...assignment(item, target) })
+    assert.equal(job.duplicate, false)
+    jobs.set(target, job.id)
+  }
+  host.end(main)
+  for (const [target, id] of jobs) {
+    await claim(host, target, id)
+    host.end(target)
+  }
+
+  const text = '请核查窗口补核合成文件的时间。'
+  host.begin(main, '继续委托 ' + task)
+  const receipt = await host.call(main, 'send_session_message', {
+    to: reviewer, request_id: 'synthetic-multi-worker-follow-up', text,
+  })
+  assert.equal(receipt.delivery, 'queued')
+  assert.equal(receipt.task, task)
+  assert.equal(receipt.job, jobs.get(reviewer))
+  host.end(main)
+  const message = await host.receive(reviewer)
+  assert.equal(message.source.bridgeWorkflowKind, 'conversation')
+  assert.equal(message.source.bridgeWorkflowId, jobs.get(reviewer))
+  assert(message.content[0].text.endsWith(text))
+  host.end(reviewer)
+  assert.deepEqual(host.deliveries.map(({ target }) => target), [worker, reviewer, reviewer])
+})
+
 test('direct collaboration uses only exact owner input and admits the bound assignment once', async t => {
   const host = await collaborationHost(t)
   for (const source of [guestSource, relaySource, { kind: 'user' }]) {

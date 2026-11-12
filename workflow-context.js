@@ -13,6 +13,7 @@ const punctuated = new RegExp('^' + ask + '[ \\t]*(' + title + ')[ \\t]*[，,：
 const referenceQuestion = new RegExp('^' + askPerson + '[ \\t]*(' + status + ')' + ending, 'u')
 const directed = new RegExp('^' + ask + '[ \\t]*(' + title + ')(?:[ \\t]*[：:]?[ \\t]*(' + status + '))?' + ending, 'u')
 const reference = new RegExp('^' + askPerson + ending, 'u')
+const namedQuestion = new RegExp('^' + ask + '[ \t]*(.+)$', 'u')
 const replyTitle = new RegExp('^(?:(?:是|就是|窗口是)[ \\t]*[：:]?[ \\t]*)?(' + title + ')' + ending, 'u')
 const replyQuestion = new RegExp('^' + askPerson + '[ \\t]*[：:]?[ \\t]*(' + status + ')' + ending, 'u')
 const bareQuestion = new RegExp('^(?:你(?:们)?[ \\t]*)?' + status + ending, 'u')
@@ -102,6 +103,32 @@ export function conversationRequest(text) {
   return { action: 'ask', selector: selector(target), goal, conversation: true }
 }
 
+// A catalog title can mark the boundary without a space or question mark.
+const additionalDelivery = /(?:发(?:送)?(?:给|到)|转发|转给|转交|交给|通知|回(?:传|报|复)给)|(?:并|再|顺便|然后|随后)[ \t]*(?:请[ \t]*)?(?:让|请|问|告诉)/u
+
+export function namedQuestionText(text) {
+  const request = text.trimStart().replace(lead, '')
+  if (withdrawsQuestion(request) || reference.test(request)) return
+  const candidate = namedQuestion.exec(request)?.[1]
+  if (!candidate || additionalDelivery.test(candidate)) return
+  if (clearQuestion(candidate)) return candidate
+  const afterComma = /^[\p{L}\p{N}_.·｜|—– -]{1,160}[，,][ \t]*(.+)$/u.exec(candidate)?.[1]
+  if (clearQuestion(afterComma)) return candidate
+}
+
+export function namedQuestionGoal(text, title) {
+  if (!title || title.length > 160 || !text.startsWith(title)) return
+  const after = text.slice(title.length)
+  // A separator or an ASCII-to-Han transition makes the split explicit.
+  // In particular, a partial Chinese title before a window suffix is not a target.
+  const separated = /^(?:[ \t，,：:]|(?:这个)?窗口)/u.test(after)
+  const adjacent = /[a-zA-Z0-9]$/u.test(title) && /^\p{Script=Han}/u.test(after) &&
+    !/(?:窗口|会话)/u.test(after)
+  if (!separated && !adjacent) return
+  const goal = after.replace(/^(?:[ \t]*(?:这个)?窗口)?[ \t]*[，,：:]?[ \t]*/u, '')
+  if (!additionalDelivery.test(goal) && clearQuestion(goal)) return goal
+}
+
 export function contextualRequest(text, prior) {
   const original = text.trim()
   const request = original.replace(lead, '')
@@ -122,6 +149,7 @@ export function contextualRequest(text, prior) {
   }
   const named = directed.exec(request)
   if (named) {
+    if (!named[2] && !quotedTitle.test(named[1]) && additionalDelivery.test(named[1])) return
     const target = selector(named[1])
     const reuse = !named[2] && target && prior?.missing === 'target' ? prior : undefined
     return { action: 'ask', selector: target, goal: named[2] ?? reuse?.goal, prior: reuse }

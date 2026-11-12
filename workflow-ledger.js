@@ -79,6 +79,9 @@ export function openLedger(dir, onCommit) {
     const job = database.prepare('SELECT body FROM job_history WHERE id = ?')
     const attempt = database.prepare('SELECT body FROM job_history WHERE task_key = ? AND item = ? AND attempt = ?')
     const jobsFor = database.prepare('SELECT body FROM job_history WHERE task_key = ? ORDER BY rowid DESC LIMIT 64')
+    const participatingJobs = database.prepare(`SELECT body FROM job_history
+      WHERE json_extract(body, '$.owner') = ? OR json_extract(body, '$.target') = ?
+      ORDER BY rowid DESC LIMIT 160`)
     const jobCount = database.prepare('SELECT count(*) AS count FROM job_history WHERE task_key = ?')
     const quarantined = database.prepare('SELECT body FROM job_quarantine WHERE task_key = ?')
     const hasQuarantined = database.prepare('SELECT 1 FROM job_quarantine WHERE task_key = ? LIMIT 1')
@@ -96,6 +99,7 @@ export function openLedger(dir, onCommit) {
       job: (id) => unpack(job.get(id)),
       attempt: (key, item, number) => unpack(attempt.get(key, item, number)),
       jobsFor: (key) => jobsFor.all(key).map(unpack),
+      participatingJobs: (id) => participatingJobs.all(id, id).map(unpack),
       jobCount: (key) => jobCount.get(key).count,
       quarantined: (key) => quarantined.all(key).map(unpack),
       hasQuarantined: (key) => Boolean(hasQuarantined.get(key)),

@@ -6,19 +6,34 @@ import { latestPrompt, tool, withCollaborationHost } from './collaboration-host.
 const [dsh, archive, playwright, chrome] = process.argv.slice(2)
 assert(dsh && archive && Boolean(playwright) === Boolean(chrome))
 const owner = 'synthetic-native-owner'
+const other = 'synthetic-native-unrelated'
 const open = '请派一个本地子代理核对合成候选，先回报证据，再等我补充。'
 const prompt = '核对合成候选，先回报证据，再等我补充。'
 const progress = '合成进展：已找到 synthetic.txt，请确认是否需要核对指纹。'
 const followups = ['请子代理核对合成文件指纹。', '请子代理给出合成结论。']
 const instructions = ['核对 synthetic.txt 的合成指纹。', '回报 synthetic.txt 的合成结论。']
 const replies = ['合成指纹已核对，等下一步。', '合成结论：文件和指纹一致。']
+const foreign = '模拟未经同意从旁窗向子代理发消息。'
+const foreignBody = '此合成正文不应进入其他窗口的子代理。'
+const wrongChildBody = '这条合成正文只点名独立执行窗口。'
+const wrongChild = '给合成原生旁窗发消息：' + wrongChildBody
+const independent = '你给合成原生旁窗这个窗口问他今天任务怎么样'
+const task = /^DSH-WORKFLOW TASK ([a-f0-9-]+)$/
+let claimed
 let childId
 
 function decide({ messages, tools }) {
   const current = latestPrompt(messages, (text) =>
-    [open, prompt, ...followups, ...instructions].includes(text))
+    task.test(text) || [independent, open, prompt, foreign, wrongChild, ...followups, ...instructions].includes(text))
   if (!current) return { reply: '合成主控已收到。' }
   const { text, results } = current
+  if (text === independent) return { reply: '' }
+  const assignment = task.exec(text)
+  if (assignment) {
+    if (!results.length) return tool('workflow_claim', { id: assignment[1] })
+    claimed = results[0]
+    return { reply: '' }
+  }
   if (text === open) {
     assert(tools.some(({ name }) => name === 'subagent'))
     assert(tools.some(({ name }) => name === 'send_message'))
@@ -33,8 +48,14 @@ function decide({ messages, tools }) {
     assert.equal(results[1].nativeMessageId, results[0].nativeMessageId)
     return { reply: '已读取 synthetic.txt。' }
   }
-  if (followups.includes(text)) return results.length ? undefined :
-    tool('send_message', { agent_id: childId, message: instructions[followups.indexOf(text)] })
+  if (text === foreign) return results.length ? undefined :
+    tool('send_session_message', { to: childId, request_id: 'synthetic-unrelated-child', text: foreignBody })
+  if (text === wrongChild) return results.length ? undefined :
+    tool('send_session_message', { to: childId, request_id: 'synthetic-wrong-child', text: wrongChildBody })
+  if (text === followups[0]) return results.length ? undefined :
+    tool('send_session_message', { to: childId, request_id: 'synthetic-native-downward', text: instructions[0] })
+  if (text === followups[1]) return results.length ? undefined :
+    tool('send_message', { agent_id: childId, message: instructions[1] })
   const index = instructions.indexOf(text)
   if (!results.length) return tool('send_message', {
     agent_id: owner, message: index === 0 ? replies[index] : '合成进展：正在汇总两处指纹。',
@@ -43,8 +64,12 @@ function decide({ messages, tools }) {
 }
 
 await withCollaborationHost({ dsh, archive, decide }, async (host) => {
-  await host.createSessions([[owner, '00-合成原生主控']])
-  await host.save({ allowedSessions: [owner], workflowEnabled: true })
+  await host.createSessions([[owner, '00-合成原生主控'], [other, '合成原生旁窗']])
+  await host.save({ enabled: true })
+  await host.prompt(owner, independent)
+  await host.until(() => claimed?.id, 'an unrelated bridge task is active in the parent')
+  assert.equal(claimed.owner, owner)
+  await host.idle(other)
   const { results } = await host.prompt(owner, open)
   assert.match(results[0], /^started subagent /)
   childId = results[0].slice('started subagent '.length)
@@ -71,9 +96,23 @@ await withCollaborationHost({ dsh, archive, decide }, async (host) => {
   assert(childEvents.some(({ type, data }) => type === 'user/message' &&
     data.content?.some(({ text }) => text?.includes(prompt))), JSON.stringify(childEvents.map(({ type, data }) =>
     type === 'user/message' ? [type, data.content] : type)))
+  const refused = await host.prompt(other, foreign)
+  assert.equal(typeof refused.results[0]?.error, 'string')
+  assert(!(await events(childId)).some(({ type, data }) =>
+    type === 'user/message' && data.content?.some((part) => part.text?.includes(foreignBody))))
+  const mismatch = await host.prompt(owner, wrongChild)
+  assert.equal(typeof mismatch.results[0]?.error, 'string', JSON.stringify(mismatch.results[0]))
+  assert(!(await events(childId)).some(({ type, data }) =>
+    type === 'agent/inbox/spliced' && data.inserted?.some((message) =>
+      message.content?.some((part) => part.text?.includes(wrongChildBody)))))
   for (const [i, text] of followups.entries()) {
     const response = await host.prompt(owner, text)
-    assert.equal(response.results[0], 'message delivered to agent ' + childId)
+    if (i === 0) {
+      assert.equal(response.results[0]?.delivery, 'delivered', JSON.stringify(response.results[0]))
+      assert(response.results[0]?.nativeMessageId)
+    } else {
+      assert.equal(response.results[0], 'message delivered to agent ' + childId)
+    }
     const downward = await untilText(childId, instructions[i])
     assert.equal(downward.data.source.kind, 'agent-message')
     assert.equal(downward.data.source.senderSessionId, owner)
@@ -85,7 +124,12 @@ await withCollaborationHost({ dsh, archive, decide }, async (host) => {
       data.content?.some((part) => part.text?.includes(replies[i])))
     assert.equal(matching.length, 1)
   }
-  console.log('PASS native spawn, direct child progress, two native follow-ups and automatic results')
+  const status = await host.post('/api/dsh-session-bridge/status-log', { sessionId: owner })
+  assert.equal(status.status, 200)
+  assert(status.body.events.some(({ kind, state, to }) =>
+    kind === 'result' && state === 'returned' && to === '00-合成原生主控'))
+  assert(!JSON.stringify(status.body).includes(replies[1]))
+  console.log('PASS native spawn, bridge sends in both native parent-child directions, unrelated sender denied, native follow-ups and automatic results')
   if (playwright) {
     const { chromium } = await import(pathToFileURL(resolve(playwright)).href)
     const { launchUrl, env } = host.browserOptions()
