@@ -1,59 +1,11 @@
 # Synthetic regression
 
-From the repository root on Linux with Node.js 24.22.2 and its bundled npm, run:
+Run `bash .github/ci/run.sh` from the repository root on Linux with Node.js 24.22.2 and its bundled npm. The launcher clears the environment and creates temporary HOME and XDG directories. Tests run in a network namespace with only loopback. On GitHub-hosted Ubuntu, the fallback uses passwordless sudo to bring up loopback in a new namespace and drops to the runner UID before starting Node.
 
-```sh
-bash .github/ci/run.sh
-```
+The host adapter imports the actual product entry point and uses the real receipt store with synthetic sessions. It covers current switch and double opt-in, ordinary and relay turns, revocation and hot disable during resolution, archived endpoints, duplicate titles and title changes, session identity, concurrent retry, failure after inbox admission, receipt persistence, and unsupported hosts.
 
-The launcher clears the environment and creates temporary HOME and XDG directories. The synthetic host creates its own DSH data under the temporary directory. Tests require a network namespace with only loopback. The launcher tries unprivileged namespaces first. On GitHub-hosted Ubuntu it can use passwordless sudo to bring up loopback in a new network namespace, then drops to the runner UID before starting Node. If isolation cannot be set up, the job fails. Checkout and Node setup happen before isolation. [GitHub-hosted runner privileges](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#administrative-privileges)
+The package check packs offline with lifecycle scripts disabled, compares archived bytes to source, and reports the archive and file-manifest SHA-256. The manifest is compact JSON keyed by sorted package-relative paths with per-file SHA-256 values and no trailing newline.
 
-- The host adapter supplies the fixed DSH Web 0.2.2-rc.1 event contract and a deliberately unknown host. It imports the product entry point and uses the real receipt and SQLite ledger code with synthetic sessions.
-- The regression covers legacy relay and workflow commands, authorization and owner isolation, exact retry and conflicting payloads, shared recipients, cancellation and expiry. The 30-window workload exercises shared workers and measures dispatch-to-wake and report-to-wake times.
-- Faults include destination resolution failure, a throw after an inbox append, a failed result flush and unavailable recovery evidence. Restart cases reuse the ledger and synthetic durable inbox and event records, then check wake identity, replay prevention and continuations interrupted on either side of a downstream dispatch.
-- Offline npm packing disables lifecycle scripts, checks each archived file against its source bytes and reports the archive and file-manifest SHA-256. The manifest is a compact JSON object keyed by sorted package-relative paths, with per-file SHA-256 values and no trailing newline.
-- The GitHub job verifies the checked-out commit against the event SHA and prints the commit and tree. The pull request run identifies the tested merge tree. A push to main records its own commit and tree. Compare the product archive digest across those runs for the reviewed version.
+The GitHub job verifies the checkout against the event SHA and prints the commit and tree. A pull request reports the tested merge tree. A push to main reports its own tree. Use the archive digest to confirm that each contains the reviewed product.
 
-Native Web installation, browser UI, actual host authentication and durable queues, version migration, rollback and real model behavior have separate integration evidence.
-
-The 0.5.0 collaboration cases run against the product and CI combination tree. They drive the registered tools with exact and modified previews, queued and non-owner confirmations, same-window claims, batch retries, and mismatched artifact references. The interrupted-close case verifies that a result turn without completion or reconciliation cannot leave a completed task in the durable ledger. Run the full suite with the launcher above.
-
-The closeout cases cover dispatch and duplicate requests while closeout is pending, cancellation and expiry before turn completion, and restart with or without durable turn completion. They check the first closeout payload, preserve the committed downstream attempt, and exercise explicit owner reconciliation before success.
-
-Time-context cases use the fixed host's source-attributed clock snapshot. They cover owner confirmation, result dispatch and closeout replay. An owner or relay message carrying the same visible text remains a separate input and must preserve the mixed-turn fence.
-
-The ordinary send cases check the same native time snapshot around the complete preview and the subsequent owner confirmation. They also verify that an additional owner or relay input containing the same text clears the frozen send authorization.
-
-Colloquial routing cases exercise a bounded owner question to one named window and the original controller's result. They also verify that ambiguous or untrusted inputs do not dispatch, and that a quoted literal with a window suffix outside the title is delivered as ordinary text.
-
-Direct-delegation receipt cases bind the queued status and exact title to the accepted target, preserve that receipt on a same-turn retry, and exercise route drift before dispatch and interruption after claim.
-
-One-shot closeout cases exercise the 128-grant boundary, archived grant and attempt evidence, and a durable reply recovered after restart. The deadline cases distinguish when the native result turn completed from when the plugin restarted. Negative cases cover earlier, blank and interrupted replies, mixed turns, failure, owner action, cancellation, late reports and records created without the reply sequence.
-
-Expiry recovery cases hold the durable history scan to check that an expired grant cannot resume work while awaiting evidence. They verify capacity is reusable once recovery settles, and that a missing turn end or unreadable history results in expiration and no replay.
-
-Native direct-result cases verify owner-turn admission, no-tool dispatch, original-controller report text and no replay after restart. A provisional tool receipt remains idempotent if the title changes, while admission rejects the changed binding. Older jobs without the native-result marker retain the model-visible reply fence.
-
-The clarification case leaves one of the same-named windows outside the allowlist and checks that ambiguity produces only an owner-bound native clarification. The isolated Chrome integration checks default visibility and a normal relay copying the clarification text.
-
-Sidebar activity cases cover transport limits and deadlines, observer isolation from committed writes, and direction and sequence for actual attempts only. Reconnected clients receive a baseline frame, and a revoked endpoint is omitted even if its activity is still in memory. The separate native Chrome fixture checks geometry, overlap, visibility and rendering.
-
-A history-only write must notify the activity observer after the transaction commits. The archival reconciliation test verifies that this path publishes the same persisted delivery state as an active-ledger update.
-
-Contextual direct tests cover adjacent owner proofs, workspace-scoped aliases, exact question text and one native result without controller tools. An explicit trailing withdrawal and a separate forwarding instruction are authorization negatives. The native Chrome fixture covers visible clarification, renames, pre-queued input and ordinary relay.
-
-The question boundary also covers a polite explicit cancellation, a separate forwarding instruction with a time condition, and a legitimate single question whose topic names the delegation feature.
-
-Conversation cases cover cancellation queued before a provisional named-window message can be released, and native final-body supplementation restricted to the exact live parent and current child run. Native Chrome tests exercise the real host tools, preserved permissions and the rendered final reply.
-
-Autonomy cases verify exact named-window routing when a model mistakenly calls either ordinary sender, and ensure tool arguments cannot change the owner-bound goal or destination. A source-attributed native model-selection notice preserves a clean owner turn. The same text from an owner or relay remains a separate input. The native DSH integration verifies the real selectModel notice and tool routing.
-
-An unlisted or nonexistent longer title must not be rewritten as an available shorter title, even when that shorter title begins the owner's text.
-
-An explicit ordinary message is also tested with two concurrently active tasks. Selecting the old sender with a different destination must not enter the second task or append the owner's text to its receiver.
-
-The allowlist-removal cases use the native owner's exact authorization and exercise a stale legacy list as migration data. An archived destination still fails admission. Title ambiguity is checked against the current catalog, including duplicate live titles. The dispatch fault case closes the owner turn before checking delivery so both attempts share durable owner authorization.
-
-The master-switch case verifies that disabled transport cannot send new or already queued work, and that re-enabling can deliver the eligible queued assignment once. Status-log tests verify session filtering, sanitized metadata, and readback while transport is disabled.
-
-The unified messaging cases use `workflow_message` for task-bound follow-ups and for observing a host-owned send or delegation. The original owner input controls the recipient and text. The fixtures check durable delivery after the native turn, reject the two retired tool names, preserve same-task worker selection, and verify that an unquoted full title with a read-only suffix is delivered exactly. Duplicate titles and an explicitly delimited unknown longer title leave only a clarification at the origin.
+The rc.20 combination commit `1fb7b9b7e132f7f88a0e1c2d5dfeab812a5ecc99` retains the 93-case contract for owner syntax, task authorization, automatic dispatch, closeout, and sidebar activity. The current suite follows the user's session-level opt-in contract. Native Web hot replacement, archive, sidebar settings, old queue preservation, and rollback use isolated DSH integration fixtures. Real model behavior is checked independently from synthetic model responses.
